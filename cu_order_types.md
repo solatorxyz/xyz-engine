@@ -20,8 +20,8 @@
 | STP decrement (no fill, both reduced) | 2189 |
 | STP cancel-newest (taker dropped) | 2048 |
 | set_trigger SL (reduce-only) | 307 |
-| exec SL trigger (keeper crank, IOC reduce-only) | 4366 |
-| exec TWAP slice (1/3, sell 10) | 3211 |
+| exec SL trigger (keeper crank, IOC reduce-only) | 4388 |
+| exec TWAP slice (1/3, sell 10) | 3233 |
 | admin pause | 136 |
 | paused: reduce-only allowed | 1045 |
 | deposit under TVL cap (cap check + CPI) | 1369 |

@@ -50,3 +50,6 @@ Use `sdk/ts/everytick.ts` (builders, decoders, `fastDepth`). `sdk/ts/smoke.ts` s
   read runs every CRANK_REFRESH_S (60 s) and on every tick when the stream is down. It warms up its keeper reward account at
   start, liquidates the position holding the most maintenance first, and when the band has no liquidity sends the
   liquidation and the ADL in one transaction. Local e2e (9% crash on a 9x long): 4.6 s -> 1.4 s from crash to closed.
+- Trigger orders (TP / SL / TWAP, IX 21) fill on the fast path too: pass the FastBook for the side the trigger trades and its
+  slabs after the market account. Matching is the same as take_fast (best of maker quotes and resting orders, mark +-5%,
+  no self-trade, maker budgets). The crank does this automatically.

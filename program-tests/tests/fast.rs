@@ -579,3 +579,57 @@ fn fast_new_side(e: &mut Env, idx: u64, side: u8) -> Address {
     let (m, ins) = (e.market, e.ins); let mut d = vec![70u8, 1]; d.extend_from_slice(&u64::MAX.to_le_bytes());
     assert!(!try_send(&mut e, vec![w(&tu), r(&m), w(&ins), w(&f), r(&k.slab)], d, &[]), "no second liquidation needed");
 }
+fn set_trig(e: &mut Env, kp: &Keypair, u: &Address, slot: u8, kind: u8, side: u8, v: [u64; 6]) {
+    let m = e.market; let mut d = vec![20u8, slot, kind, side]; for x in v { d.extend_from_slice(&x.to_le_bytes()); }
+    e.send("", vec![AccountMeta::new(kp.pubkey(), true), w(u), r(&m)], d, &[kp], true);
+}
+fn exec_fast(e: &mut Env, kp: &Keypair, ku: &Address, tu: &Address, f: &Address, slabs: &[Address], slot: u8) -> bool {
+    let m = e.market; let mut a = vec![AccountMeta::new(kp.pubkey(), true), w(ku), w(tu), r(&m), w(f)]; a.extend(slabs.iter().map(r));
+    let kpc = kp.insecure_clone(); try_send(e, a, vec![21u8, slot], &[&kpc])
+}
+/// Stop-loss on a fast-path market: it fires on the oracle, fills against maker bids, and pays the keeper its tip.
+#[test] fn stop_loss_fills_on_the_fast_book() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000); let (kp, ku) = e.user(1);
+    quote(&mut e, &k, &[(ASK, 100_010, 5_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 1_000, true);
+    set_trig(&mut e, &tp, &tu, 0, 2, 1, [99_000, 90_000, 1_000, 1_000, 0, 0]); // SL: sell 1000 when price <= 99,000, tip 1000
+    quote(&mut e, &k, &[(0, 99_400, 5_000)], true);
+    assert!(!exec_fast(&mut e, &kp, &ku, &tu, &f, &[k.slab], 0), "not triggered yet");
+    let s = e.slot + 1; e.set_time(s); e.oracle_update("", 985_00000000, None);
+    quote(&mut e, &k, &[(0, 98_450, 5_000)], true);
+    let (c0, k0) = (e.user_state(&tu).cash, e.user_state(&ku).cash);
+    assert!(exec_fast(&mut e, &kp, &ku, &tu, &f, &[k.slab], 0), "stop-loss executes against the maker bid");
+    let t = e.user_state(&tu); assert_eq!(t.pos[0].base == 0 || t.pos[0].market == [0; 32], true, "position closed");
+    assert_eq!(e.user_state(&ku).cash - k0, 1_000, "keeper tip");
+    assert!(t.cash > c0, "sale proceeds credited");
+    assert_eq!(fb(&e, &f).makers[0].base, -1_000 + 1_000, "maker bought it back: pending base nets to zero");
+    assert!(!exec_fast(&mut e, &kp, &ku, &tu, &f, &[k.slab], 0), "one-shot");
+}
+/// TWAP on a fast-path market: one slice per interval, nothing before the next slot is due.
+#[test] fn twap_slices_on_the_fast_book() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000); let (kp, ku) = e.user(1);
+    quote(&mut e, &k, &[(ASK, 100_010, 5_000)], true);
+    set_trig(&mut e, &tp, &tu, 1, 3, 0, [0, PX + 100, 900, 0, 5, 3]); // TWAP buy 900 in 3 slices, every 5 slots
+    assert!(exec_fast(&mut e, &kp, &ku, &tu, &f, &[k.slab], 1));
+    assert_eq!(e.user_state(&tu).pos[0].base, 300);
+    assert!(!exec_fast(&mut e, &kp, &ku, &tu, &f, &[k.slab], 1), "next slice not due");
+    for n in 0..2 { let s = e.slot + 5; e.set_time(s); e.oracle_update("", 1000_00000000, None); quote(&mut e, &k, &[(ASK, 100_010, 5_000)], true);
+        assert!(exec_fast(&mut e, &kp, &ku, &tu, &f, &[k.slab], 1), "slice {n}"); }
+    assert_eq!(e.user_state(&tu).pos[0].base, 900);
+    assert_eq!(e.user_state(&tu).triggers[1].kind, 0, "done");
+}
+/// On a split market a trigger must bring the book of the side it trades; the other book is refused.
+#[test] fn trigger_uses_the_right_split_book() {
+    let mut e = Env::new(); e.oracle_update("", 1000_00000000, None);
+    let (fbid, fask) = (fast_new_side(&mut e, 0, 1), fast_new_side(&mut e, 0, 2));
+    let k = maker(&mut e, &fask, 10_000_000_000, 1_000_000_000);
+    let m = e.market; e.send("", vec![AccountMeta::new(e.admin.pubkey(), true), r(&m), w(&fbid), r(&k.slab)], vec![62], &[], true);
+    quote(&mut e, &k, &[(ASK, 100_010, 5_000)], true);
+    let (tp, tu) = e.user(10_000_000_000); let (kp, ku) = e.user(1);
+    set_trig(&mut e, &tp, &tu, 0, 3, 0, [0, PX + 100, 300, 0, 5, 1]); // buy: needs the ask book
+    assert!(!exec_fast(&mut e, &kp, &ku, &tu, &fbid, &[k.slab], 0), "bid book refused for a buy");
+    assert!(exec_fast(&mut e, &kp, &ku, &tu, &fask, &[k.slab], 0));
+    assert_eq!(e.user_state(&tu).pos[0].base, 300);
+}

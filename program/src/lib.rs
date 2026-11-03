@@ -978,7 +978,7 @@ fn set_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult 
     u.triggers[s] = t;
     Ok(())
 }
-/// Permissionless keeper crank. accs: keeper(s), keeper user(w), target user(w), market(r), shards(w)..., [other markets]
+/// Permissionless keeper crank. accs: keeper(s), keeper user(w), target user(w), market(r), [fast book(w), slabs(r)...], shards(w)..., [other markets]
 /// data: tag, slot u8
 fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if a.len() < 5 || d.len() < 2 || a[1].address() == a[2].address() { return Err(err(E::BadData)); }
@@ -1019,8 +1019,17 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
     let taker_bps = TIERS[(t.tier as usize).min(TIERS.len() - 1)].0;
     if qty == 0 && !twap { t.triggers[si].kind = 0; gc_pos(t); return Ok(()); } // nothing to reduce: clear, no tip
     if qty == 0 { return Err(err(E::NotTriggered)); }
-    let f = take(pid, rest, &mk, m, t, &tk, pi, bid, tr.limit_px, qty, slot, taker_bps, STP_CANCEL_OLDEST)?;
-    if f.filled == 0 { return Err(err(E::NotTriggered)); } // AUDIT M-1: no tip / no slice burn without a fill
+    // a FastBook among the accounts: fill against maker quotes and resting orders (best price first), same rules as take_fast
+    let filled = if let Some(fx) = rest.iter().find(|x| disc_of(x) == DISC_FAST) {
+        let fb: &mut FastBook = load(fx, pid, DISC_FAST, FAST_SIZE)?;
+        let opp = if bid { 1usize } else { 0usize };
+        if fb.market != mk || (fb.side != 0 && fb.side != opp as u64 + 1) { return Err(err(E::BadAccount)); }
+        let px0 = mark(m); let band = px0 / 10000 * spec::QUOTE_BAND_BPS; let (blo, bhi) = bound_range(m);
+        let (lo, hi) = (px0.saturating_sub(band).max(blo), (px0 + band).min(bhi));
+        let (sl, cnt) = fast_slabs(pid, fb, rest, &tk)?;
+        fast_match(pid, fb, &sl[..cnt], (fb.idx as usize) << 4 | opp << 3, opp, bid, lo, hi, rest, &mk, m, t, &tk, pi, tr.limit_px, qty, slot, taker_bps)?
+    } else { take(pid, rest, &mk, m, t, &tk, pi, bid, tr.limit_px, qty, slot, taker_bps, STP_CANCEL_OLDEST)?.filled };
+    if filled == 0 { return Err(err(E::NotTriggered)); } // AUDIT M-1: no tip / no slice burn without a fill
     let w = &mut t.triggers[si];
     if twap {
         w.qty -= qty.min(w.qty); w.slices_left -= 1; w.next_slot = slot + tr.interval;
@@ -1030,7 +1039,7 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
     } else { w.kind = 0; }
     let tip = core::cmp::min(tr.tip, MAX_KEEPER_TIP) as i64;
     t.cash = i64c(t.cash as i128 - tip as i128)?; kp.cash = i64c(kp.cash as i128 + tip as i128)?;
-    emit(&[&[EVENTS_TRIGGER as u8, si as u8, tr.kind as u8], &tk, &f.filled.to_le_bytes()]);
+    emit(&[&[EVENTS_TRIGGER as u8, si as u8, tr.kind as u8], &tk, &filled.to_le_bytes()]);
     gc_pos(t);
     Ok(())
 }
@@ -1906,14 +1915,32 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     }
     let tier = (u.tier as usize).min(TIERS.len() - 1);
     let taker_bps = TIERS[tier].0;
-    let base0 = long(u.pos[pi].base);
-    let mut ev = EvBuf::new(&uk, bid);
+    fast_match(pid, f, &sl[..cnt], base_ix, opp, bid, lo, hi, rest, &mk, m, u, &uk, pi, limit, left, slot, taker_bps)?;
+    if !reduce {
+        if m.max_oi != 0 && m.oi_long > m.max_oi { return Err(err(E::Cap)); }
+        let p = &u.pos[pi];
+        if m.max_position != 0 && core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs()) > m.max_position as i128 { return Err(err(E::Cap)); }
+        let (eq, im, _) = health(pid, u, &a[2..], nw, true)?;
+        if eq < im { return Err(err(E::Margin)); }
+        if p.flags & POS_ISO != 0 { let (e2, i2, _) = iso_health(pid, u, pi, &a[2..], nw, true)?; if e2 < i2 { return Err(err(E::Margin)); } }
+    }
+    gc_pos(u);
+    Ok(())
+}
+
+/// Taker matching shared by take_fast and trigger orders: the better of the best maker quote and the best resting order fills
+/// first, until `left` lots are done or nothing is inside `limit`. Books the taker's side, maker fills, fees and OI. Returns lots.
+fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: usize, bid: bool, lo: u64, hi: u64,
+              rest: &[AccountView], mk: &Key, m: &Market, u: &mut User, uk: &Key, pi: usize, limit: u64, mut left: u64, slot: u64,
+              taker_bps: u64) -> Result<u64, ProgramError> {
+    let (want, base0) = (left, long(u.pos[pi].base));
+    let mut ev = EvBuf::new(uk, bid);
     while left > 0 {
-        let (bk, bl, bp, ba) = best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi).unwrap_or((usize::MAX, 0, 0, 0));
+        let (bk, bl, bp, ba) = best_quote(f, sl, base_ix, opp, bid, slot, lo, hi).unwrap_or((usize::MAX, 0, 0, 0));
         // resting orders strictly better than the best quote (or all of them when no quote is usable)
         if !rest.is_empty() || m.strict_take != 0 {
             let lim = if bk == usize::MAX { limit } else if bid { limit.min(bp - 1) } else { limit.max(bp + 1) };
-            let tf = take(pid, rest, &mk, m, u, &uk, pi, bid, lim, left, slot, taker_bps, STP_CANCEL_OLDEST)?;
+            let tf = take(pid, rest, mk, m, u, uk, pi, bid, lim, left, slot, taker_bps, STP_CANCEL_OLDEST)?;
             left -= tf.filled;
             if left == 0 || tf.abort { break; }
         }
@@ -1934,18 +1961,21 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     ev.flush();
     f.oi_long_delta += long(u.pos[pi].base) - base0;
     f.fills += 1;
-    if !reduce {
-        if m.max_oi != 0 && m.oi_long > m.max_oi { return Err(err(E::Cap)); }
-        let p = &u.pos[pi];
-        if m.max_position != 0 && core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs()) > m.max_position as i128 { return Err(err(E::Cap)); }
-        let (eq, im, _) = health(pid, u, &a[2..], nw, true)?;
-        if eq < im { return Err(err(E::Margin)); }
-        if p.flags & POS_ISO != 0 { let (e2, i2, _) = iso_health(pid, u, pi, &a[2..], nw, true)?; if e2 < i2 { return Err(err(E::Margin)); } }
-    }
-    gc_pos(u);
-    Ok(())
+    Ok(want - left)
 }
-
+/// Approved makers' slabs found in `xs`, skipping killed ones and the taker's own. Every slab must belong to this book.
+fn fast_slabs(pid: &Address, f: &FastBook, xs: &[AccountView], uk: &Key) -> Result<([(*const Slab, usize); FAST_MAKERS], usize), ProgramError> {
+    let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
+    let mut cnt = 0;
+    for x in xs.iter().filter(|x| disc_of(x) == DISC_SLAB) {
+        let s: &Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
+        let k = key(x);
+        let mi = f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))?;
+        if s.kill != 0 || s.user == *uk || cnt == FAST_MAKERS { continue; }
+        sl[cnt] = (s as *const Slab, mi); cnt += 1;
+    }
+    Ok((sl, cnt))
+}
 /// Best usable maker quote on the side a taker hits, inside [lo, hi]: (slab slot, level, price, lots available).
 /// Better price first, then the older quote. Lots are capped by the maker's remaining budget.
 #[inline(always)]
