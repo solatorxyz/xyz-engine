@@ -11,7 +11,7 @@ pub const RANK_N: usize = 8;
 pub const MAX_ORDERS: usize = 64;
 pub const MAX_LEDGER: usize = 32;
 pub const MAX_TRIGGERS: usize = 4;
-pub const MAX_POS: usize = 4;
+pub const MAX_POS: usize = 16;
 
 #[repr(C)]
 pub struct Market {
