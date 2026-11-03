@@ -1294,32 +1294,36 @@ fn read_ext(x: &AccountView, pid: &Address, m: &Market, now: i64) -> Option<u64>
 }
 /// Best bid / ask from approved maker slabs, for mid and premium. All approved slabs or none, like the shard set.
 fn fast_bbo(sh: &[AccountView], pid: &Address, mk: &Key, slot: u64, px: u64) -> Result<(Option<u64>, Option<u64>), ProgramError> {
-    let Some(fx) = sh.iter().find(|x| disc_of(x) == DISC_FAST) else { return Ok((None, None)) };
-    let f: &FastBook = load(fx, pid, DISC_FAST, FAST_SIZE)?;
-    if f.market != *mk { return Err(err(E::BadAccount)); }
     let band = px / 10000 * spec::QUOTE_BAND_BPS;
     let (lo, hi) = (px.saturating_sub(band), px + band);
-    let (mut bb, mut ba, mut seen) = (None::<u64>, None::<u64>, 0u64);
-    for x in sh {
-        if disc_of(x) != DISC_SLAB { continue; }
-        let s: &Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
-        let k = key(x);
-        let mi = f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))?;
-        if seen >> mi & 1 == 1 { return Err(err(E::BadAccount)); }
-        seen |= 1 << mi;
-        if s.kill != 0 || f.makers[mi].budget <= 0 { continue; }
-        for sd in 0..2usize {
-            let base = (f.idx as usize) << 4 | sd << 3;
-            for l in 0..SLAB_LEVELS {
-                let q = &s.quotes[base + l]; let p = q.px as u64;
-                if q.qty == 0 || p < lo || p > hi || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
-                let u_ = &f.used[mi][sd << 3 | l];
-                if u_.gen == q.gen && u_.qty >= q.qty { continue; }
-                if sd == 0 { bb = Some(bb.map_or(p, |v| v.max(p))); } else { ba = Some(ba.map_or(p, |v| v.min(p))); }
+    let (mut bb, mut ba) = (None::<u64>, None::<u64>);
+    // every FastBook passed contributes the sides it holds; each must come with all of its makers' slabs
+    for fx in sh.iter().filter(|x| disc_of(x) == DISC_FAST) {
+        let f: &FastBook = load(fx, pid, DISC_FAST, FAST_SIZE)?;
+        if f.market != *mk { return Err(err(E::BadAccount)); }
+        let mut seen = 0u64;
+        for x in sh {
+            if disc_of(x) != DISC_SLAB { continue; }
+            let s: &Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
+            let k = key(x);
+            let Some(mi) = f.makers[..f.n as usize].iter().position(|e| e.slab == k) else { continue };
+            if seen >> mi & 1 == 1 { return Err(err(E::BadAccount)); }
+            seen |= 1 << mi;
+            if s.kill != 0 || f.makers[mi].budget <= 0 { continue; }
+            for sd in 0..2usize {
+                if f.side != 0 && f.side != sd as u64 + 1 { continue; }
+                let base = (f.idx as usize) << 4 | sd << 3;
+                for l in 0..SLAB_LEVELS {
+                    let q = &s.quotes[base + l]; let p = q.px as u64;
+                    if q.qty == 0 || p < lo || p > hi || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
+                    let u_ = &f.used[mi][sd << 3 | l];
+                    if u_.gen == q.gen && u_.qty >= q.qty { continue; }
+                    if sd == 0 { bb = Some(bb.map_or(p, |v| v.max(p))); } else { ba = Some(ba.map_or(p, |v| v.min(p))); }
+                }
             }
         }
+        if seen != (1u64 << f.n) - 1 { return Err(err(E::MissingShards)); }
     }
-    if seen != (1u64 << f.n) - 1 { return Err(err(E::MissingShards)); }
     Ok((bb, ba))
 }
 /// PriceUpdateV2: disc8 | write_authority32 | verification_level (1 = Full) | feed_id32 | price i64 | conf u64 | expo i32 | publish_time i64 | ...
@@ -1703,16 +1707,17 @@ fn slab_init(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     s.disc = DISC_SLAB; s.authority = key(&a[0]); s.user = key(&a[1]);
     Ok(())
 }
-/// accs: admin(s), market(r), fast(w, zeroed). data: tag, idx u64
+/// accs: admin(s), market(r), fast(w, zeroed). data: tag, idx u64, [side u8: 0 both, 1 bids, 2 asks]
 fn fast_init(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if a.len() < 3 { return Err(err(E::BadData)); }
     let m: &Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
     if !auth(pid, &m.admin, a) { return Err(err(E::BadAccount)); }
     if !a[2].owned_by(pid) || a[2].data_len() < FAST_SIZE || disc_of(&a[2]) != 0 { return Err(err(E::BadAccount)); }
     let idx = rd64(d, 1)?;
-    if idx as usize >= SLAB_QUOTES / (2 * SLAB_LEVELS) { return Err(err(E::BadData)); }
+    let side = if d.len() > 9 { d[9] as u64 } else { 0 };
+    if idx as usize >= SLAB_QUOTES / (2 * SLAB_LEVELS) || side > 2 { return Err(err(E::BadData)); }
     let f = unsafe { &mut *(a[2].borrow_unchecked().as_ptr() as *mut FastBook) };
-    f.disc = DISC_FAST; f.market = key(&a[1]); f.idx = idx;
+    f.disc = DISC_FAST; f.market = key(&a[1]); f.idx = idx; f.side = side;
     Ok(())
 }
 /// Admin approves a maker for this market. accs: admin(s), market(r), fast(w), slab(r)
@@ -1863,6 +1868,7 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let (blo, bhi) = bound_range(m);
     let (lo, hi) = (px0.saturating_sub(band).max(blo), (px0 + band).min(bhi));
     let opp = if bid { 1usize } else { 0usize };
+    if f.side != 0 && f.side != opp as u64 + 1 { return Err(err(E::BadAccount)); } // split market: buyers use the ask book, sellers the bid book
     let base_ix = (f.idx as usize) << 4 | opp << 3;
     let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
     let mut cnt = 0;
@@ -1987,6 +1993,7 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let (blo, bhi) = bound_range(m);
     let (lo, hi) = (px.saturating_sub(band).max(blo).max(1), (px + band).min(bhi));
     let opp = if bid { 1usize } else { 0usize };
+    if f.side != 0 && f.side != opp as u64 + 1 { return Err(err(E::BadAccount)); }
     let base_ix = (f.idx as usize) << 4 | opp << 3;
     let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
     let (mut cnt, mut seen) = (0usize, 0u64);

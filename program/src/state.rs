@@ -178,7 +178,10 @@ pub struct FastMaker { pub slab: Key, pub user: Key, pub margin: i64, pub budget
 /// Per-market fill state: takers write here, so quotes and fills never contend on a write lock.
 #[repr(C)]
 pub struct FastBook { pub disc: u64, pub market: Key, pub idx: u64, pub n: u64, pub oi_long_delta: i64, pub fee_accum: i64, pub fills: u64,
-    pub makers: [FastMaker; FAST_MAKERS], pub used: [[Used; 2 * SLAB_LEVELS]; FAST_MAKERS] }
+    pub makers: [FastMaker; FAST_MAKERS], pub used: [[Used; 2 * SLAB_LEVELS]; FAST_MAKERS],
+    /// 0 = both sides; 1 = makers' bids only (sellers write here); 2 = makers' asks only (buyers write here).
+    /// A split market has one book per side, so buys and sells never contend for the same write lock.
+    pub side: u64 }
 pub const SLAB_SIZE: usize = core::mem::size_of::<Slab>();
 pub const FAST_SIZE: usize = core::mem::size_of::<FastBook>();
 

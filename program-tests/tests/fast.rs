@@ -485,3 +485,41 @@ fn model_take(e: &Env, f: &Address, slabs: &[(Address, Address)], taker: &Addres
     println!("reference model: {checked} takes compared");
     assert!(checked > 1000);
 }
+fn fast_new_side(e: &mut Env, idx: u64, side: u8) -> Address {
+    let k = Address::new_unique(); e.prog_acct(k, FAST_SIZE);
+    let mut d = vec![61u8]; d.extend_from_slice(&idx.to_le_bytes()); d.push(side);
+    let (a, m) = (e.admin.pubkey(), e.market);
+    e.send("", vec![AccountMeta::new(a, true), r(&m), w(&k)], d, &[], true); k
+}
+/// Split market: buyers fill against the ask book, sellers against the bid book. The two take transactions write disjoint
+/// accounts (their own User and their side's book), so the runtime can run them in parallel; the maker's fills from both
+/// books land in one position at settle.
+#[test] fn split_books_take_settle_and_disjoint_locks() {
+    let mut e = Env::new(); e.oracle_update("", 1000_00000000, None);
+    let (fbid, fask) = (fast_new_side(&mut e, 0, 1), fast_new_side(&mut e, 0, 2));
+    let k = maker(&mut e, &fbid, 10_000_000_000, 1_000_000_000);
+    let (a, m) = (e.admin.pubkey(), e.market); let _ = a;
+    e.send("", vec![AccountMeta::new(e.admin.pubkey(), true), r(&m), w(&fask), r(&k.slab)], vec![62], &[], true);
+    fund_m(&mut e, &fask, &k, 1_000_000_000, true);
+    quote(&mut e, &k, &[(ASK, 100_010, 500), (0, 99_990, 500)], true);
+    let (bp, bu) = e.user(10_000_000_000); let (sp, su) = e.user(10_000_000_000);
+    // wrong book for the side is refused
+    tk(&mut e, &bp, &bu, &fbid, &[k.slab], &[], 0, PX + 100, 10, false);
+    tk(&mut e, &sp, &su, &fask, &[k.slab], &[], 1, PX - 100, 10, false);
+    let buy = take_accts(&e, &bp, &bu, &fask, &[k.slab]); let sell = take_accts(&e, &sp, &su, &fbid, &[k.slab]);
+    let wb: Vec<_> = buy.iter().filter(|x| x.is_writable).map(|x| x.pubkey).collect(); let ws: Vec<_> = sell.iter().filter(|x| x.is_writable).map(|x| x.pubkey).collect();
+    assert!(wb.iter().all(|k| !ws.contains(k)), "buy and sell write disjoint accounts");
+    tk(&mut e, &bp, &bu, &fask, &[k.slab], &[], 0, PX + 100, 300, true);
+    tk(&mut e, &sp, &su, &fbid, &[k.slab], &[], 1, PX - 100, 200, true);
+    assert_eq!((e.user_state(&bu).pos[0].base, e.user_state(&su).pos[0].base), (300, -200));
+    assert_eq!((fb(&e, &fask).makers[0].base, fb(&e, &fbid).makers[0].base), (-300, 200));
+    settle(&mut e, &fask, &k); settle(&mut e, &fbid, &k);
+    assert_eq!(e.user_state(&k.u).pos[0].base, -100, "both books settle into one position");
+    // mark sees both sides only when both books (with all their slabs) are passed
+    let (mm, orc) = (e.market, e.oracle);
+    e.send("", vec![w(&mm), r(&orc), r(&fbid), r(&fask), r(&k.slab)], vec![4], &[], true);
+    // liquidation of a long sells into the bid book; the ask book is refused for it
+    let (m2, ins) = (e.market, e.ins);
+    let mut d = vec![70u8, 1]; d.extend_from_slice(&u64::MAX.to_le_bytes());
+    assert!(!try_send(&mut e, vec![w(&bu), r(&m2), w(&ins), w(&fask), r(&k.slab)], d.clone(), &[]), "healthy and wrong book");
+}
