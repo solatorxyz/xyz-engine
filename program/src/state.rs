@@ -144,3 +144,29 @@ pub const DISC_DELEGATE: u64 = 0x5045525044454c01; // "PERPDEL\x01"
 #[repr(C)]
 pub struct Delegate { pub disc: u64, pub user: Key, pub delegate: Key, pub expiry_slot: u64, pub max_qty: u64 }
 pub const DELEGATE_SIZE: usize = core::mem::size_of::<Delegate>();
+
+// ---------- fast quote path ----------
+pub const DISC_SLAB: u64 = 0x50455250534c4201; // "PERPSLB\x01"
+pub const DISC_FAST: u64 = 0x5045525046415301; // "PERPFAS\x01"
+pub const SLAB_QUOTES: usize = 2048;
+pub const SLAB_LEVELS: usize = 8;
+pub const FAST_MAKERS: usize = 8;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Quote { pub px: u32, pub qty: u32, pub gen: u32, pub slot: u32 }
+/// A maker's quotes for every market: written by the maker alone, read by takers. Index = market idx << 4 | side << 3 | level.
+#[repr(C)]
+pub struct Slab { pub disc: u64, pub authority: Key, pub user: Key, pub gen: u64, pub count: u64, pub kill: u64, pub quotes: [Quote; SLAB_QUOTES] }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Used { pub gen: u32, pub qty: u32 }
+/// Margin locked for quoting here, the notional it may still fill, and fills not yet moved to the maker's User.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FastMaker { pub slab: Key, pub user: Key, pub margin: i64, pub budget: i64, pub base: i64, pub quote: i64, pub volume: u64 }
+/// Per-market fill state: takers write here, so quotes and fills never contend on a write lock.
+#[repr(C)]
+pub struct FastBook { pub disc: u64, pub market: Key, pub idx: u64, pub n: u64, pub oi_long_delta: i64, pub fee_accum: i64, pub fills: u64,
+    pub makers: [FastMaker; FAST_MAKERS], pub used: [[Used; 2 * SLAB_LEVELS]; FAST_MAKERS] }
+pub const SLAB_SIZE: usize = core::mem::size_of::<Slab>();
+pub const FAST_SIZE: usize = core::mem::size_of::<FastBook>();

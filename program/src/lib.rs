@@ -168,6 +168,8 @@ fn delegate_max_qty(pid: &Address, a: &[AccountView], signer: &Key, uk: &Key, sl
 pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8]) -> ProgramResult {
     let tag = *data.first().ok_or(err(E::BadData))?;
     match tag as u64 {
+        spec::IX_SLAB_QUOTE => slab_quote(pid, accs, data),
+        spec::IX_TAKE_FAST => take_fast(pid, accs, data),
         IX_PLACE => batch(pid, accs, data, true),
         IX_BATCH => batch(pid, accs, data, false),
         IX_CANCEL => batch(pid, accs, data, false),
@@ -188,6 +190,12 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
         spec::IX_ISO_TRANSFER => iso_transfer(pid, accs, data),
         spec::IX_INIT_MULTISIG => init_multisig(pid, accs, data),
         spec::IX_ADMIN_PROPOSE => admin_propose(pid, accs, data),
+        spec::IX_SLAB_INIT => slab_init(pid, accs),
+        spec::IX_FAST_INIT => fast_init(pid, accs, data),
+        spec::IX_FAST_JOIN => fast_join(pid, accs),
+        spec::IX_SLAB_FUND => slab_fund(pid, accs, data),
+        spec::IX_SLAB_SETTLE => slab_settle(pid, accs),
+        spec::IX_SLAB_KILL => slab_kill(pid, accs, data),
         spec::IX_ADMIN_EXECUTE => admin_execute(pid, accs),
         IX_AGG_INIT => agg_init(pid, accs, data),
         IX_AGG_POST => agg_post(pid, accs, data),
@@ -1268,6 +1276,12 @@ fn aggregate(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     let m: &mut Market = load(&a[0], pid, DISC_MARKET, MARKET_SIZE)?;
     let mk = key(&a[0]);
     for x in a[1..].iter() {
+        if disc_of(x) == DISC_FAST {
+            let f: &mut FastBook = load(x, pid, DISC_FAST, FAST_SIZE)?;
+            if f.market != mk { return Err(err(E::BadAccount)); }
+            m.oi_long = (m.oi_long as i64 + f.oi_long_delta) as u64; f.oi_long_delta = 0;
+            m.fees += f.fee_accum; f.fee_accum = 0; continue;
+        }
         if disc_of(x) == DISC_INS {
             let ins: &mut Insurance = load(x, pid, DISC_INS, INS_SIZE)?;
             if ins.market != mk { return Err(err(E::BadAccount)); }
@@ -1553,7 +1567,7 @@ fn adl(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
         let from_c = (deficit - from_ins).min(ce.max(0)); // AUDIT M-5: never push the counterparty below zero
         ins.balance = i64c(ins.balance as i128 - from_ins)?;
         credit(c, ci, -from_c)?; ce -= from_c;
-        credit(t, ti, from_ins + from_c)?;
+        credit(t, ti, deficit)?; // VERIFY-1: the unrecovered part is carried in bad_debt, not also in the target's cash
         m.bad_debt = i64c(m.bad_debt as i128 + deficit - from_ins - from_c)?;
     }
     // re-rank the counterparty at its new size
@@ -1561,6 +1575,239 @@ fn adl(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if let Some(s) = adl_score(c, ci, px, ce) { rank_insert(r, side, &ck, s); }
     emit(&[&[EVENTS_ADL as u8], &tk, &ck, &q.to_le_bytes()]);
     gc_pos(t); gc_pos(c);
+    Ok(())
+}
+
+
+// ---------- fast quote path ----------
+/// accs: authority(s), user(r), slab(w, zeroed)
+fn slab_init(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
+    if a.len() < 3 { return Err(err(E::BadData)); }
+    let u: &mut User = load(&a[1], pid, DISC_USER, USER_SIZE)?;
+    if !a[0].is_signer() || u.authority != key(&a[0]) { return Err(err(E::BadAccount)); }
+    if !a[2].owned_by(pid) || a[2].data_len() < SLAB_SIZE || disc_of(&a[2]) != 0 { return Err(err(E::BadAccount)); }
+    let s = unsafe { &mut *(a[2].borrow_unchecked().as_ptr() as *mut Slab) };
+    s.disc = DISC_SLAB; s.authority = key(&a[0]); s.user = key(&a[1]);
+    Ok(())
+}
+/// accs: admin(s), market(r), fast(w, zeroed). data: tag, idx u64
+fn fast_init(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 3 { return Err(err(E::BadData)); }
+    let m: &Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+    if !auth(pid, &m.admin, a) { return Err(err(E::BadAccount)); }
+    if !a[2].owned_by(pid) || a[2].data_len() < FAST_SIZE || disc_of(&a[2]) != 0 { return Err(err(E::BadAccount)); }
+    let idx = rd64(d, 1)?;
+    if idx as usize >= SLAB_QUOTES / (2 * SLAB_LEVELS) { return Err(err(E::BadData)); }
+    let f = unsafe { &mut *(a[2].borrow_unchecked().as_ptr() as *mut FastBook) };
+    f.disc = DISC_FAST; f.market = key(&a[1]); f.idx = idx;
+    Ok(())
+}
+/// Admin approves a maker for this market. accs: admin(s), market(r), fast(w), slab(r)
+fn fast_join(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
+    if a.len() < 4 { return Err(err(E::BadData)); }
+    let m: &Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+    let f: &mut FastBook = load(&a[2], pid, DISC_FAST, FAST_SIZE)?;
+    let s: &mut Slab = load(&a[3], pid, DISC_SLAB, SLAB_SIZE)?;
+    if !auth(pid, &m.admin, a) || f.market != key(&a[1]) { return Err(err(E::BadAccount)); }
+    let (n, sk) = (f.n as usize, key(&a[3]));
+    if n >= FAST_MAKERS { return Err(err(E::Cap)); }
+    if f.makers[..n].iter().any(|x| x.slab == sk) { return Err(err(E::BadAccount)); }
+    f.makers[n] = FastMaker { slab: sk, user: s.user, margin: 0, budget: 0, base: 0, quote: 0, volume: 0 };
+    f.n += 1;
+    Ok(())
+}
+/// Maker overwrites its own quotes: no margin read and no market account, so it conflicts with nothing but takers reading this slab.
+/// accs: authority(s), slab(w). data: tag, items (idx u16, px u32, qty u32)
+fn slab_quote(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 2 || !a[0].is_signer() { return Err(err(E::BadAccount)); }
+    let s: &mut Slab = load(&a[1], pid, DISC_SLAB, SLAB_SIZE)?;
+    if s.authority != key(&a[0]) { return Err(err(E::BadAccount)); }
+    let body = &d[1..];
+    if body.len() % spec::QUOTE_ITEM_SIZE != 0 { return Err(err(E::BadData)); }
+    let slot = clock()?.slot as u32;
+    s.gen = s.gen.wrapping_add(1); let g = s.gen as u32;
+    for it in body.chunks_exact(spec::QUOTE_ITEM_SIZE) {
+        let i = u16::from_le_bytes([it[0], it[1]]) as usize;
+        if i >= SLAB_QUOTES { return Err(err(E::BadData)); }
+        let q = unsafe { s.quotes.get_unchecked_mut(i) };
+        q.px = u32::from_le_bytes([it[2], it[3], it[4], it[5]]); q.qty = u32::from_le_bytes([it[6], it[7], it[8], it[9]]);
+        q.gen = g; q.slot = slot;
+    }
+    s.count = s.count.wrapping_add((body.len() / spec::QUOTE_ITEM_SIZE) as u64);
+    Ok(())
+}
+/// Emergency stop for all quotes of a maker. accs: authority(s), slab(w). data: tag, on u8
+fn slab_kill(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 2 || !a[0].is_signer() || d.len() < 2 { return Err(err(E::BadData)); }
+    let s: &mut Slab = load(&a[1], pid, DISC_SLAB, SLAB_SIZE)?;
+    if s.authority != key(&a[0]) { return Err(err(E::BadAccount)); }
+    s.kill = d[1] as u64;
+    Ok(())
+}
+#[inline(always)]
+fn maker_budget(m: &Market, margin: i64) -> i64 { i64::try_from(margin.max(0) as i128 * 10000 / m.imr_bps as i128).unwrap_or(i64::MAX) }
+/// Lock (amount > 0) or release (amount < 0) quoting margin. A maker can only fill up to margin / IMR of notional between settles.
+/// accs: authority(s), user(w), market(r), fast(w), [other markets]. data: tag, amount i64
+fn slab_fund(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 4 { return Err(err(E::BadData)); }
+    let amt = rd64(d, 1)? as i64;
+    let u: &mut User = load(&a[1], pid, DISC_USER, USER_SIZE)?;
+    let m: &Market = load(&a[2], pid, DISC_MARKET, MARKET_SIZE)?;
+    let f: &mut FastBook = load(&a[3], pid, DISC_FAST, FAST_SIZE)?;
+    let (uk, mk) = (key(&a[1]), key(&a[2]));
+    if !a[0].is_signer() || u.authority != key(&a[0]) || f.market != mk { return Err(err(E::BadAccount)); }
+    home(u, m)?;
+    let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
+    let n = f.n as usize;
+    let e = f.makers[..n].iter_mut().find(|x| x.user == uk).ok_or(err(E::BadAccount))?;
+    if amt < 0 && (e.base != 0 || e.quote != 0) { return Err(err(E::Ledger)); } // settle first
+    let nm = i64c(e.margin as i128 + amt as i128)?;
+    if nm < 0 { return Err(err(E::Margin)); }
+    settle_funding_all(pid, u, &a[2..])?;
+    u.cash = i64c(u.cash as i128 - amt as i128)?; e.margin = nm;
+    e.budget = maker_budget(m, nm);
+    if amt > 0 { let (eq, im, _) = health(pid, u, &a[2..], nw, true)?; if u.cash < 0 || eq < im { return Err(err(E::Margin)); } }
+    Ok(())
+}
+/// Permissionless: move a maker's fills into its User and refill the budget. A maker below maintenance gets its margin back
+/// in cash and stops quoting, so normal liquidation sees all of its equity.
+/// accs: user(w), market(r), fast(w), [other markets]
+fn slab_settle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
+    if a.len() < 3 { return Err(err(E::BadData)); }
+    let u: &mut User = load(&a[0], pid, DISC_USER, USER_SIZE)?;
+    let m: &Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+    let f: &mut FastBook = load(&a[2], pid, DISC_FAST, FAST_SIZE)?;
+    let (uk, mk) = (key(&a[0]), key(&a[1]));
+    if f.market != mk { return Err(err(E::BadAccount)); }
+    home(u, m)?;
+    let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
+    let n = f.n as usize;
+    let e = f.makers[..n].iter_mut().find(|x| x.user == uk).ok_or(err(E::BadAccount))?;
+    settle_funding_all(pid, u, &a[1..])?;
+    if e.base != 0 || e.quote != 0 {
+        let pi = pos_idx(u, &mk, m.funding_index)?;
+        let (ob, before) = (u.pos[pi].base, long(u.pos[pi].base));
+        u.pos[pi].base = ob.checked_add(e.base).ok_or(err(E::Math))?;
+        credit(u, pi, e.quote as i128)?;
+        u.pos[pi].cost = cost_after(ob, u.pos[pi].base, u.pos[pi].cost, -(e.quote as i128))?;
+        f.oi_long_delta += long(u.pos[pi].base) - before;
+        u.maker_volume += e.volume;
+        e.base = 0; e.quote = 0; e.volume = 0;
+    }
+    let (eq, _, mm) = health(pid, u, &a[1..], nw, false)?;
+    if eq < mm { u.cash = i64c(u.cash as i128 + e.margin as i128)?; e.margin = 0; }
+    e.budget = maker_budget(m, e.margin);
+    gc_pos(u);
+    Ok(())
+}
+/// Taker order against maker slabs and, when opposite-side shards are passed, resting book orders. Better price wins.
+/// accs: authority(s), user(w), market(r), fast(w), slabs(r) x ns, [shards], [other markets]
+/// data: tag, side u8, flags u8, ns u8, limit u64, qty u64
+fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 4 || d.len() != 20 { return Err(err(E::BadData)); }
+    let (bid, fl, ns) = (d[1] as u64 == SIDE_BID, d[2] as u64, d[3] as usize);
+    let (limit, mut left) = (rd64(d, 4)?, rd64(d, 12)?);
+    if ns > FAST_MAKERS || a.len() < 4 + ns || left == 0 || left > u32::MAX as u64 { return Err(err(E::BadData)); }
+    let u: &mut User = load(&a[1], pid, DISC_USER, USER_SIZE)?;
+    let m: &Market = load(&a[2], pid, DISC_MARKET, MARKET_SIZE)?;
+    let f: &mut FastBook = load(&a[3], pid, DISC_FAST, FAST_SIZE)?;
+    let (uk, mk) = (key(&a[1]), key(&a[2]));
+    if f.market != mk { return Err(err(E::BadAccount)); }
+    let clk = clock()?; let slot = clk.slot; let nw: Now = (slot, clk.unix_timestamp);
+    let rest = &a[4 + ns..];
+    let dmax = if a[0].is_signer() && u.authority == key(&a[0]) { u64::MAX } else if a[0].is_signer() {
+        delegate_max_qty(pid, rest, &key(&a[0]), &uk, slot).ok_or(err(E::BadAccount))? } else { return Err(err(E::BadAccount)); };
+    if left > dmax { return Err(err(E::Cap)); }
+    home(u, m)?;
+    claim_all(pid, u, &uk, rest)?;
+    let pi = pos_idx(u, &mk, m.funding_index)?;
+    settle_funding_all(pid, u, &a[2..])?;
+    let reduce = fl & FLAG_REDUCE_ONLY != 0;
+    if reduce {
+        let b = u.pos[pi].base;
+        let cap = if bid && b < 0 { (-b) as u64 } else if !bid && b > 0 { b as u64 } else { 0 };
+        left = left.min(cap);
+        if left == 0 { gc_pos(u); return Ok(()); }
+    } else {
+        if m.paused != 0 { return Err(err(E::Paused)); }
+        if stale(m, nw) { return Err(err(E::Stale)); }
+    }
+    let px0 = mark(m);
+    let band = px0 / 10000 * spec::QUOTE_BAND_BPS;
+    let (lo, hi) = (px0.saturating_sub(band), px0 + band);
+    let opp = if bid { 1usize } else { 0usize };
+    let base_ix = (f.idx as usize) << 4 | opp << 3;
+    let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
+    let mut cnt = 0;
+    for x in a[4..4 + ns].iter() {
+        let s: &Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
+        let k = key(x);
+        let mi = f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))?;
+        if s.kill != 0 || s.user == uk { continue; } // no self-trade against own slab
+        sl[cnt] = (s as *const Slab, mi); cnt += 1;
+    }
+    let tier = (u.tier as usize).min(TIERS.len() - 1);
+    let taker_bps = TIERS[tier].0;
+    let base0 = long(u.pos[pi].base);
+    let mut ev = EvBuf::new(&uk, bid);
+    while left > 0 {
+        let (mut bk, mut bl, mut bp, mut ba, mut bs) = (usize::MAX, 0usize, 0u64, 0u64, u32::MAX);
+        for (k, &(sp, mi)) in sl[..cnt].iter().enumerate() {
+            let s = unsafe { &*sp };
+            let e = &f.makers[mi];
+            if e.budget <= 0 { continue; }
+            for l in 0..SLAB_LEVELS {
+                let q = unsafe { s.quotes.get_unchecked(base_ix + l) };
+                if q.qty == 0 || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
+                let p = q.px as u64;
+                if p == 0 || p < lo || p > hi { continue; }
+                let u_ = unsafe { f.used.get_unchecked(mi).get_unchecked(opp << 3 | l) };
+                let av = (if u_.gen == q.gen { q.qty.saturating_sub(u_.qty) } else { q.qty }) as u64;
+                let av = av.min(e.budget as u64 / p);
+                if av == 0 { continue; }
+                if bk == usize::MAX || (bid && p < bp) || (!bid && p > bp) || (p == bp && q.slot < bs) { bk = k; bl = l; bp = p; ba = av; bs = q.slot; }
+            }
+        }
+        // resting orders strictly better than the best quote (or all of them when no quote is usable)
+        if !rest.is_empty() {
+            let lim = if bk == usize::MAX { limit } else if bid { limit.min(bp - 1) } else { limit.max(bp + 1) };
+            let tf = take(pid, rest, &mk, m, u, &uk, pi, bid, lim, left, slot, taker_bps, STP_CANCEL_OLDEST)?;
+            left -= tf.filled;
+            if left == 0 || tf.abort { break; }
+        }
+        if bk == usize::MAX || (bid && bp > limit) || (!bid && bp < limit) { break; }
+        let (sp, mi) = sl[bk];
+        let q = unsafe { &(*sp).quotes[base_ix + bl] };
+        let fq = ba.min(left);
+        let nt = bp * fq; // px < 2^32, qty < 2^32
+        let fee = bps_up(nt as i128, taker_bps);
+        let e = &mut f.makers[mi];
+        let sg: i64 = if bid { 1 } else { -1 };
+        e.budget -= nt as i64;
+        e.base = e.base.checked_sub(sg * fq as i64).ok_or(err(E::Math))?;
+        e.quote = i64c(e.quote as i128 + sg as i128 * nt as i128)?;
+        e.volume += fq;
+        let us = &mut f.used[mi][opp << 3 | bl];
+        if us.gen == q.gen { us.qty += fq as u32; } else { us.gen = q.gen; us.qty = fq as u32; }
+        f.fee_accum = i64c(f.fee_accum as i128 + fee)?;
+        credit(u, pi, -fee - sg as i128 * nt as i128)?;
+        let ob = u.pos[pi].base; u.pos[pi].base = ob.checked_add(sg * fq as i64).ok_or(err(E::Math))?;
+        u.pos[pi].cost = cost_after(ob, u.pos[pi].base, u.pos[pi].cost, sg as i128 * nt as i128)?;
+        ev.push(&e.user, bp, fq, (mi as u64) << 32 | q.gen as u64);
+        left -= fq;
+    }
+    ev.flush();
+    f.oi_long_delta += long(u.pos[pi].base) - base0;
+    f.fills += 1;
+    if !reduce {
+        if m.max_oi != 0 && m.oi_long > m.max_oi { return Err(err(E::Cap)); }
+        let p = &u.pos[pi];
+        if m.max_position != 0 && core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs()) > m.max_position as i128 { return Err(err(E::Cap)); }
+        let (eq, im, _) = health(pid, u, &a[2..], nw, true)?;
+        if eq < im { return Err(err(E::Margin)); }
+        if p.flags & POS_ISO != 0 { let (e2, i2, _) = iso_health(pid, u, pi, &a[2..], nw, true)?; if e2 < i2 { return Err(err(E::Margin)); } }
+    }
+    gc_pos(u);
     Ok(())
 }
 
