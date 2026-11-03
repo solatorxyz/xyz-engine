@@ -46,3 +46,7 @@ Use `sdk/ts/everytick.ts` (builders, decoders, `fastDepth`). `sdk/ts/smoke.ts` s
   25% chunk. Example from the tests: a 9x long just under maintenance closed 10,674 of 90,000 lots, not 22,500.
 - Keeper reward: append your own User account (same vault) to liquidate_book / liquidate_fast and receive 20% of the
   liquidation fee (LIQ_KEEPER_SHARE_BPS); insurance gets the rest. No keeper account: all to insurance.
+- Crank is event-driven: programSubscribe streams (markets, users, fast books) keep a cache and wake it on any change; a full
+  read runs every CRANK_REFRESH_S (60 s) and on every tick when the stream is down. It warms up its keeper reward account at
+  start, liquidates the position holding the most maintenance first, and when the band has no liquidity sends the
+  liquidation and the ADL in one transaction. Local e2e (9% crash on a 9x long): 4.6 s -> 1.4 s from crash to closed.
