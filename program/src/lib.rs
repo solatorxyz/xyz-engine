@@ -390,7 +390,7 @@ fn find_market(pid: &Address, k: &Key, a: &[AccountView]) -> Result<&'static Mar
 }
 fn settle_funding_all(pid: &Address, u: &mut User, a: &[AccountView]) -> ProgramResult {
     for p in u.pos.iter_mut() {
-        if p.market == [0; 32] { continue; }
+        if p.market == [0; 32] { break; } // used positions are packed at the front (gc_pos)
         let m = find_market(pid, &p.market, a)?;
         let idx = m.funding_index;
         let dd = idx as i128 - p.funding_snap as i128;
@@ -464,7 +464,8 @@ fn iso_transfer(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
 fn health(pid: &Address, u: &User, a: &[AccountView], nw: Now, need_fresh: bool) -> Result<(i128, i128, i128), ProgramError> {
     let (mut eq, mut im, mut mm) = (u.cash as i128, 0i128, 0i128);
     for p in u.pos.iter() {
-        if p.market == [0; 32] || p.flags & POS_ISO != 0 { continue; } // isolated positions are margined on their own
+        if p.market == [0; 32] { break; }
+        if p.flags & POS_ISO != 0 { continue; } // isolated positions are margined on their own
         let m = find_market(pid, &p.market, a)?;
         if need_fresh && stale(m, nw) && (p.base != 0 || p.bid_open != 0 || p.ask_open != 0) { return Err(err(E::Stale)); }
         let px = mark(m);
@@ -479,14 +480,23 @@ fn pos_idx(u: &mut User, mk: &Key, funding_index: i64) -> Result<usize, ProgramE
     let mut free = usize::MAX;
     for (i, p) in u.pos.iter().enumerate() {
         if p.market == *mk { return Ok(i); }
-        if p.market == [0; 32] && free == usize::MAX { free = i; }
+        if p.market == [0; 32] { free = i; break; }
     }
     if free == usize::MAX { return Err(err(E::Cap)); }
     u.pos[free] = Pos { market: *mk, base: 0, funding_snap: funding_index, bid_open: 0, ask_open: 0, n_orders: 0, cost: 0, iso_margin: 0, flags: 0 };
     Ok(free)
 }
+/// Free flat, idle positions and keep the used ones packed at the front in their order, so every loop over
+/// positions stops at the first empty slot. Runs last in each instruction (indices held earlier are stale after it).
 fn gc_pos(u: &mut User) {
-    for p in u.pos.iter_mut() { if p.base == 0 { p.cost = 0; p.flags &= POS_ISO; if p.bid_open == 0 && p.ask_open == 0 && p.iso_margin == 0 && p.flags == 0 { p.market = [0; 32]; } } }
+    let mut j = 0;
+    for i in 0..MAX_POS {
+        let p = &mut u.pos[i];
+        if p.market == [0; 32] { break; }
+        if p.base == 0 { p.cost = 0; p.flags &= POS_ISO; if p.bid_open == 0 && p.ask_open == 0 && p.iso_margin == 0 && p.flags == 0 { p.market = [0; 32]; continue; } }
+        if i != j { u.pos.swap(i, j); }
+        j += 1;
+    }
 }
 #[inline(always)]
 /// AUDIT N-7: cost basis after a base change with signed quote `paid` (> 0 = paid). Flat -> 0; sign flip ->
