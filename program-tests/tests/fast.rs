@@ -681,3 +681,22 @@ fn exec_fast(e: &mut Env, kp: &Keypair, ku: &Address, tu: &Address, f: &Address,
     println!("liquidation fuzz: {liqs} liquidations, {takes} takes");
     assert!(liqs > 20, "the fuzz must actually liquidate");
 }
+/// The SDK's liquidation price formula matches the program: just above it liquidation is refused, just below it goes through.
+#[test] fn liquidation_price_formula_matches_the_program() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(1_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 90_000, true);
+    let u = e.user_state(&tu); let mmr = e.market_state().mmr_bps as f64;
+    // p* = (mm_rest - eq_rest) / (b - |b| mmr): one position, so eq_rest = cash and mm_rest = 0
+    let b = u.pos[0].base as f64; let pstar = -(u.cash as f64) / (b - b.abs() * mmr / 10_000.0);
+    println!("liquidation price {pstar:.1}");
+    let try_at = |e: &mut Env, px: u64| -> bool {
+        let s = e.slot + 1; e.set_time(s); e.oracle_update("", (px * 1_000_000) as i64, None);
+        quote(e, &k, &[(0, (px - 3) as u32, 100_000)], true);
+        let (m, ins) = (e.market, e.ins); let mut d = vec![70u8, 1]; d.extend_from_slice(&u64::MAX.to_le_bytes());
+        try_send(e, vec![w(&tu), r(&m), w(&ins), w(&f), r(&k.slab)], d, &[])
+    };
+    assert!(!try_at(&mut e, pstar.ceil() as u64 + 2), "above the liquidation price: refused");
+    assert!(try_at(&mut e, pstar.floor() as u64 - 2), "below the liquidation price: liquidated");
+}

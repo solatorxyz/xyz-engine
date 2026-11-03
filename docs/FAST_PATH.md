@@ -53,3 +53,6 @@ Use `sdk/ts/everytick.ts` (builders, decoders, `fastDepth`). `sdk/ts/smoke.ts` s
 - Trigger orders (TP / SL / TWAP, IX 21) fill on the fast path too: pass the FastBook for the side the trigger trades and its
   slabs after the market account. Matching is the same as take_fast (best of maker quotes and resting orders, mark +-5%,
   no self-trade, maker budgets). The crank does this automatically.
+- Liquidation price for the UI: `liquidation_price()` (Python) / `liquidationPrice()` (TS) solve equity = maintenance for one
+  position with the others held at their marks. Checked against the program: 2 ticks above it liquidation is refused, 2 below it
+  goes through.
