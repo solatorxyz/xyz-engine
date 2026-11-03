@@ -23,4 +23,4 @@
 | settle_funding (permissionless, 1 position) | 196 |
 | aggregate OI/fees from 9 shards (crank) | 851 |
 | liquidate_book (permissionless, 1 chunk into the book, no liquidator capital) | 5292 |
-| exec SL trigger on mark (keeper crank, IOC reduce-only) | 2624 |
+| exec SL trigger on mark (keeper crank, IOC reduce-only) | 2647 |

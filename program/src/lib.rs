@@ -1928,6 +1928,7 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     Ok(())
 }
 
+#[inline(always)]
 /// Taker matching shared by take_fast and trigger orders: the better of the best maker quote and the best resting order fills
 /// first, until `left` lots are done or nothing is inside `limit`. Books the taker's side, maker fills, fees and OI. Returns lots.
 fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: usize, bid: bool, lo: u64, hi: u64,
