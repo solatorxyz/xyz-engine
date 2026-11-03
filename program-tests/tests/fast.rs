@@ -245,3 +245,122 @@ fn fund_t(e: &mut Env, f: &Address, k: &Mk, amt: i64, target: i64, ok: bool) {
     // the account now meets initial margin again: a taker order that needs exactly the released cash still clears
     assert_eq!(b.makers[0].budget, b.makers[0].margin as i64 * 10);
 }
+fn try_send(e: &mut Env, accounts: Vec<AccountMeta>, data: Vec<u8>, signers: &[&Keypair]) -> bool {
+    let ix = Instruction { program_id: e.pid, accounts, data };
+    let mut s: Vec<&Keypair> = vec![&e.admin]; s.extend_from_slice(signers);
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&e.admin.pubkey()), &s, e.svm.latest_blockhash());
+    let ok = e.svm.send_transaction(tx).is_ok(); e.svm.expire_blockhash(); ok
+}
+struct Rng(u64);
+impl Rng { fn n(&mut self, m: u64) -> u64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0 % m } }
+/// Random quotes, takes, settles, funding moves, kills and price moves against three makers and three takers.
+/// Every step: positions net to zero (users + unsettled maker fills) and no maker budget goes negative.
+/// At the end, after everyone settles: cash + locked margin + fees + insurance == tokens in the vault.
+#[test] fn random_fast_sequences() {
+    let (mut takes_ok, mut takes_fail) = (0u64, 0u64);
+    for seed in 1..=24u64 {
+        let mut g = Rng(seed * 0x9E3779B97F4A7C15 | 1);
+        let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let f = fast_new(&mut e, 0);
+        let mk: Vec<Mk> = (0..3).map(|i| maker(&mut e, &f, 20_000_000_000, if i == 0 { 0 } else { 2_000_000_000 })).collect();
+        let tk_: Vec<(Keypair, Address)> = (0..3).map(|_| e.user(2_000_000_000 + g.n(8_000_000_000))).collect();
+        fund_t(&mut e, &f, &mk[0], 0, 5_000_000_000, true); settle(&mut e, &f, &mk[0]);
+        let mut px: i64 = 1000_00000000;
+        let slabs: Vec<Address> = mk.iter().map(|m| m.slab).collect();
+        for _ in 0..250 {
+            match g.n(10) {
+                0..=2 => { let i = g.n(3) as usize; let mid = (px / 1_000_000) as u64;
+                    let v: Vec<(u16, u32, u32)> = (0..4).map(|_| { let s = g.n(2) as u16; let l = g.n(8) as u16;
+                        let off = 1 + g.n(300); let p = if s == 1 { mid + off } else { mid - off }; (s << 3 | l, p as u32, (1 + g.n(50_000)) as u32) }).collect();
+                    quote(&mut e, &mk[i], &v, true); }
+                3..=5 => { let i = g.n(3) as usize; let side = g.n(2) as u8; let mid = (px / 1_000_000) as u64;
+                    let lim = if side == 0 { mid + g.n(600) } else { mid - g.n(600) };
+                    let m = e.market; let (kp, u) = (&tk_[i].0, tk_[i].1);
+                    let mut a = vec![AccountMeta::new(kp.pubkey(), true), w(&u), r(&m), w(&f)]; a.extend(slabs.iter().map(r));
+                    let fl = if g.n(4) == 0 { 1u8 } else { 0 };
+                    let mut d = take_ix(side, fl, 3, lim, 1 + g.n(80_000)); d[2] = fl;
+                    let kpc = kp.insecure_clone();
+                    if try_send(&mut e, a, d, &[&kpc]) { takes_ok += 1 } else { takes_fail += 1 } }
+                6 => { let i = g.n(3) as usize; let m = e.market; let u = mk[i].u; try_send(&mut e, vec![w(&u), r(&m), w(&f)], vec![65], &[]); }
+                7 => { let i = g.n(3) as usize; let amt = g.n(3_000_000_000) as i64 - 1_000_000_000;
+                    let mut d = vec![64u8]; d.extend_from_slice(&amt.to_le_bytes()); if g.n(3) == 0 { d.extend_from_slice(&(g.n(6_000_000_000) as i64).to_le_bytes()); }
+                    let m = e.market; let kp = mk[i].kp.insecure_clone(); let u = mk[i].u;
+                    try_send(&mut e, vec![AccountMeta::new(kp.pubkey(), true), w(&u), r(&m), w(&f)], d, &[&kp]); }
+                8 => { let i = g.n(3) as usize; let kp = mk[i].kp.insecure_clone(); let s = mk[i].slab;
+                    try_send(&mut e, vec![AccountMeta::new(kp.pubkey(), true), w(&s)], vec![67u8, (g.n(5) == 0) as u8], &[&kp]); }
+                _ => { px = (px as i128 * (10_000 + g.n(401) as i128 - 200) / 10_000) as i64; let s = e.slot + 1 + g.n(3); e.set_time(s); e.oracle_update("", px, None); }
+            }
+            let b = fb(&e, &f);
+            let mut net: i128 = (0..3).map(|i| b.makers[i].base as i128).sum();
+            for a in mk.iter().map(|m| m.u).chain(tk_.iter().map(|t| t.1)) { net += e.user_state(&a).pos.iter().filter(|p| p.market == e.market.to_bytes()).map(|p| p.base as i128).sum::<i128>(); }
+            assert_eq!(net, 0, "seed {seed}: positions don't net to zero");
+            for i in 0..3 { assert!(b.makers[i].budget >= 0, "seed {seed}: negative budget"); }
+        }
+        let s = e.slot + 1; e.set_time(s); e.oracle_update("", px, None);
+        for i in 0..3 { let m = e.market; let u = mk[i].u; e.send("", vec![w(&u), r(&m), w(&f)], vec![65], &[], true); }
+        for i in 0..3 { let m = e.market; let (kp, u) = (tk_[i].0.insecure_clone(), tk_[i].1);
+            let mut a = vec![AccountMeta::new(kp.pubkey(), true), w(&u), r(&m), w(&f)]; a.extend(slabs.iter().map(r));
+            let mut d = take_ix(0, 1, 3, 1, 1); d[2] = 1; try_send(&mut e, a, d, &[&kp]); }
+        let b = fb(&e, &f);
+        let mut sum: i128 = (0..3).map(|i| b.makers[i].margin as i128).sum::<i128>() + b.fee_accum as i128 + e.ins_bal() as i128 + e.market_state().fees as i128;
+        for a in mk.iter().map(|m| m.u).chain(tk_.iter().map(|t| t.1)) { sum += e.user_state(&a).cash as i128; }
+        // unrealized PnL is not cash: add it at the mark so the books close
+        let ms = e.market_state();
+        for a in mk.iter().map(|m| m.u).chain(tk_.iter().map(|t| t.1)) { let _ = (a, &ms); }
+        let v = e.vault_amount() as i128;
+        let pnl_open: i128 = mk.iter().map(|m| m.u).chain(tk_.iter().map(|t| t.1)).map(|a| e.user_state(&a).pos.iter().filter(|p| p.market == e.market.to_bytes()).map(|p| p.base as i128).sum::<i128>()).sum();
+        assert_eq!(pnl_open, 0);
+        assert!((sum - v).abs() <= 16, "seed {seed}: cash {sum} vs vault {v}");
+    }
+    println!("fuzz takes ok {takes_ok} rejected {takes_fail}");
+    assert!(takes_ok > 500);
+}
+fn liq_fast(e: &mut Env, f: &Address, t: &Address, slabs: &[Address], ok: bool) -> Option<u64> {
+    let (m, ins) = (e.market, e.ins);
+    let mut a = vec![w(t), r(&m), w(&ins), w(f)]; a.extend(slabs.iter().map(r));
+    let mut d = vec![70u8, slabs.len() as u8]; d.extend_from_slice(&u64::MAX.to_le_bytes());
+    e.send(if ok { "liquidate_fast" } else { "" }, a, d, &[], ok)
+}
+/// 9x long taker, price -9%: liquidation fills against maker bids in 25% chunks, fee to insurance, maker fills pending.
+#[test] fn liquidate_fast_fills_against_maker_quotes() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(1_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 90_000, true);
+    settle(&mut e, &f, &k);
+    liq_fast(&mut e, &f, &tu, &[k.slab], false); // healthy
+    let s = e.slot + 1; e.set_time(s); e.oracle_update("", 910_00000000, None);
+    liq_fast(&mut e, &f, &tu, &[k.slab], true); // below maintenance and no bids anywhere: succeeds by opening the ADL window
+    let u0 = e.user_state(&tu); assert_eq!(u0.pos[0].flags & 2, 2, "empty fast book (all makers passed, no shards) opens the ADL window");
+    quote(&mut e, &k, &[(0, 90_990, 100_000)], true);
+    let ins0 = e.ins_bal();
+    liq_fast(&mut e, &f, &tu, &[k.slab], true);
+    let u = e.user_state(&tu); assert_eq!(u.pos[0].base, 67_500, "one 25% chunk");
+    let b = fb(&e, &f); assert_eq!(b.makers[0].base, 22_500, "maker bought the chunk at its bid, pending until settle");
+    let fee = e.ins_bal() - ins0; assert_eq!(fee as i128, (90_990i128 * 22_500 * 25) / 10_000, "liquidation fee to insurance");
+    while e.user_state(&tu).pos[0].base > 0 { if liq_fast_try(&mut e, &f, &tu, &[k.slab]) == false { break; } }
+    let net: i128 = e.user_state(&tu).pos[0].base as i128 + fb(&e, &f).makers[0].base as i128 + e.user_state(&k.u).pos[0].base as i128;
+    assert_eq!(net, 0);
+}
+fn liq_fast_try(e: &mut Env, f: &Address, t: &Address, slabs: &[Address]) -> bool {
+    let (m, ins) = (e.market, e.ins);
+    let mut a = vec![w(t), r(&m), w(&ins), w(f)]; a.extend(slabs.iter().map(r));
+    let mut d = vec![70u8, slabs.len() as u8]; d.extend_from_slice(&u64::MAX.to_le_bytes());
+    try_send(e, a, d, &[])
+}
+/// No ADL window unless the fast book is provably empty: every approved maker passed and no book shards exist.
+#[test] fn liquidate_fast_needs_every_maker_for_adl() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let k2 = maker(&mut e, &f, 10_000_000_000, 1_000_000_000);
+    let (tp, tu) = e.user(1_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 90_000, true);
+    let s = e.slot + 1; e.set_time(s); e.oracle_update("", 910_00000000, None);
+    liq_fast(&mut e, &f, &tu, &[k.slab], false); // second maker not passed: NoFill
+    assert_eq!(e.user_state(&tu).pos[0].flags & 2, 0);
+    let _ = e.shard(1, 100_000); // a book exists now: the fast book alone proves nothing
+    liq_fast(&mut e, &f, &tu, &[k.slab, k2.slab], false);
+    assert_eq!(e.user_state(&tu).pos[0].flags & 2, 0);
+    // a fake slab or a slab from another market is rejected
+    let other = Address::new_unique(); e.prog_acct(other, SLAB_SIZE);
+    liq_fast(&mut e, &f, &tu, &[other], false);
+}

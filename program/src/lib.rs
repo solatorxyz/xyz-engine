@@ -197,6 +197,7 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
         spec::IX_SLAB_FUND => slab_fund(pid, accs, data),
         spec::IX_SLAB_SETTLE => slab_settle(pid, accs),
         spec::IX_SLAB_KILL => slab_kill(pid, accs, data),
+        spec::IX_LIQ_FAST => liquidate_fast(pid, accs, data),
         spec::IX_SET_SESSION => set_session(pid, accs, data),
         spec::IX_MARKET_CFG => market_cfg(pid, accs, data),
         spec::IX_VAULT_INIT => vault_init(pid, accs, data),
@@ -1866,23 +1867,7 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let base0 = long(u.pos[pi].base);
     let mut ev = EvBuf::new(&uk, bid);
     while left > 0 {
-        let (mut bk, mut bl, mut bp, mut ba, mut bs) = (usize::MAX, 0usize, 0u64, 0u64, u32::MAX);
-        for (k, &(sp, mi)) in sl[..cnt].iter().enumerate() {
-            let s = unsafe { &*sp };
-            let e = &f.makers[mi];
-            if e.budget <= 0 { continue; }
-            for l in 0..SLAB_LEVELS {
-                let q = unsafe { s.quotes.get_unchecked(base_ix + l) };
-                if q.qty == 0 || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
-                let p = q.px as u64;
-                if p == 0 || p < lo || p > hi { continue; }
-                let u_ = unsafe { f.used.get_unchecked(mi).get_unchecked(opp << 3 | l) };
-                let av = (if u_.gen == q.gen { q.qty.saturating_sub(u_.qty) } else { q.qty }) as u64;
-                let av = av.min(e.budget as u64 / p);
-                if av == 0 { continue; }
-                if bk == usize::MAX || (bid && p < bp) || (!bid && p > bp) || (p == bp && q.slot < bs) { bk = k; bl = l; bp = p; ba = av; bs = q.slot; }
-            }
-        }
+        let (bk, bl, bp, ba) = best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi).unwrap_or((usize::MAX, 0, 0, 0));
         // resting orders strictly better than the best quote (or all of them when no quote is usable)
         if !rest.is_empty() || m.strict_take != 0 {
             let lim = if bk == usize::MAX { limit } else if bid { limit.min(bp - 1) } else { limit.max(bp + 1) };
@@ -1894,21 +1879,14 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
         let (sp, mi) = sl[bk];
         let q = unsafe { &(*sp).quotes[base_ix + bl] };
         let fq = ba.min(left);
-        let nt = bp * fq; // px < 2^32, qty < 2^32
+        let nt = fill_maker(f, mi, q, opp << 3 | bl, bid, bp, fq)?;
         let fee = bps_up(nt as i128, taker_bps);
-        let e = &mut f.makers[mi];
-        let sg: i64 = if bid { 1 } else { -1 };
-        e.budget -= nt as i64;
-        e.base = e.base.checked_sub(sg * fq as i64).ok_or(err(E::Math))?;
-        e.quote = i64c(e.quote as i128 + sg as i128 * nt as i128)?;
-        e.volume += fq;
-        let us = &mut f.used[mi][opp << 3 | bl];
-        if us.gen == q.gen { us.qty += fq as u32; } else { us.gen = q.gen; us.qty = fq as u32; }
+        let sg: i128 = if bid { 1 } else { -1 };
         f.fee_accum = i64c(f.fee_accum as i128 + fee)?;
-        credit(u, pi, -fee - sg as i128 * nt as i128)?;
-        let ob = u.pos[pi].base; u.pos[pi].base = ob.checked_add(sg * fq as i64).ok_or(err(E::Math))?;
-        u.pos[pi].cost = cost_after(ob, u.pos[pi].base, u.pos[pi].cost, sg as i128 * nt as i128)?;
-        ev.push(&e.user, bp, fq, (mi as u64) << 32 | q.gen as u64);
+        credit(u, pi, -fee - sg * nt as i128)?;
+        let ob = u.pos[pi].base; u.pos[pi].base = ob.checked_add(sg as i64 * fq as i64).ok_or(err(E::Math))?;
+        u.pos[pi].cost = cost_after(ob, u.pos[pi].base, u.pos[pi].cost, sg * nt as i128)?;
+        ev.push(&f.makers[mi].user, bp, fq, (mi as u64) << 32 | q.gen as u64);
         left -= fq;
     }
     ev.flush();
@@ -1923,6 +1901,126 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
         if p.flags & POS_ISO != 0 { let (e2, i2, _) = iso_health(pid, u, pi, &a[2..], nw, true)?; if e2 < i2 { return Err(err(E::Margin)); } }
     }
     gc_pos(u);
+    Ok(())
+}
+
+/// Best usable maker quote on the side a taker hits, inside [lo, hi]: (slab slot, level, price, lots available).
+/// Better price first, then the older quote. Lots are capped by the maker's remaining budget.
+#[inline(always)]
+fn best_quote(f: &FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: usize, bid: bool, slot: u64, lo: u64, hi: u64) -> Option<(usize, usize, u64, u64)> {
+    let (mut bk, mut bl, mut bp, mut ba, mut bs) = (usize::MAX, 0usize, 0u64, 0u64, u32::MAX);
+    for (k, &(sp, mi)) in sl.iter().enumerate() {
+        let s = unsafe { &*sp };
+        let e = &f.makers[mi];
+        if e.budget <= 0 { continue; }
+        for l in 0..SLAB_LEVELS {
+            let q = unsafe { s.quotes.get_unchecked(base_ix + l) };
+            if q.qty == 0 || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
+            let p = q.px as u64;
+            if p == 0 || p < lo || p > hi { continue; }
+            let u_ = unsafe { f.used.get_unchecked(mi).get_unchecked(opp << 3 | l) };
+            let av = (if u_.gen == q.gen { q.qty.saturating_sub(u_.qty) } else { q.qty }) as u64;
+            let av = av.min(e.budget as u64 / p);
+            if av == 0 { continue; }
+            if bk == usize::MAX || (bid && p < bp) || (!bid && p > bp) || (p == bp && q.slot < bs) { bk = k; bl = l; bp = p; ba = av; bs = q.slot; }
+        }
+    }
+    if bk == usize::MAX { None } else { Some((bk, bl, bp, ba)) }
+}
+/// Book `fq` lots at `p` against maker `mi` (quote level `ul` in its used table). Returns the notional.
+#[inline(always)]
+fn fill_maker(f: &mut FastBook, mi: usize, q: &Quote, ul: usize, bid: bool, p: u64, fq: u64) -> Result<u64, ProgramError> {
+    let nt = p * fq; // px < 2^32, qty < 2^32
+    let e = &mut f.makers[mi];
+    let sg: i64 = if bid { 1 } else { -1 };
+    e.budget -= nt as i64;
+    e.base = e.base.checked_sub(sg * fq as i64).ok_or(err(E::Math))?;
+    e.quote = i64c(e.quote as i128 + sg as i128 * nt as i128)?;
+    e.volume += fq;
+    let us = &mut f.used[mi][ul];
+    if us.gen == q.gen { us.qty += fq as u32; } else { us.gen = q.gen; us.qty = fq as u32; }
+    Ok(nt)
+}
+/// Liquidation against maker quotes, for markets (or moments) where the fast book holds the liquidity. Same rules as
+/// liquidate_book: below maintenance, 25% chunks, fee to insurance, bankrupt remainder to insurance or UseAdl.
+/// When nothing fills, the market has no shards and every approved maker's slab was passed, the position becomes
+/// ADL-eligible (the fast book is provably empty within the band). Accounts with resting book orders go through liquidate_book.
+/// accs: user(w), market(r), insurance(w), fast(w), slabs(r) x ns, [other markets]. data: tag, ns u8, max_qty u64
+fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 4 || d.len() != 10 { return Err(err(E::BadData)); }
+    let (ns, max_qty) = (d[1] as usize, rd64(d, 2)?);
+    if ns > FAST_MAKERS || a.len() < 4 + ns { return Err(err(E::BadData)); }
+    let t: &mut User = load(&a[0], pid, DISC_USER, USER_SIZE)?;
+    let m: &Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+    let ins: &mut Insurance = load(&a[2], pid, DISC_INS, INS_SIZE)?;
+    let f: &mut FastBook = load(&a[3], pid, DISC_FAST, FAST_SIZE)?;
+    let (tk, mk) = (key(&a[0]), key(&a[1]));
+    if m.insurance != key(&a[2]) || f.market != mk { return Err(err(E::BadAccount)); }
+    home(t, m)?;
+    let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp); let slot = clk.slot;
+    if stale(m, nw) { return Err(err(E::Stale)); }
+    let mkts = &a[1..];
+    settle_funding_all(pid, t, mkts)?;
+    let pi = t.pos.iter().position(|p| p.market == mk).ok_or(err(E::NotLiquidatable))?;
+    let (eq, _, mm) = phealth(pid, t, pi, mkts, nw, true)?;
+    if eq >= mm { return Err(err(E::NotLiquidatable)); }
+    if t.pos[pi].bid_open != 0 || t.pos[pi].ask_open != 0 || t.pos[pi].n_orders != 0 { return Err(err(E::MissingShards)); }
+    let b = t.pos[pi].base;
+    if b == 0 { return Err(err(E::NotLiquidatable)); }
+    let ab = b.unsigned_abs();
+    let mut left = ab.min(max_qty).min(liq_chunk(ab));
+    if left == 0 { return Err(err(E::BadData)); }
+    let px = mark(m); let bid = b < 0;
+    let band = px * (LIQ_BOOK_BAND_BPS << (LIQ_BOOK_BAND_STEPS - 1)) / 10000;
+    let (lo, hi) = (px.saturating_sub(band).max(1), px + band);
+    let opp = if bid { 1usize } else { 0usize };
+    let base_ix = (f.idx as usize) << 4 | opp << 3;
+    let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
+    let (mut cnt, mut seen) = (0usize, 0u64);
+    for x in a[4..4 + ns].iter() {
+        let s: &Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
+        let k = key(x);
+        let mi = f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))?;
+        seen |= 1 << mi;
+        if s.kill != 0 || s.user == tk { continue; }
+        sl[cnt] = (s as *const Slab, mi); cnt += 1;
+    }
+    let base0 = long(t.pos[pi].base);
+    let (mut filled, mut notional) = (0u64, 0i128);
+    let mut ev = EvBuf::new(&tk, bid);
+    while left > 0 {
+        let Some((bk, bl, bp, ba)) = best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi) else { break };
+        let (sp, mi) = sl[bk];
+        let q = unsafe { &(*sp).quotes[base_ix + bl] };
+        let fq = ba.min(left);
+        let nt = fill_maker(f, mi, q, opp << 3 | bl, bid, bp, fq)?;
+        let sg: i128 = if bid { 1 } else { -1 };
+        credit(t, pi, -sg * nt as i128)?;
+        let ob = t.pos[pi].base; t.pos[pi].base = ob.checked_add(sg as i64 * fq as i64).ok_or(err(E::Math))?;
+        t.pos[pi].cost = cost_after(ob, t.pos[pi].base, t.pos[pi].cost, sg * nt as i128)?;
+        ev.push(&f.makers[mi].user, bp, fq, (mi as u64) << 32 | q.gen as u64);
+        filled += fq; notional += nt as i128; left -= fq;
+    }
+    ev.flush();
+    if filled == 0 {
+        let all = if f.n >= 64 { u64::MAX } else { (1u64 << f.n) - 1 };
+        if m.n_shards != 0 || seen & all != all { return Err(err(E::NoFill)); }
+        t.pos[pi].flags = (t.pos[pi].flags & POS_ISO) | spec::POS_FLAG_ADL_ELIGIBLE | (slot << 8);
+        emit(&[&[spec::EVENTS_LIQ_NOFILL as u8], &tk, &slot.to_le_bytes()]);
+        return Ok(());
+    }
+    f.oi_long_delta += long(t.pos[pi].base) - base0;
+    f.fills += 1;
+    let (eq2, _, _) = phealth(pid, t, pi, mkts, nw, false)?;
+    let fee = bps_dn(notional, LIQ_FEE_BPS).min(eq2.max(0));
+    credit(t, pi, -fee)?; ins.balance = i64c(ins.balance as i128 + fee)?;
+    if eq2 < 0 {
+        if -eq2 > ins.balance.max(0) as i128 { return Err(err(E::UseAdl)); }
+        let closed = if t.pos[pi].flags & POS_ISO != 0 { t.pos[pi].base == 0 } else { t.pos.iter().all(|p| p.base == 0 || p.flags & POS_ISO != 0) };
+        if closed { ins.balance = i64c(ins.balance as i128 + eq2)?; credit(t, pi, -eq2)?; }
+    }
+    emit(&[&[EVENTS_LIQUIDATION as u8], &tk, &filled.to_le_bytes(), &px.to_le_bytes(), &[0u8; 32]]);
+    gc_pos(t);
     Ok(())
 }
 

@@ -22,5 +22,5 @@
 | ADL (bankrupt -> on-chain ranked counterparty -> insurance) | 7968 |
 | settle_funding (permissionless, 1 position) | 410 |
 | aggregate OI/fees from 9 shards (crank) | 851 |
-| liquidate_book (permissionless, 1 chunk into the book, no liquidator capital) | 5055 |
+| liquidate_book (permissionless, 1 chunk into the book, no liquidator capital) | 5059 |
 | exec SL trigger on mark (keeper crank, IOC reduce-only) | 3153 |
