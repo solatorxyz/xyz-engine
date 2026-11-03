@@ -411,3 +411,77 @@ fn take_accts(e: &Env, kp: &Keypair, u: &Address, f: &Address, slabs: &[Address]
     assert!(!send_many(&mut e, vec![assert_ix(&tu, &[], &[(fake, 0)], i64::MIN)], &[]));
     assert!(!send_many(&mut e, vec![(vec![r(&tu)], vec![71u8, 1, 0])], &[]), "short data");
 }
+fn slab_q(e: &Env, k: &Address, i: usize) -> Quote { let d = e.data(k); let o = 96 + i * 16; Quote { px: u32::from_le_bytes(d[o..o + 4].try_into().unwrap()),
+    qty: u32::from_le_bytes(d[o + 4..o + 8].try_into().unwrap()), gen: u32::from_le_bytes(d[o + 8..o + 12].try_into().unwrap()), slot: u32::from_le_bytes(d[o + 12..o + 16].try_into().unwrap()) } }
+/// Reference model of take_fast's maker matching, written from the rules, not from the code: repeatedly take the best usable
+/// quote (better price, then older quote slot, then slab order, then level order); a quote is usable when live (qty, age <= 30
+/// slots, inside mark +-5%, maker not killed, not the taker's own), and its size is capped by what is left of this quote
+/// generation and by the maker's budget. Returns (lots per maker, taker lots, notional).
+fn model_take(e: &Env, f: &Address, slabs: &[(Address, Address)], taker: &Address, bid: bool, limit: u64, mut left: u64) -> (Vec<i64>, u64) {
+    let b = fb(e, f); let ms = e.market_state(); let px0 = if ms.mark_px != 0 { ms.mark_px } else { ms.oracle_px };
+    let band = px0 / 10000 * 500; let (lo, hi) = (px0.saturating_sub(band), px0 + band); let slot = e.slot as u32;
+    let mut budget: Vec<i64> = (0..slabs.len()).map(|i| b.makers[i].budget).collect();
+    let mut used: Vec<[(u32, u32); 16]> = (0..slabs.len()).map(|i| { let mut u = [(0u32, 0u32); 16]; for l in 0..16 { u[l] = (b.used[i][l].gen, b.used[i][l].qty); } u }).collect();
+    let opp = if bid { 1 } else { 0 }; let mut got = vec![0i64; slabs.len()]; let mut total = 0u64;
+    while left > 0 {
+        let mut best: Option<(u64, u32, usize, usize, u64)> = None;
+        for (k, (sl, owner)) in slabs.iter().enumerate() {
+            let kill = u64::from_le_bytes(e.data(sl)[88..96].try_into().unwrap());
+            if kill != 0 || owner == taker || budget[k] <= 0 { continue; }
+            for l in 0..8 {
+                let q = slab_q(e, sl, opp << 3 | l); let p = q.px as u64;
+                if q.qty == 0 || slot - q.slot.min(slot) > 30 || p == 0 || p < lo || p > hi { continue; }
+                let u = used[k][opp << 3 | l]; let av = (if u.0 == q.gen { q.qty.saturating_sub(u.1) } else { q.qty }) as u64;
+                let av = av.min(budget[k] as u64 / p); if av == 0 { continue; }
+                let better = match best { None => true, Some((bp, bs, _, _, _)) => (bid && p < bp) || (!bid && p > bp) || (p == bp && q.slot < bs) };
+                if better { best = Some((p, q.slot, k, l, av)); }
+            }
+        }
+        let Some((p, _, k, l, av)) = best else { break };
+        if (bid && p > limit) || (!bid && p < limit) { break; }
+        let fq = av.min(left); let q = slab_q(e, &slabs[k].0, opp << 3 | l);
+        budget[k] -= (p * fq) as i64; let u = &mut used[k][opp << 3 | l]; if u.0 == q.gen { u.1 += fq as u32 } else { *u = (q.gen, fq as u32) }
+        got[k] += if bid { -(fq as i64) } else { fq as i64 }; total += fq; left -= fq;
+    }
+    (got, total)
+}
+/// Random interleavings of requotes, takes (including stale limits), kills, settles and price moves. Every take must match the
+/// reference model exactly, never trade through its limit, and never fill a quote generation past its quoted size.
+#[test] fn fast_path_matches_reference_model() {
+    let mut checked = 0u64;
+    for seed in 1..=30u64 {
+        let mut g = Rng(seed.wrapping_mul(0xD1B54A32D192ED03) | 1);
+        let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let f = fast_new(&mut e, 0);
+        let mk: Vec<Mk> = (0..3).map(|_| maker(&mut e, &f, 50_000_000_000, 5_000_000_000)).collect();
+        let tk_: Vec<(Keypair, Address)> = (0..2).map(|_| e.user(50_000_000_000)).collect();
+        let slabs: Vec<(Address, Address)> = mk.iter().map(|m| (m.slab, m.u)).collect();
+        let mut px: i64 = 1000_00000000;
+        for _ in 0..200 {
+            match g.n(9) {
+                0..=2 => { let i = g.n(3) as usize; let mid = (px / 1_000_000) as u64;
+                    let v: Vec<(u16, u32, u32)> = (0..3).map(|_| { let s = g.n(2) as u16; let l = g.n(8) as u16; let off = 1 + g.n(6);  // few price points: many ties
+                        (s << 3 | l, (if s == 1 { mid + off } else { mid - off }) as u32, (1 + g.n(400)) as u32) }).collect();
+                    quote(&mut e, &mk[i], &v, true); }
+                3..=5 => { let i = g.n(2) as usize; let bid = g.n(2) == 0; let mid = (px / 1_000_000) as u64;
+                    let limit = if bid { mid + g.n(8) } else { mid - g.n(8) }; let qty = 1 + g.n(900);
+                    let (kp, u) = (tk_[i].0.insecure_clone(), tk_[i].1);
+                    let (want, total) = model_take(&e, &f, &slabs, &u, bid, limit, qty);
+                    let before: Vec<i64> = (0..3).map(|k| fb(&e, &f).makers[k].base).collect(); let tb = e.user_state(&u).pos.iter().find(|p| p.market == e.market.to_bytes()).map_or(0, |p| p.base);
+                    let m = e.market; let mut a = vec![AccountMeta::new(kp.pubkey(), true), w(&u), r(&m), w(&f)]; a.extend(mk.iter().map(|x| r(&x.slab)));
+                    let ok = try_send(&mut e, a, take_ix(if bid { 0 } else { 1 }, 0, 3, limit, qty), &[&kp]);
+                    let after: Vec<i64> = (0..3).map(|k| fb(&e, &f).makers[k].base).collect(); let ta = e.user_state(&u).pos.iter().find(|p| p.market == e.market.to_bytes()).map_or(0, |p| p.base);
+                    if ok { for k in 0..3 { assert_eq!(after[k] - before[k], want[k], "seed {seed}: maker {k} fill differs from the reference model"); }
+                        assert_eq!((ta - tb).unsigned_abs(), total, "seed {seed}: taker fill differs"); checked += 1; }
+                    else { assert_eq!(after, before, "seed {seed}: a failed take must change nothing"); }
+                    // no quote generation is ever filled past its size
+                    let b = fb(&e, &f);
+                    for (k, (sl, _)) in slabs.iter().enumerate() { for l in 0..16 { let q = slab_q(&e, sl, l); if b.used[k][l].gen == q.gen { assert!(b.used[k][l].qty <= q.qty, "seed {seed}: overfill"); } } } }
+                6 => { let i = g.n(3) as usize; let kp = mk[i].kp.insecure_clone(); let s = mk[i].slab; try_send(&mut e, vec![AccountMeta::new(kp.pubkey(), true), w(&s)], vec![67u8, (g.n(4) == 0) as u8], &[&kp]); }
+                7 => { let i = g.n(3) as usize; let m = e.market; let u = mk[i].u; try_send(&mut e, vec![w(&u), r(&m), w(&f)], vec![65], &[]); }
+                _ => { px = (px as i128 * (10_000 + g.n(41) as i128 - 20) / 10_000) as i64; let s = e.slot + 1 + g.n(3); e.set_time(s); e.oracle_update("", px, None); }
+            }
+        }
+    }
+    println!("reference model: {checked} takes compared");
+    assert!(checked > 1000);
+}
