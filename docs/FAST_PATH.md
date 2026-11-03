@@ -35,7 +35,8 @@ A maker can fill at most margin / IMR of notional between settles. That bounds w
 - FastBook is 2000 bytes (auto target added). Nothing on devnet uses it yet.
 
 ## Frontend (Codex owns UI)
-- Order book: union of every approved maker's slab levels for the market (decode_slab), minus the FastBook `used` qty for the same quote generation, plus shard orders.
+Use `sdk/ts/everytick.ts` (builders, decoders, `fastDepth`). `sdk/ts/smoke.ts` shows reading a FastBook, slabs, a User and a Market from RPC.
+- Order book: `fastDepth(decodeFastBook(fast), slabs, slot, mark)` gives live maker levels (used qty, age, ±5% band and budget applied). Merge with shard orders.
 - Trading: `take_fast` with all approved slabs for the market. Show fills from the program's fill events.
 - Positions: decode_user plus, for makers, the FastBook entry (unsettled base and quote) so equity matches what liquidation sees.
 - Maker panel: margin, budget, auto target, kill switch.
