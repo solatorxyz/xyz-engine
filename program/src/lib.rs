@@ -1971,8 +1971,10 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let mut left = ab.min(max_qty).min(liq_chunk(ab));
     if left == 0 { return Err(err(E::BadData)); }
     let px = mark(m); let bid = b < 0;
-    let band = px * (LIQ_BOOK_BAND_BPS << (LIQ_BOOK_BAND_STEPS - 1)) / 10000;
-    let (lo, hi) = (px.saturating_sub(band).max(1), px + band);
+    // same price window as an ordinary take: a liquidation never reaches quotes a taker couldn't
+    let band = px / 10000 * spec::QUOTE_BAND_BPS;
+    let (blo, bhi) = bound_range(m);
+    let (lo, hi) = (px.saturating_sub(band).max(blo).max(1), (px + band).min(bhi));
     let opp = if bid { 1usize } else { 0usize };
     let base_ix = (f.idx as usize) << 4 | opp << 3;
     let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];

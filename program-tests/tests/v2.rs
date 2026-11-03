@@ -245,3 +245,41 @@ fn takeover(e: &mut Env, x: &V, tu: &Address, ok: bool) {
     assert_eq!(vst(&e, &v).halted, 1, "25% drawdown stops takeovers");
     let (c, cv, csrc) = holder(&mut e, 1000); vdep(&mut e, &x, &c, &cv, &csrc, 1000, false);
 }
+/// spec::VAULT_VIRTUAL
+fn tok_amt(e: &Env, k: &Address) -> u64 { u64::from_le_bytes(e.data(k)[64..72].try_into().unwrap()) }
+fn vcrank(e: &mut Env, x: &V) { let (m, v, sub) = (e.market, x.v, x.sub); e.send("", vec![w(&v), w(&sub), r(&m)], vec![56], &[], true); }
+fn redeemable(e: &Env, x: &V, vd: &Address) -> i128 { let v = vst(e, &x.v); vds(e, vd).shares as i128 * (v.nav as i128 + 1_000_000i128) / (v.shares as i128 + 1_000_000i128) }
+/// After the vault loses on a taken-over position, a new depositor buys in at the lower NAV: their deposit is worth what they
+/// paid, and they take out what they put in. The earlier holder carries the loss alone.
+#[test] fn vault_loss_is_not_passed_to_later_depositors() {
+    let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let x = vault(&mut e, 10000);
+    let (a, av, asrc) = holder(&mut e, 100_000_000_000); vdep(&mut e, &x, &a, &av, &asrc, 100_000_000_000, true);
+    let (_a0, tu) = underwater(&mut e, 1_100_000_000, 100_000);
+    e.oracle_update("", 915_00000000, None); takeover(&mut e, &x, &tu, true);
+    e.oracle_update("", 880_00000000, None); vcrank(&mut e, &x);
+    let nav = vst(&e, &x.v).nav; assert!(nav < 100_000_000_000, "the vault is down: {nav}");
+    let a_before = redeemable(&e, &x, &av);
+    let (b, bv, bsrc) = holder(&mut e, 10_000_000_000); vdep(&mut e, &x, &b, &bv, &bsrc, 10_000_000_000, true);
+    let bval = redeemable(&e, &x, &bv); assert!((bval - 10_000_000_000).abs() <= 2, "new deposit is worth what was paid: {bval}");
+    assert!((redeemable(&e, &x, &av) - a_before).abs() <= 2, "the earlier holder is not diluted");
+    let s = e.slot; e.set_time(s + 101); e.oracle_update("", 880_00000000, None);
+    let sh = vds(&e, &bv).shares; let t0 = tok_amt(&e, &bsrc);
+    vwd(&mut e, &x, &b, &bv, &bsrc, sh, true);
+    let got = tok_amt(&e, &bsrc) - t0; assert!((got as i128 - 10_000_000_000).abs() <= 2, "B takes out what B put in: {got}");
+}
+/// Cash backing a taken-over position can't leave: a withdrawal that would put the vault below initial margin fails.
+#[test] fn vault_withdraw_keeps_positions_margined() {
+    let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let x = vault(&mut e, 10000);
+    let (_a0, tu) = underwater(&mut e, 1_100_000_000, 100_000);
+    let (a, av, asrc) = holder(&mut e, 12_000_000_000); vdep(&mut e, &x, &a, &av, &asrc, 12_000_000_000, true);
+    let (m, v, pda) = (e.market, x.v, x.sub); let _ = (m, v, pda);
+    // raise the day cap so only the margin rule can stop the withdrawal
+    let ad = e.admin.pubkey(); let mut d = vec![57u8]; for q in [100u64, 10000, 2500, 0] { d.extend_from_slice(&q.to_le_bytes()); }
+    e.send("", vec![AccountMeta::new(ad, true), w(&x.v)], d, &[], true);
+    for p in [955, 915] { e.oracle_update("", p * 100_000_000, None); }
+    takeover(&mut e, &x, &tu, true);
+    let s = e.slot; e.set_time(s + 101); e.oracle_update("", 915_00000000, None);
+    let sh = vds(&e, &av).shares;
+    vwd(&mut e, &x, &a, &av, &asrc, sh, false);      // all of it: the 9.15B position would be unmargined
+    vwd(&mut e, &x, &a, &av, &asrc, sh / 20, true);  // a small slice is fine
+}
