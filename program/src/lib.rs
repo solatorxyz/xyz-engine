@@ -68,7 +68,7 @@ pub const IX_AGGREGATE: u8 = 16;
 
 #[repr(u32)]
 pub enum E { BadAccount = 1, BadData, Margin, Stale, NotLiquidatable, ShardFull, NoShard, Oracle, Expired, NotBankrupt, Math, Cap, Ledger,
-    FokUnfilled, Paused, NotTriggered, Vault, TokenProgram, MissingShards, Rank, Timelock, Isolated, UseAdl, Breaker, NoFill, Locked, Halted }
+    FokUnfilled, Paused, NotTriggered, Vault, TokenProgram, MissingShards, Rank, Timelock, Isolated, UseAdl, Breaker, NoFill, Locked, Halted, Assert }
 #[inline(always)]
 fn err(e: E) -> ProgramError { ProgramError::Custom(e as u32) }
 
@@ -198,6 +198,7 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
         spec::IX_SLAB_SETTLE => slab_settle(pid, accs),
         spec::IX_SLAB_KILL => slab_kill(pid, accs, data),
         spec::IX_LIQ_FAST => liquidate_fast(pid, accs, data),
+        spec::IX_ASSERT => assert_state(pid, accs, data),
         spec::IX_SET_SESSION => set_session(pid, accs, data),
         spec::IX_MARKET_CFG => market_cfg(pid, accs, data),
         spec::IX_VAULT_INIT => vault_init(pid, accs, data),
@@ -2033,6 +2034,39 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     }
     emit(&[&[EVENTS_LIQUIDATION as u8], &tk, &filled.to_le_bytes(), &px.to_le_bytes(), &[0u8; 32]]);
     gc_pos(t);
+    Ok(())
+}
+
+/// Atomic guard: fails the whole transaction unless the account ends where the caller expects. Put it last in a multi-leg
+/// transaction (pair trade, multi-market rebalance, perp + spot hedge): a leg that fills short reverts every leg.
+/// Checks position bounds per market, token account balances (the spot leg), and a minimum cross equity at the stored mark.
+/// accs: user(r), markets(r) x np, token accounts(r) x nt, [other markets the user holds, for the equity check]
+/// data: tag, np u8, nt u8, min_equity i64 (i64::MIN = unchecked), np x (min_base i64, max_base i64), nt x min_amount u64
+fn assert_state(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if d.len() < 11 { return Err(err(E::BadData)); }
+    let (np, nt) = (d[1] as usize, d[2] as usize);
+    if d.len() != 11 + np * 16 + nt * 8 || a.len() < 1 + np + nt { return Err(err(E::BadData)); }
+    let u: &User = load(&a[0], pid, DISC_USER, USER_SIZE)?;
+    for i in 0..np {
+        let _m: &Market = load(&a[1 + i], pid, DISC_MARKET, MARKET_SIZE)?;
+        let mk = key(&a[1 + i]);
+        let (lo, hi) = (rd64(d, 11 + i * 16)? as i64, rd64(d, 19 + i * 16)? as i64);
+        let mut b = 0i64;
+        for p in u.pos.iter() { if p.market == [0; 32] { break; } if p.market == mk { b = p.base; break; } }
+        if b < lo || b > hi { return Err(err(E::Assert)); }
+    }
+    for j in 0..nt {
+        let t = &a[1 + np + j];
+        if !t.owned_by(&pinocchio_token::ID) || t.data_len() < 165 { return Err(err(E::BadAccount)); }
+        let amt = u64::from_le_bytes(unsafe { t.borrow_unchecked() }[64..72].try_into().unwrap());
+        if amt < rd64(d, 11 + np * 16 + j * 8)? { return Err(err(E::Assert)); }
+    }
+    let min_eq = rd64(d, 3)? as i64;
+    if min_eq != i64::MIN {
+        let clk = clock()?;
+        let (eq, _, _) = health(pid, u, &a[1..], (clk.slot, clk.unix_timestamp), false)?;
+        if eq < min_eq as i128 { return Err(err(E::Assert)); }
+    }
     Ok(())
 }
 

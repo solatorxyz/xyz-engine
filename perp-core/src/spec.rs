@@ -314,6 +314,7 @@ pub const IX_SLAB_SETTLE: u64 = 65;
 pub const IX_TAKE_FAST: u64 = 66;
 pub const IX_SLAB_KILL: u64 = 67;
 pub const IX_LIQ_FAST: u64 = 70;
+pub const IX_ASSERT: u64 = 71;
 pub const QUOTE_MAX_AGE_SLOTS: u32 = 30;
 pub const QUOTE_BAND_BPS: u64 = 500;
 pub const QUOTE_ITEM_SIZE: usize = 10;

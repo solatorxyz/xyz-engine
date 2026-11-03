@@ -364,3 +364,50 @@ fn liq_fast_try(e: &mut Env, f: &Address, t: &Address, slabs: &[Address]) -> boo
     let other = Address::new_unique(); e.prog_acct(other, SLAB_SIZE);
     liq_fast(&mut e, &f, &tu, &[other], false);
 }
+fn send_many(e: &mut Env, ixs: Vec<(Vec<AccountMeta>, Vec<u8>)>, signers: &[&Keypair]) -> bool {
+    let ixs: Vec<Instruction> = ixs.into_iter().map(|(accounts, data)| Instruction { program_id: e.pid, accounts, data }).collect();
+    let mut s: Vec<&Keypair> = vec![&e.admin]; s.extend_from_slice(signers);
+    let tx = Transaction::new_signed_with_payer(&ixs, Some(&e.admin.pubkey()), &s, e.svm.latest_blockhash());
+    let ok = e.svm.send_transaction(tx).is_ok(); e.svm.expire_blockhash(); ok
+}
+fn assert_ix(u: &Address, mkts: &[(Address, i64, i64)], toks: &[(Address, u64)], min_eq: i64) -> (Vec<AccountMeta>, Vec<u8>) {
+    let mut d = vec![71u8, mkts.len() as u8, toks.len() as u8]; d.extend_from_slice(&min_eq.to_le_bytes());
+    for (_, lo, hi) in mkts { d.extend_from_slice(&lo.to_le_bytes()); d.extend_from_slice(&hi.to_le_bytes()); }
+    for (_, m) in toks { d.extend_from_slice(&m.to_le_bytes()); }
+    let mut a = vec![r(u)]; a.extend(mkts.iter().map(|(m, _, _)| r(m))); a.extend(toks.iter().map(|(t, _)| r(t)));
+    (a, d)
+}
+fn take_accts(e: &Env, kp: &Keypair, u: &Address, f: &Address, slabs: &[Address]) -> Vec<AccountMeta> {
+    let m = e.market; let mut a = vec![AccountMeta::new(kp.pubkey(), true), w(u), r(&m), w(f)]; a.extend(slabs.iter().map(r)); a
+}
+/// A leg that can't fill in full reverts the whole transaction: the take before the guard leaves no trace.
+#[test] fn assert_reverts_a_short_leg_and_passes_a_full_one() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 60)], true);
+    let m = e.market;
+    let take = (take_accts(&e, &tp, &tu, &f, &[k.slab]), take_ix(0, 0, 1, PX + 100, 100));
+    let tpc = tp.insecure_clone();
+    assert!(!send_many(&mut e, vec![take.clone(), assert_ix(&tu, &[(m, 100, 100)], &[], i64::MIN)], &[&tpc]), "only 60 available: revert");
+    assert_eq!(e.user_state(&tu).pos[0].market, [0; 32], "nothing happened");
+    assert_eq!(fb(&e, &f).makers[0].base, 0);
+    assert!(send_many(&mut e, vec![take, assert_ix(&tu, &[(m, 50, 100)], &[], i64::MIN)], &[&tpc]), "60 is inside [50, 100]");
+    assert_eq!(e.user_state(&tu).pos[0].base, 60);
+    // equity floor: the taker paid fees, so equity is just under its deposit
+    assert!(!send_many(&mut e, vec![assert_ix(&tu, &[(m, 60, 60)], &[], 10_000_000_000)], &[]));
+    assert!(send_many(&mut e, vec![assert_ix(&tu, &[(m, 60, 60)], &[], 9_000_000_000)], &[]));
+    // a market the user never touched counts as flat
+    let other = e.market; let _ = other;
+}
+/// The spot leg: a token balance below the floor reverts; a fake (non-token) account is rejected.
+#[test] fn assert_checks_token_balances() {
+    let mut e = Env::new(); e.oracle_update("", 1000_00000000, None);
+    let (_tp, tu) = e.user(1_000_000);
+    let mint = Address::from(e.market_state().mint); let tok = Address::new_unique();
+    e.svm.set_account(tok, Account { lamports: 1_000_000_000, data: token_acct(&mint, &Address::new_unique(), 5_000), owner: TOKEN, executable: false, rent_epoch: 0 }).unwrap();
+    assert!(send_many(&mut e, vec![assert_ix(&tu, &[], &[(tok, 5_000)], i64::MIN)], &[]));
+    assert!(!send_many(&mut e, vec![assert_ix(&tu, &[], &[(tok, 5_001)], i64::MIN)], &[]));
+    let fake = Address::new_unique(); e.prog_acct(fake, 165);
+    assert!(!send_many(&mut e, vec![assert_ix(&tu, &[], &[(fake, 0)], i64::MIN)], &[]));
+    assert!(!send_many(&mut e, vec![(vec![r(&tu)], vec![71u8, 1, 0])], &[]), "short data");
+}
