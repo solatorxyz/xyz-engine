@@ -47,7 +47,7 @@ fn setup(e: &mut Env) -> (Address, Mk) { e.oracle_update("", 1000_00000000, None
     let t = e.user_state(&tu); assert_eq!(t.pos[0].base, 130);
     let fbk = fb(&e, &f); assert_eq!(fbk.makers[0].base, -130);
     let nt = 100_010i64 * 100 + 100_020 * 30; assert_eq!(fbk.makers[0].quote, nt);
-    let fee = fbk.fee_accum; assert_eq!(fee, (nt + 1999) / 2000);
+    let fee = fbk.fee_accum; assert_eq!(fee, (100_010i64 * 100 + 1999) / 2000 + (100_020i64 * 30 + 1999) / 2000);
     assert_eq!(t.cash, 10_000_000_000 - nt - fee);
     // the same quote can't be spent twice
     tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 1000, true);
@@ -165,15 +165,15 @@ fn setup(e: &mut Env) -> (Address, Mk) { e.oracle_update("", 1000_00000000, None
 #[test] fn underwater_maker_can_be_liquidated_after_settle() {
     let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let f = fast_new(&mut e, 0);
     let k = maker(&mut e, &f, 2_100_000_000, 2_000_000_000);
-    let (tp, tu) = e.user(50_000_000_000);
-    quote(&mut e, &k, &[(ASK, 100_010, 20_000)], true);
-    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 20_000, true);
-    e.oracle_update("", 1040_00000000, None);
+    let (tp, tu) = e.user(5_000_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 190_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 190_000, true);
+    e.oracle_update("", 1049_00000000, None); e.oracle_update("", 1060_00000000, None);
     settle(&mut e, &f, &k);
     let b = fb(&e, &f); let u = e.user_state(&k.u);
     assert_eq!(b.makers[0].margin, 0, "margin returned, quoting stopped");
-    assert_eq!(b.makers[0].budget, 0); assert_eq!(u.pos[0].base, -20_000);
-    let (lp, lu) = e.user(50_000_000_000);
+    assert_eq!(b.makers[0].budget, 0); assert_eq!(u.pos[0].base, -190_000);
+    let (lp, lu) = e.user(5_000_000_000_000);
     let (m, ins) = (e.market, e.ins);
     let mut d = vec![5u8]; d.extend_from_slice(&u64::MAX.to_le_bytes());
     e.send("", vec![AccountMeta::new(lp.pubkey(), true), w(&lu), w(&k.u), r(&m), w(&ins)], d, &[&lp], true);

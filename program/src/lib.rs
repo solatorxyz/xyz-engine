@@ -68,7 +68,7 @@ pub const IX_AGGREGATE: u8 = 16;
 
 #[repr(u32)]
 pub enum E { BadAccount = 1, BadData, Margin, Stale, NotLiquidatable, ShardFull, NoShard, Oracle, Expired, NotBankrupt, Math, Cap, Ledger,
-    FokUnfilled, Paused, NotTriggered, Vault, TokenProgram, MissingShards, Rank, Timelock, Isolated, UseAdl, Breaker, NoFill }
+    FokUnfilled, Paused, NotTriggered, Vault, TokenProgram, MissingShards, Rank, Timelock, Isolated, UseAdl, Breaker, NoFill, Locked, Halted }
 #[inline(always)]
 fn err(e: E) -> ProgramError { ProgramError::Custom(e as u32) }
 
@@ -127,11 +127,11 @@ fn agg_init(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     p[89..93].copy_from_slice(&d[33..37]); p[109..117].copy_from_slice(&d[37..45]);
     Ok(())
 }
-/// accs: authority(s), agg(w). data: tag, price i64, conf u64, publish_time i64, n_sources u64.
+/// accs: authority(s), agg(w). data: tag, price i64, conf u64, publish_time i64, n_sources u64, [ext_px i64, ext_ts i64].
 /// Checks: signer == stored authority; price > 0; publish_time strictly newer and not in the future (+5 s);
 /// |price - last| <= max_jump_bps of last per post (0 = off). Staleness/confidence/divergence are enforced by update_oracle.
 fn agg_post(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
-    if a.len() < 2 || !a[0].is_signer() || d.len() != 33 { return Err(err(E::BadData)); }
+    if a.len() < 2 || !a[0].is_signer() || (d.len() != 33 && d.len() != 49) { return Err(err(E::BadData)); }
     if !a[1].owned_by(pid) || a[1].data_len() < AGG_SIZE { return Err(err(E::BadAccount)); }
     let ak = key(&a[0]); let p = unsafe { a[1].borrow_unchecked_mut() };
     if p[0..8] != AGG_DISC || p[8..40] != ak { return Err(err(E::BadAccount)); }
@@ -144,6 +144,7 @@ fn agg_post(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     p[101..109].copy_from_slice(&last_pt.to_le_bytes()); p[73..81].copy_from_slice(&px.to_le_bytes()); p[81..89].copy_from_slice(&conf.to_le_bytes());
     p[93..101].copy_from_slice(&pt.to_le_bytes()); p[117..125].copy_from_slice(&ns.to_le_bytes());
     let n = r(p, 125) + 1; p[125..133].copy_from_slice(&n.to_le_bytes());
+    if d.len() == 49 { p[133..149].copy_from_slice(&d[33..49]); } // external perp consensus: price, publish time
     Ok(())
 }
 /// Owner approves / updates / revokes (expiry 0) a session-key delegate. accs: authority(s), user(r), record(w, program-owned).
@@ -196,6 +197,16 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
         spec::IX_SLAB_FUND => slab_fund(pid, accs, data),
         spec::IX_SLAB_SETTLE => slab_settle(pid, accs),
         spec::IX_SLAB_KILL => slab_kill(pid, accs, data),
+        spec::IX_SET_SESSION => set_session(pid, accs, data),
+        spec::IX_MARKET_CFG => market_cfg(pid, accs, data),
+        spec::IX_VAULT_INIT => vault_init(pid, accs, data),
+        spec::IX_VAULT_ADD_SUB => vault_add_sub(pid, accs),
+        spec::IX_VAULT_LINK => vault_link(pid, accs, data),
+        spec::IX_VAULT_DEPOSIT => vault_deposit(pid, accs, data),
+        spec::IX_VAULT_WITHDRAW => vault_withdraw(pid, accs, data),
+        spec::IX_VAULT_TAKEOVER => vault_takeover(pid, accs, data),
+        spec::IX_VAULT_CRANK => vault_crank(pid, accs),
+        spec::IX_VAULT_SET => vault_set(pid, accs, data),
         spec::IX_ADMIN_EXECUTE => admin_execute(pid, accs),
         IX_AGG_INIT => agg_init(pid, accs, data),
         IX_AGG_POST => agg_post(pid, accs, data),
@@ -316,7 +327,7 @@ fn init_shard(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if lo % m.bucket_width != 0 || d[1] > 1 { return Err(err(E::BadData)); }
     let s = unsafe { &mut *(a[2].borrow_unchecked().as_ptr() as *mut Shard) };
     s.disc = DISC_SHARD; s.market = key(&a[1]); s.side = d[1] as u64; s.lo = lo; s.width = m.bucket_width;
-    s.shard_no = m.n_shards; m.n_shards += 1;
+    s.shard_no = m.n_shards; m.n_shards += 1; m.n_side[d[1] as usize] += 1;
     Ok(())
 }
 /// accs: authority(s), user(w)
@@ -594,6 +605,7 @@ fn best(a: &[AccountView], pid: &Address, mk: &Key, side: u64, oracle: u64) -> O
 }
 /// shard.seq high bit: set once a peg/spline order is inserted (disables the sorted fast path for that shard).
 const SPECIAL_BIT: u64 = 1 << 63;
+const RETIRED_BIT: u64 = 1 << 62;
 const SEQ_MASK: u64 = (1 << ORDER_SEQ_BITS) - 1;
 pub struct Fill { pub filled: u64, pub notional: i128, pub abort: bool }
 const MAX_TAKE_SHARDS: usize = 16;
@@ -616,6 +628,26 @@ impl EvBuf {
     }
     fn flush(&mut self) { if self.n > 0 { self.b[34] = self.n as u8; emit(&[&self.b[..35 + self.n * EV_ENTRY]]); self.n = 0; } }
 }
+#[inline(always)]
+fn arrival(c: &(*mut Shard, usize, u64, bool)) -> u64 { unsafe { (*c.0).orders[c.1].meta >> 32 } }
+/// Discovery bounds in force for matching: the whole range while the external market is open.
+#[inline(always)]
+fn bound_range(m: &Market) -> (u64, u64) {
+    if m.session == 0 || m.bound_bps == 0 || m.bound_ref == 0 { return (0, u64::MAX); }
+    let d = (m.bound_ref as u128 * m.bound_bps as u128 / 10000) as u64;
+    (m.bound_ref.saturating_sub(d), m.bound_ref.saturating_add(d))
+}
+/// Re-anchor while closed (price within thresh of the bound moves the reference to the bound, until bound_max), then clamp mark.
+fn apply_bounds(m: &mut Market, px: u64) {
+    if m.bound_bps == 0 { return; }
+    if m.session == 0 || m.bound_ref == 0 { m.bound_ref = px; m.bound_up = 0; m.bound_dn = 0; return; }
+    let d = (m.bound_ref as u128 * m.bound_bps as u128 / 10000) as u64;
+    let t = (d as u128 * m.bound_thresh_bps as u128 / 10000) as u64;
+    if px >= m.bound_ref + t && m.bound_up < m.bound_max { m.bound_ref += d; m.bound_up += 1; }
+    else if px + t <= m.bound_ref && m.bound_dn < m.bound_max { m.bound_ref -= d; m.bound_dn += 1; }
+    let (lo, hi) = bound_range(m);
+    m.mark_px = m.mark_px.clamp(lo, hi);
+}
 /// Taker matches against the best opposite order across the passed shards (effective prices).
 /// Per-shard best is computed once and recomputed only for the shard just modified (no full rescan per fill).
 fn take(pid: &Address, a: &[AccountView], mk: &Key, m: &Market, u: &mut User, uk: &Key, pi: usize,
@@ -627,21 +659,29 @@ fn take(pid: &Address, a: &[AccountView], mk: &Key, m: &Market, u: &mut User, uk
     let oracle = m.oracle_px;
     let mut cs: [(*mut Shard, usize, u64, bool); MAX_TAKE_SHARDS] = [(core::ptr::null_mut(), 0, 0, false); MAX_TAKE_SHARDS];
     let mut ns = 0;
+    let mut ro = [false; MAX_TAKE_SHARDS];
     for x in a {
         if disc_of(x) != DISC_SHARD || !x.owned_by(pid) { continue; }
         let s: &mut Shard = unsafe { &mut *(x.borrow_unchecked().as_ptr() as *mut Shard) };
         if s.market != *mk || s.side != opp { continue; }
         if ns == MAX_TAKE_SHARDS { return Err(err(E::BadData)); }
         let b = shard_best(s, oracle);
+        ro[ns] = !x.is_writable();
         cs[ns] = (s as *mut Shard, b.map_or(0, |v| v.0), b.map_or(0, |v| v.1), b.is_some()); ns += 1;
     }
+    // P-3: every opposite shard must be visible; shards the order won't touch may be read-only, so takers only serialize where they trade
+    if m.strict_take != 0 && ns as u64 != m.n_side[opp as usize] { return Err(err(E::MissingShards)); }
+    let (blo, bhi) = bound_range(m);
     let mut ev = EvBuf::new(uk, taker_bid);
     while qty > 0 {
         let mut k = usize::MAX;
-        for j in 0..ns { if cs[j].3 && (k == usize::MAX || (taker_bid && cs[j].2 < cs[k].2) || (!taker_bid && cs[j].2 > cs[k].2)) { k = j; } }
+        for j in 0..ns { if cs[j].3 && (k == usize::MAX || (taker_bid && cs[j].2 < cs[k].2) || (!taker_bid && cs[j].2 > cs[k].2)
+            || (cs[j].2 == cs[k].2 && arrival(&cs[j]) < arrival(&cs[k]))) { k = j; } }
         if k == usize::MAX { break; }
         let (sp, i, px, _) = cs[k];
         if (taker_bid && px > limit) || (!taker_bid && px < limit) { break; }
+        if px < blo || px > bhi { break; } // closed market: nothing trades outside the discovery bounds
+        if ro[k] { return Err(err(E::BadAccount)); }
         let s = unsafe { &mut *sp };
         if first.is_null() { first = sp; }
         let mut o = s.orders[i];
@@ -722,7 +762,7 @@ fn fok_avail(a: &[AccountView], pid: &Address, mk: &Key, opp: u64, oracle: u64, 
     }
     false
 }
-fn insert(a: &[AccountView], pid: &Address, mk: &Key, uk: &Key, bid: bool, mut o: Order) -> Result<u64, ProgramError> {
+fn insert(a: &[AccountView], pid: &Address, mk: &Key, uk: &Key, bid: bool, mut o: Order, slot: u64) -> Result<u64, ProgramError> {
     let side = if bid { SIDE_BID } else { SIDE_ASK };
     let price = o.price;
     let mut full = false;
@@ -731,8 +771,10 @@ fn insert(a: &[AccountView], pid: &Address, mk: &Key, uk: &Key, bid: bool, mut o
         let s: &mut Shard = unsafe { &mut *(x.borrow_unchecked().as_ptr() as *mut Shard) };
         if s.market != *mk || s.side != side || price < s.lo || price >= s.lo + s.width { continue; }
         let n = s.n as usize;
-        if n >= MAX_ORDERS { full = true; continue; }
-        if s.seq & !SPECIAL_BIT >= SEQ_MASK { full = true; continue; } // AUDIT L-3: never wrap; retire the shard // AUDIT H-3: overflow into another shard for the same bucket
+        // P-1: a shard that overflowed stays closed until it empties, so later orders can't jump ahead of the overflow shard
+        if s.seq & RETIRED_BIT != 0 { if n == 0 && s.seq & SEQ_MASK < SEQ_MASK { s.seq &= !RETIRED_BIT; } else { full = true; continue; } }
+        if n >= MAX_ORDERS { s.seq |= RETIRED_BIT; full = true; continue; }
+        if s.seq & SEQ_MASK >= SEQ_MASK { s.seq |= RETIRED_BIT; full = true; continue; } // AUDIT L-3: never wrap; retire the shard // AUDIT H-3: overflow into another shard for the same bucket
         let mut i = n;
         // best-first by anchor price: bids desc, asks asc; FIFO within price
         for j in 0..n { let p = s.orders[j].price; if (bid && p < price) || (!bid && p > price) { i = j; break; } }
@@ -740,6 +782,7 @@ fn insert(a: &[AccountView], pid: &Address, mk: &Key, uk: &Key, bid: bool, mut o
         s.seq += 1;
         if kind(&o) != KIND_LIMIT { s.seq |= SPECIAL_BIT; }
         o.id = (s.shard_no << ORDER_SEQ_BITS) | (s.seq & SEQ_MASK); // AUDIT L-3: unique per market, no wrap
+        o.meta = (o.meta & 0xffff_ffff) | ((slot & 0xffff_ffff) << 32); // P-2: arrival slot, compared across shards at equal price
         o.owner = *uk;
         s.orders[i] = o;
         s.n += 1;
@@ -884,7 +927,7 @@ fn batch(pid: &Address, a: &mut [AccountView], d: &[u8], single: bool) -> Progra
             if u.pos[pi].n_orders >= MAX_OPEN_ORDERS_PER_MARKET { return Err(err(E::Cap)); } // AUDIT M-2
             // LOAD-1: in a batch, a full bucket (64 orders) skips only this item (like ALO/FOK skips) instead of
             // failing the whole replace -- otherwise one crowded price bucket wipes every other quote and cancel in the tx.
-            match insert(rest, pid, &mk, &uk, bid, ord) {
+            match insert(rest, pid, &mk, &uk, bid, ord, slot) {
                 Ok(_) => {}
                 Err(ProgramError::Custom(c)) if !single && c == E::ShardFull as u32 => continue,
                 Err(e) => return Err(e),
@@ -1149,20 +1192,30 @@ fn update_oracle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     // (each shard_no exactly once). No shards passed: previous sample and EMA are held (can't be pulled to 0).
     // CU: one pass over the shards does the full-set check, both impact prices and the best bid/ask.
     let book = if sh.is_empty() { None } else { scan_book(sh, pid, &mk, m.n_shards, px, slot, m.impact_notional)? };
-    if let Some((ib, ia, mid)) = book {
-        m.prem_last = premium_ppb(ib, ia, px);
+    // maker slabs count as book too (complete approved set, or none)
+    let (fb, fa) = fast_bbo(sh, pid, &mk, slot, px)?;
+    let (ib, ia, sb, sa) = book.unwrap_or((None, None, None, None));
+    let best_b = match (sb, fb) { (Some(x), Some(y)) => Some(x.max(y)), (x, y) => x.or(y) };
+    let best_a = match (sa, fa) { (Some(x), Some(y)) => Some(x.min(y)), (x, y) => x.or(y) };
+    let ext = read_ext(&a[1], pid, m, clk.unix_timestamp);
+    if ext.is_some() { m.ext_px = ext.unwrap_or(0); m.ext_ts = clk.unix_timestamp; }
+    if book.is_some() || fb.is_some() || fa.is_some() {
+        m.prem_last = premium_ppb(ib.or(fb), ia.or(fa), px);
+        let mid = match (best_b, best_a) { (Some(b), Some(a)) => Some((b + a) / 2), _ => None };
         // 5) mark = clamp(median(oracle, oracle + EMA(mid - oracle), mid), oracle +- MARK_CLAMP_BPS)
-        let (e, mp) = mark_from(px, m.mark_ema as i128, ds, mid); m.mark_ema = i64c(e)?; m.mark_px = mp;
+        //    with a fresh external perp price: median(oracle + EMA, mid, external)
+        let (e, mp) = mark_from(px, m.mark_ema as i128, ds, mid, ext); m.mark_ema = i64c(e)?; m.mark_px = mp;
     } else {
-        let (_, mp) = mark_from(px, m.mark_ema as i128, 0, Some((px as i128 + m.mark_ema as i128).max(1) as u64)); m.mark_px = mp;
+        let (_, mp) = mark_from(px, m.mark_ema as i128, 0, Some((px as i128 + m.mark_ema as i128).max(1) as u64), ext); m.mark_px = mp;
     }
     m.oracle_px = px; m.oracle_conf = conf_px; m.oracle_slot = clk.slot; m.oracle_ts = pt;
+    apply_bounds(m, px);
     Ok(())
 }
 /// Single pass: full-set check (AUDIT N-1), impact bid/ask (AUDIT N-2 level rule) and mid of the best prices.
 /// Ok(None) if no shard of the market was passed. Results identical to full_set + impact_px x2 + best x2.
 fn scan_book(sh: &[AccountView], pid: &Address, mk: &Key, n: u64, oracle: u64, slot: u64, notional: u64)
-    -> Result<Option<(Option<u64>, Option<u64>, Option<u64>)>, ProgramError> {
+    -> Result<Option<(Option<u64>, Option<u64>, Option<u64>, Option<u64>)>, ProgramError> {
     let mut seen = [0u64; 4]; let mut k = 0u64;
     let mut bufs = [[(0u64, 0u64); IMPACT_MAX]; 2]; let mut ns = [0usize; 2];
     let mut bb: [Option<u64>; 2] = [None, None];
@@ -1214,8 +1267,48 @@ fn scan_book(sh: &[AccountView], pid: &Address, mk: &Key, n: u64, oracle: u64, s
         }
         None
     };
-    let mid = match (bb[0], bb[1]) { (Some(b), Some(a)) => Some((b + a) / 2), _ => None };
-    Ok(Some((imp(&bufs[0][..ns[0]]), imp(&bufs[1][..ns[1]]), mid)))
+    Ok(Some((imp(&bufs[0][..ns[0]]), imp(&bufs[1][..ns[1]]), bb[0], bb[1])))
+}
+/// External perp consensus from our own oracle account, in market price units. None when old, absent or from Pyth.
+fn read_ext(x: &AccountView, pid: &Address, m: &Market, now: i64) -> Option<u64> {
+    if !x.owned_by(pid) || x.data_len() < AGG_SIZE { return None; }
+    let p = unsafe { x.borrow_unchecked() };
+    if p[0..8] != AGG_DISC { return None; }
+    let r = |o: usize| i64::from_le_bytes(p[o..o + 8].try_into().unwrap());
+    let (v, ts) = (r(133), r(141));
+    if v <= 0 || (now - ts).abs() > spec::EXT_MAX_AGE_SECS { return None; }
+    let q = (v as i128 * m.px_mul as i128 / m.px_div as i128) as u64;
+    if q == 0 { None } else { Some(q) }
+}
+/// Best bid / ask from approved maker slabs, for mid and premium. All approved slabs or none, like the shard set.
+fn fast_bbo(sh: &[AccountView], pid: &Address, mk: &Key, slot: u64, px: u64) -> Result<(Option<u64>, Option<u64>), ProgramError> {
+    let Some(fx) = sh.iter().find(|x| disc_of(x) == DISC_FAST) else { return Ok((None, None)) };
+    let f: &FastBook = load(fx, pid, DISC_FAST, FAST_SIZE)?;
+    if f.market != *mk { return Err(err(E::BadAccount)); }
+    let band = px / 10000 * spec::QUOTE_BAND_BPS;
+    let (lo, hi) = (px.saturating_sub(band), px + band);
+    let (mut bb, mut ba, mut seen) = (None::<u64>, None::<u64>, 0u64);
+    for x in sh {
+        if disc_of(x) != DISC_SLAB { continue; }
+        let s: &Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
+        let k = key(x);
+        let mi = f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))?;
+        if seen >> mi & 1 == 1 { return Err(err(E::BadAccount)); }
+        seen |= 1 << mi;
+        if s.kill != 0 || f.makers[mi].budget <= 0 { continue; }
+        for sd in 0..2usize {
+            let base = (f.idx as usize) << 4 | sd << 3;
+            for l in 0..SLAB_LEVELS {
+                let q = &s.quotes[base + l]; let p = q.px as u64;
+                if q.qty == 0 || p < lo || p > hi || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
+                let u_ = &f.used[mi][sd << 3 | l];
+                if u_.gen == q.gen && u_.qty >= q.qty { continue; }
+                if sd == 0 { bb = Some(bb.map_or(p, |v| v.max(p))); } else { ba = Some(ba.map_or(p, |v| v.min(p))); }
+            }
+        }
+    }
+    if seen != (1u64 << f.n) - 1 { return Err(err(E::MissingShards)); }
+    Ok((bb, ba))
 }
 /// PriceUpdateV2: disc8 | write_authority32 | verification_level (1 = Full) | feed_id32 | price i64 | conf u64 | expo i32 | publish_time i64 | ...
 fn read_pyth(pid: &Address, x: &AccountView, feed: &Key, m: &Market, now: i64) -> Result<(u64, u64, i64), E> {
@@ -1239,13 +1332,14 @@ fn read_pyth(pid: &Address, x: &AccountView, feed: &Key, m: &Market, now: i64) -
 }
 fn mark(m: &Market) -> u64 { if m.mark_px != 0 { m.mark_px } else { m.oracle_px } }
 /// Same as perp_core::mark_from.
-fn mark_from(px: u64, ema: i128, ds: u64, mid: Option<u64>) -> (i128, u64) {
+fn mark_from(px: u64, ema: i128, ds: u64, mid: Option<u64>, ext: Option<u64>) -> (i128, u64) {
     let s = match mid { Some(x) => x as i128 - px as i128, None => 0 };
     let w = core::cmp::min(ds, spec::MARK_EMA_SLOTS) as i128;
     let d = s - ema;
     // CU: native i64 when |d| * w can't overflow (same truncating division)
     let e = if d.unsigned_abs() < (1 << 40) && w < (1 << 20) { ema + ((d as i64 * w as i64) / spec::MARK_EMA_SLOTS as i64) as i128 } else { ema + d * w / spec::MARK_EMA_SLOTS as i128 };
-    let (a, b, c) = (px as i128, px as i128 + e, mid.unwrap_or(px) as i128);
+    let adj = px as i128 + e;
+    let (a, b, c) = match ext { Some(x) => (adj, mid.map_or(adj, |v| v as i128), x as i128), None => (px as i128, adj, mid.unwrap_or(px) as i128) };
     let med = a.min(b).max(a.max(b).min(c));
     let band = if px < (1 << 48) { (px * spec::MARK_CLAMP_BPS / 10000) as i128 } else { px as i128 * spec::MARK_CLAMP_BPS as i128 / 10000 };
     (e, med.clamp((px as i128 - band).max(1), px as i128 + band) as u64)
@@ -1302,7 +1396,8 @@ fn aggregate(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
 /// stay above initial margin. Same terms for every liquidator -> self-dealing gains nothing.
 /// accs: liquidator authority(s), liquidator user(w), target user(w), market(r), insurance(w), target-order shards(w)..., [other markets]
 /// data: tag, max_qty u64
-fn liquidate(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+fn liquidate(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult { liquidate_core(pid, a, d, false) }
+fn liquidate_core(pid: &Address, a: &mut [AccountView], d: &[u8], vlt: bool) -> ProgramResult {
     if a.len() < 5 { return Err(err(E::BadData)); }
     let max_qty = rd64(d, 1)?;
     if a[1].address() == a[2].address() { return Err(err(E::BadAccount)); }
@@ -1311,7 +1406,7 @@ fn liquidate(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let m: &Market = load(&a[3], pid, DISC_MARKET, MARKET_SIZE)?;
     let ins: &mut Insurance = load(&a[4], pid, DISC_INS, INS_SIZE)?;
     let (tk, mk) = (key(&a[2]), key(&a[3]));
-    if !a[0].is_signer() || lq.authority != key(&a[0]) || m.insurance != key(&a[4]) { return Err(err(E::BadAccount)); }
+    if (!vlt && !a[0].is_signer()) || lq.authority != key(&a[0]) || m.insurance != key(&a[4]) { return Err(err(E::BadAccount)); }
     home(lq, m)?; home(t, m)?;
     let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
     if stale(m, nw) { return Err(err(E::Stale)); }
@@ -1320,7 +1415,8 @@ fn liquidate(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     settle_funding_all(pid, t, mkts)?; settle_funding_all(pid, lq, mkts)?;
     let pi = t.pos.iter().position(|p| p.market == mk).ok_or(err(E::NotLiquidatable))?;
     let (eq, _, mm) = phealth(pid, t, pi, mkts, nw, true)?;
-    if eq >= mm { return Err(err(E::NotLiquidatable)); }
+    // the vault steps in only once the book had its chance: equity under 2/3 of maintenance
+    if eq >= (if vlt { mm * 2 / 3 } else { mm }) { return Err(err(E::NotLiquidatable)); }
     cancel_all_of(&a[5..], pid, &mk, &tk, t, pi); // free the target's resting margin first
     // AUDIT M-2: the liquidator must pass every shard holding the target's orders / unclaimed fills (bounded by n_orders cap)
     if t.pos[pi].bid_open != 0 || t.pos[pi].ask_open != 0 || t.pos[pi].n_orders != 0 { return Err(err(E::MissingShards)); }
@@ -1349,9 +1445,14 @@ fn liquidate(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     // AUDIT N-3/N-5: insurance never goes negative. A deficit larger than the fund can't be liquidated here:
     // the account goes through ADL (socialized against ranked counterparties, remainder -> Market.bad_debt only).
     if eq2 < 0 {
-        if -eq2 > ins.balance.max(0) as i128 { return Err(err(E::UseAdl)); }
+        // loss order: leftover insurance, then vault capital, then ADL
+        let cap = ins.balance.max(0) as i128 + if vlt { lq.cash.max(0) as i128 } else { 0 };
+        if -eq2 > cap { return Err(err(E::UseAdl)); }
         let closed = if t.pos[pi].flags & POS_ISO != 0 { t.pos[pi].base == 0 } else { t.pos.iter().all(|p| p.base == 0 || p.flags & POS_ISO != 0) };
-        if closed { ins.balance = i64c(ins.balance as i128 + eq2)?; credit(t, pi, -eq2)?; }
+        if closed {
+            let from_ins = (-eq2).min(ins.balance.max(0) as i128); let from_v = -eq2 - from_ins;
+            ins.balance = i64c(ins.balance as i128 - from_ins)?; lq.cash = i64c(lq.cash as i128 - from_v)?; credit(t, pi, -eq2)?;
+        }
     }
     let (le, lim, _) = health(pid, lq, mkts, nw, true)?;
     if le < lim { return Err(err(E::Margin)); }
@@ -1734,7 +1835,8 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     }
     let px0 = mark(m);
     let band = px0 / 10000 * spec::QUOTE_BAND_BPS;
-    let (lo, hi) = (px0.saturating_sub(band), px0 + band);
+    let (blo, bhi) = bound_range(m);
+    let (lo, hi) = (px0.saturating_sub(band).max(blo), (px0 + band).min(bhi));
     let opp = if bid { 1usize } else { 0usize };
     let base_ix = (f.idx as usize) << 4 | opp << 3;
     let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
@@ -1769,7 +1871,7 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
             }
         }
         // resting orders strictly better than the best quote (or all of them when no quote is usable)
-        if !rest.is_empty() {
+        if !rest.is_empty() || m.strict_take != 0 {
             let lim = if bk == usize::MAX { limit } else if bid { limit.min(bp - 1) } else { limit.max(bp + 1) };
             let tf = take(pid, rest, &mk, m, u, &uk, pi, bid, lim, left, slot, taker_bps, STP_CANCEL_OLDEST)?;
             left -= tf.filled;
@@ -1808,6 +1910,185 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
         if p.flags & POS_ISO != 0 { let (e2, i2, _) = iso_health(pid, u, pi, &a[2..], nw, true)?; if e2 < i2 { return Err(err(E::Margin)); } }
     }
     gc_pos(u);
+    Ok(())
+}
+
+
+// ---------- market config / session ----------
+/// accs: signer(s) (admin or session_auth), market(w). data: tag, session u8
+fn set_session(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 2 || d.len() < 2 || d[1] > 1 { return Err(err(E::BadData)); }
+    let m: &mut Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+    let by_key = a[0].is_signer() && m.session_auth != [0; 32] && key(&a[0]) == m.session_auth;
+    if !by_key && !auth(pid, &m.admin, a) { return Err(err(E::BadAccount)); }
+    if m.session != d[1] as u64 { m.session = d[1] as u64; m.bound_up = 0; m.bound_dn = 0; if m.session == 1 { m.bound_ref = m.oracle_px; } }
+    Ok(())
+}
+/// accs: admin(s), market(w). data: tag, bound_bps, thresh_bps, max_resets, strict_take (u64s), session_auth[32]
+fn market_cfg(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 2 || d.len() != 65 { return Err(err(E::BadData)); }
+    let m: &mut Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+    if !auth(pid, &m.admin, a) { return Err(err(E::BadAccount)); }
+    let (b, t) = (rd64(d, 1)?, rd64(d, 9)?);
+    if b > 10000 || t > 10000 { return Err(err(E::BadData)); }
+    m.bound_bps = b; m.bound_thresh_bps = t; m.bound_max = rd64(d, 17)?; m.strict_take = rd64(d, 25)?;
+    m.session_auth.copy_from_slice(&d[33..65]);
+    Ok(())
+}
+
+// ---------- HLP-style vault ----------
+/// accs: admin(s), vault(w, zeroed), market(r). data: tag, lockup_slots, day_cap_bps, perf_bps, dd_bps
+fn vault_init(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 3 || !a[0].is_signer() || d.len() != 33 { return Err(err(E::BadData)); }
+    if !a[1].owned_by(pid) || a[1].data_len() < VAULT_SIZE || disc_of(&a[1]) != 0 { return Err(err(E::BadAccount)); }
+    let m: &Market = load(&a[2], pid, DISC_MARKET, MARKET_SIZE)?;
+    let (cap, perf, dd) = (rd64(d, 9)?, rd64(d, 17)?, rd64(d, 25)?);
+    if cap > 10000 || perf > 3000 || dd > 10000 { return Err(err(E::BadData)); }
+    let v = unsafe { &mut *(a[1].borrow_unchecked().as_ptr() as *mut Vault) };
+    v.disc = DISC_VAULT; v.admin = key(&a[0]); v.token_vault = m.vault; v.lockup_slots = rd64(d, 1)?; v.day_cap_bps = cap; v.perf_bps = perf; v.dd_bps = dd;
+    Ok(())
+}
+/// accs: admin(s), vault(w), user(w, zeroed). The sub-account answers only to the program, on the vault's behalf.
+fn vault_add_sub(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
+    if a.len() < 3 { return Err(err(E::BadData)); }
+    let v: &mut Vault = load(&a[1], pid, DISC_VAULT, VAULT_SIZE)?;
+    if !auth(pid, &v.admin, a) || v.n_subs as usize >= VAULT_SUBS { return Err(err(E::BadAccount)); }
+    if !a[2].owned_by(pid) || a[2].data_len() < USER_SIZE || disc_of(&a[2]) != 0 { return Err(err(E::BadAccount)); }
+    let u = unsafe { &mut *(a[2].borrow_unchecked().as_ptr() as *mut User) };
+    u.disc = DISC_USER; u.authority = key(&a[1]); u.home_vault = v.token_vault;
+    v.subs[v.n_subs as usize] = key(&a[2]); v.n_subs += 1;
+    if v.n_subs == 1 { v.active = 1; }
+    Ok(())
+}
+/// accs: admin(s), vault(r), market(r), link(w, zeroed or own). data: tag, cap_bps
+fn vault_link(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 4 { return Err(err(E::BadData)); }
+    let v: &mut Vault = load(&a[1], pid, DISC_VAULT, VAULT_SIZE)?;
+    let _m: &Market = load(&a[2], pid, DISC_MARKET, MARKET_SIZE)?;
+    if !auth(pid, &v.admin, a) { return Err(err(E::BadAccount)); }
+    if !a[3].owned_by(pid) || a[3].data_len() < VLINK_SIZE { return Err(err(E::BadAccount)); }
+    let l = unsafe { &mut *(a[3].borrow_unchecked().as_ptr() as *mut VaultLink) };
+    if l.disc != 0 && (l.disc != DISC_VLINK || l.vault != key(&a[1]) || l.market != key(&a[2])) { return Err(err(E::BadAccount)); }
+    l.disc = DISC_VLINK; l.vault = key(&a[1]); l.market = key(&a[2]); l.cap_bps = rd64(d, 1)?;
+    Ok(())
+}
+/// Vault value: equity of every active sub-account. Flat, unused subs need no account.
+fn vault_nav(pid: &Address, v: &Vault, a: &[AccountView], nw: Now) -> Result<i128, ProgramError> {
+    let mut nav = 0i128;
+    for i in 0..v.n_subs as usize {
+        if v.active >> i & 1 == 0 { continue; }
+        let x = a.iter().find(|x| key(x) == v.subs[i]).ok_or(err(E::MissingShards))?;
+        let u: &mut User = load(x, pid, DISC_USER, USER_SIZE)?;
+        settle_funding_all(pid, u, a)?;
+        nav += health(pid, u, a, nw, true)?.0;
+    }
+    Ok(nav)
+}
+/// Remember the value, track the peak, and stop new takeovers past the drawdown limit.
+fn vault_mark(v: &mut Vault, nav: i128, slot: u64) -> ProgramResult {
+    v.nav = i64c(nav)?; v.nav_slot = slot;
+    if v.nav > v.peak_nav { v.peak_nav = v.nav; }
+    if v.dd_bps != 0 && (v.nav as i128) * 10000 < v.peak_nav as i128 * (10000 - v.dd_bps as i128) { v.halted = 1; }
+    Ok(())
+}
+const VV: i128 = spec::VAULT_VIRTUAL as i128;
+/// accs: owner(s), vault(w), depositor(w, zeroed or own), subs[0](w), market(r), token vault(w), src(w), token program, [active subs, markets]
+/// data: tag, amount
+fn vault_deposit(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 8 || !a[0].is_signer() { return Err(err(E::BadData)); }
+    let amt = rd64(d, 1)?;
+    if amt == 0 { return Err(err(E::BadData)); }
+    let v: &mut Vault = load(&a[1], pid, DISC_VAULT, VAULT_SIZE)?;
+    let m: &Market = load(&a[4], pid, DISC_MARKET, MARKET_SIZE)?;
+    if v.n_subs == 0 || key(&a[3]) != v.subs[0] || key(&a[5]) != v.token_vault || m.vault != v.token_vault || v.halted != 0 { return Err(err(E::BadAccount)); }
+    if a[7].address() != &pinocchio_token::ID { return Err(err(E::TokenProgram)); }
+    if !a[2].owned_by(pid) || a[2].data_len() < VDEP_SIZE { return Err(err(E::BadAccount)); }
+    let vd = unsafe { &mut *(a[2].borrow_unchecked().as_ptr() as *mut VaultDeposit) };
+    let (vk, ok) = (key(&a[1]), key(&a[0]));
+    if vd.disc == 0 { vd.disc = DISC_VDEP; vd.vault = vk; vd.owner = ok; }
+    else if vd.disc != DISC_VDEP || vd.vault != vk || vd.owner != ok { return Err(err(E::BadAccount)); }
+    let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
+    let nav = vault_nav(pid, v, &a[3..], nw)?;
+    if nav + VV <= 0 { return Err(err(E::Halted)); }
+    let minted = amt as i128 * (v.shares as i128 + VV) / (nav + VV);
+    if minted <= 0 { return Err(err(E::BadData)); }
+    pinocchio_token::instructions::Transfer::new(&a[6], &a[5], &a[0], amt).invoke_with_program(a[7].address())?;
+    let s0: &mut User = load(&a[3], pid, DISC_USER, USER_SIZE)?;
+    s0.cash = i64c(s0.cash as i128 + amt as i128)?;
+    v.shares += u64::try_from(minted).map_err(|_| err(E::Math))?;
+    vd.shares += minted as u64; vd.basis = i64c(vd.basis as i128 + amt as i128)?; vd.unlock_slot = clk.slot + v.lockup_slots;
+    vault_mark(v, nav + amt as i128, clk.slot)
+}
+/// accs: owner(s), vault(w), depositor(w), subs[0](w), market(r), token vault(w), dst(w), token program, vault pda, [active subs, markets]
+/// data: tag, shares
+fn vault_withdraw(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 9 || !a[0].is_signer() { return Err(err(E::BadData)); }
+    let sh = rd64(d, 1)?;
+    let v: &mut Vault = load(&a[1], pid, DISC_VAULT, VAULT_SIZE)?;
+    let vd: &mut VaultDeposit = load(&a[2], pid, DISC_VDEP, VDEP_SIZE)?;
+    let m: &Market = load(&a[4], pid, DISC_MARKET, MARKET_SIZE)?;
+    if vd.vault != key(&a[1]) || vd.owner != key(&a[0]) || key(&a[3]) != v.subs[0] || key(&a[5]) != v.token_vault || m.vault != v.token_vault { return Err(err(E::BadAccount)); }
+    if a[7].address() != &pinocchio_token::ID { return Err(err(E::TokenProgram)); }
+    if sh == 0 || sh > vd.shares { return Err(err(E::BadData)); }
+    let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
+    if clk.slot < vd.unlock_slot { return Err(err(E::Locked)); }
+    let nav = vault_nav(pid, v, &a[3..], nw)?;
+    let gross = sh as i128 * (nav + VV) / (v.shares as i128 + VV);
+    let cost = vd.basis as i128 * sh as i128 / vd.shares as i128;
+    let fee = if gross > cost { (gross - cost) * v.perf_bps as i128 / 10000 } else { 0 }; // kept in the vault for remaining holders
+    let out = gross - fee;
+    if out <= 0 { return Err(err(E::BadData)); }
+    if v.day_cap_bps != 0 {
+        if clk.slot >= v.day_start + spec::SLOTS_PER_DAY { v.day_start = clk.slot; v.day_out = 0; }
+        if (v.day_out as i128 + out) * 10000 > nav * v.day_cap_bps as i128 { return Err(err(E::Cap)); }
+        v.day_out = i64c(v.day_out as i128 + out)?;
+    }
+    let s0: &mut User = load(&a[3], pid, DISC_USER, USER_SIZE)?;
+    if out > s0.cash as i128 { return Err(err(E::Margin)); }
+    s0.cash = i64c(s0.cash as i128 - out)?;
+    let (eq, im, _) = health(pid, s0, &a[3..], nw, true)?;
+    if eq < im { return Err(err(E::Margin)); }
+    v.shares -= sh; vd.shares -= sh; vd.basis = i64c(vd.basis as i128 - cost)?;
+    vault_mark(v, nav - out, clk.slot)?;
+    let bump = [m.vault_bump as u8];
+    let seeds = [Seed::from(b"vault".as_slice()), Seed::from(&m.vault_seed), Seed::from(&bump)];
+    pinocchio_token::instructions::Transfer::new(&a[5], &a[6], &a[8], out as u64)
+        .invoke_signed_with_program(&[Signer::from(&seeds)], a[7].address())
+}
+/// Permissionless: the vault takes over a position the book could not close, at the mark.
+/// accs: vault(w), sub(w), target(w), market(r), insurance(w), link(r), target shards(w)..., [other markets]. data: tag, max_qty
+fn vault_takeover(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 6 { return Err(err(E::BadData)); }
+    let v: &mut Vault = load(&a[0], pid, DISC_VAULT, VAULT_SIZE)?;
+    let l: &VaultLink = load(&a[5], pid, DISC_VLINK, VLINK_SIZE)?;
+    let m: &Market = load(&a[3], pid, DISC_MARKET, MARKET_SIZE)?;
+    let (vk, mk, sk) = (key(&a[0]), key(&a[3]), key(&a[1]));
+    if v.halted != 0 { return Err(err(E::Halted)); }
+    if l.vault != vk || l.market != mk { return Err(err(E::BadAccount)); }
+    let si = v.subs[..v.n_subs as usize].iter().position(|k| *k == sk).ok_or(err(E::BadAccount))?;
+    liquidate_core(pid, a, d, true)?;
+    let u: &User = load(&a[1], pid, DISC_USER, USER_SIZE)?;
+    if let Some(p) = u.pos.iter().find(|p| p.market == mk) {
+        if mulf((p.base as i128).abs(), mark(m)) * 10000 > v.nav.max(0) as i128 * l.cap_bps as i128 { return Err(err(E::Cap)); }
+    }
+    v.active |= 1 << si;
+    Ok(())
+}
+/// Permissionless: refresh value, peak and the drawdown stop. accs: vault(w), [active subs, markets]
+fn vault_crank(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
+    if a.len() < 2 { return Err(err(E::BadData)); }
+    let v: &mut Vault = load(&a[0], pid, DISC_VAULT, VAULT_SIZE)?;
+    let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
+    let nav = vault_nav(pid, v, &a[1..], nw)?;
+    vault_mark(v, nav, clk.slot)
+}
+/// accs: admin(s), vault(w). data: tag, lockup_slots, day_cap_bps, dd_bps, halted
+fn vault_set(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 2 || d.len() != 33 { return Err(err(E::BadData)); }
+    let v: &mut Vault = load(&a[1], pid, DISC_VAULT, VAULT_SIZE)?;
+    if !auth(pid, &v.admin, a) { return Err(err(E::BadAccount)); }
+    v.lockup_slots = rd64(d, 1)?; v.day_cap_bps = rd64(d, 9)?; v.dd_bps = rd64(d, 17)?; v.halted = rd64(d, 25)?;
+    if v.day_cap_bps > 10000 || v.dd_bps > 10000 { return Err(err(E::BadData)); }
     Ok(())
 }
 

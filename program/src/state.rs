@@ -44,6 +44,16 @@ pub struct Market {
     pub max_position: u64,
     /// timelocked admin change: op, value, earliest slot, key (new admin / oracle2)
     pub pending_op: u64, pub pending_val: u64, pub pending_eta: u64, pub pending_key: Key,
+    /// resting-book shards per side; strict_take = 1 makes takers prove they saw every opposite shard
+    pub n_side: [u64; 2], pub strict_take: u64,
+    /// discovery bounds: mark stays within bound_ref +- bound_bps; while closed the reference re-anchors up to bound_max times per direction
+    pub bound_ref: u64, pub bound_bps: u64, pub bound_thresh_bps: u64, pub bound_max: u64, pub bound_up: u64, pub bound_dn: u64,
+    /// 0 = external market open, 1 = closed (internal pricing)
+    pub session: u64,
+    /// external perp consensus price and its publish time
+    pub ext_px: u64, pub ext_ts: i64,
+    /// key allowed to flip `session` (the keeper), besides the admin
+    pub session_auth: Key,
 }
 
 #[repr(C)]
@@ -170,3 +180,23 @@ pub struct FastBook { pub disc: u64, pub market: Key, pub idx: u64, pub n: u64, 
     pub makers: [FastMaker; FAST_MAKERS], pub used: [[Used; 2 * SLAB_LEVELS]; FAST_MAKERS] }
 pub const SLAB_SIZE: usize = core::mem::size_of::<Slab>();
 pub const FAST_SIZE: usize = core::mem::size_of::<FastBook>();
+
+// ---------- HLP-style vault ----------
+pub const DISC_VAULT: u64 = 0x5045525056415501; // "PERPVAU\x01"
+pub const DISC_VDEP: u64 = 0x5045525056445001; // "PERPVDP\x01"
+pub const DISC_VLINK: u64 = 0x50455250564c4b01; // "PERPVLK\x01"
+pub const VAULT_SUBS: usize = 32;
+/// Liquidity, insurance and liquidation takeover in one pool. Positions sit in program-controlled User sub-accounts
+/// (authority = this account); subs[0] holds the idle cash. Sub-accounts in `active` must be passed to price the vault.
+#[repr(C)]
+pub struct Vault { pub disc: u64, pub admin: Key, pub token_vault: Key, pub shares: u64, pub nav: i64, pub peak_nav: i64, pub nav_slot: u64,
+    pub lockup_slots: u64, pub day_cap_bps: u64, pub perf_bps: u64, pub dd_bps: u64, pub halted: u64, pub day_start: u64, pub day_out: i64,
+    pub active: u64, pub n_subs: u64, pub subs: [Key; VAULT_SUBS] }
+#[repr(C)]
+pub struct VaultDeposit { pub disc: u64, pub vault: Key, pub owner: Key, pub shares: u64, pub unlock_slot: u64, pub basis: i64 }
+/// Markets the vault may take positions in, with an inventory cap as bps of NAV.
+#[repr(C)]
+pub struct VaultLink { pub disc: u64, pub vault: Key, pub market: Key, pub cap_bps: u64 }
+pub const VAULT_SIZE: usize = core::mem::size_of::<Vault>();
+pub const VDEP_SIZE: usize = core::mem::size_of::<VaultDeposit>();
+pub const VLINK_SIZE: usize = core::mem::size_of::<VaultLink>();
