@@ -1,0 +1,19 @@
+[package]
+name = "perp-program-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+[package.metadata]
+cargo-fuzz = true
+[dependencies]
+libfuzzer-sys = "0.4"
+perp-program = { path = ".." }
+pinocchio = { version = "0.12", default-features = false, features = ["cpi"] }
+solana-address = { version = "2", features = ["curve25519"] }
+[workspace]
+members = ["."]
+[[bin]]
+name = "native"
+path = "fuzz_targets/native.rs"
+test = false
+doc = false

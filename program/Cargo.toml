@@ -1,0 +1,24 @@
+[package]
+name = "perp-program"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pinocchio = { version = "0.12", default-features = false, features = ["cpi"] }
+pinocchio-token = { version = "0.8", default-features = false }
+
+[target.'cfg(not(target_os = "solana"))'.dependencies]
+# host-only (clippy / native checks): PDA derivation without syscalls
+solana-address = { version = "2", features = ["curve25519"] }
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(target_os, values("solana"))']
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+overflow-checks = true
