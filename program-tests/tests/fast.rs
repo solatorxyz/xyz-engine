@@ -633,3 +633,51 @@ fn exec_fast(e: &mut Env, kp: &Keypair, ku: &Address, tu: &Address, f: &Address,
     assert!(exec_fast(&mut e, &kp, &ku, &tu, &fask, &[k.slab], 0));
     assert_eq!(e.user_state(&tu).pos[0].base, 300);
 }
+/// Random sequences with high leverage and liquidations (keeper paid): positions net to zero after every step, and at the end
+/// cash + locked margin + fees + insurance (keeper included as a user) equals the tokens in the vault.
+#[test] fn random_sequences_with_liquidations_conserve() {
+    let (mut liqs, mut takes) = (0u64, 0u64);
+    for seed in 1..=40u64 {
+        let mut g = Rng(seed.wrapping_mul(0xA24BAED4963EE407) | 1);
+        let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let f = fast_new(&mut e, 0);
+        let mk: Vec<Mk> = (0..2).map(|_| maker(&mut e, &f, 200_000_000_000, 20_000_000_000)).collect();
+        let tk_: Vec<(Keypair, Address)> = (0..3).map(|_| e.user(1_000_000_000 + g.n(1_000_000_000))).collect();
+        let (_kp, ku) = e.user(1);
+        let slabs: Vec<Address> = mk.iter().map(|m| m.slab).collect();
+        let mut px: i64 = 1000_00000000;
+        for _ in 0..200 {
+            let mid = (px / 1_000_000) as u64;
+            match g.n(8) {
+                0..=1 => { for m in &mk { let v: Vec<(u16, u32, u32)> = (0..4).map(|l| { let s = (l % 2) as u16; let off = 1 + g.n(40);
+                    (s << 3 | (l / 2) as u16, (if s == 1 { mid + off } else { mid - off }) as u32, (1 + g.n(60_000)) as u32) }).collect();
+                    quote(&mut e, m, &v, true); } }
+                2..=3 => { let i = g.n(3) as usize; let side = g.n(2) as u8; let lim = if side == 0 { mid + 500 } else { mid - 500 };
+                    let (kp, u) = (tk_[i].0.insecure_clone(), tk_[i].1); let m = e.market;
+                    let mut a = vec![AccountMeta::new(kp.pubkey(), true), w(&u), r(&m), w(&f)]; a.extend(slabs.iter().map(r));
+                    if try_send(&mut e, a, take_ix(side, 0, 2, lim, 1 + g.n(90_000)), &[&kp]) { takes += 1; } }
+                4 => { let i = g.n(2) as usize; let m = e.market; let u = mk[i].u; try_send(&mut e, vec![w(&u), r(&m), w(&f)], vec![65], &[]); }
+                5 => { let i = g.n(3) as usize; let u = tk_[i].1; let (m, ins) = (e.market, e.ins);
+                    let mut a = vec![w(&u), r(&m), w(&ins), w(&f)]; a.extend(slabs.iter().map(r)); a.push(w(&ku));
+                    let mut d = vec![70u8, 2]; d.extend_from_slice(&u64::MAX.to_le_bytes());
+                    if try_send(&mut e, a, d, &[]) { liqs += 1; } }
+                _ => { px = (px as i128 * (10_000 + g.n(601) as i128 - 300) / 10_000) as i64; let s = e.slot + 1 + g.n(3); e.set_time(s); e.oracle_update("", px, None); }
+            }
+            let b = fb(&e, &f);
+            let mut net: i128 = (0..2).map(|i| b.makers[i].base as i128).sum();
+            for a in mk.iter().map(|m| m.u).chain(tk_.iter().map(|t| t.1)) { net += e.user_state(&a).pos.iter().filter(|p| p.market == e.market.to_bytes()).map(|p| p.base as i128).sum::<i128>(); }
+            assert_eq!(net, 0, "seed {seed}: positions don't net to zero");
+            for i in 0..2 { assert!(b.makers[i].budget >= 0, "seed {seed}: negative budget"); }
+        }
+        let s = e.slot + 1; e.set_time(s); e.oracle_update("", px, None);
+        for m in &mk { let mm = e.market; let u = m.u; e.send("", vec![w(&u), r(&mm), w(&f)], vec![65], &[], true); }
+        for (kp, u) in &tk_ { let m = e.market; let kp = kp.insecure_clone(); let mut a = vec![AccountMeta::new(kp.pubkey(), true), w(u), r(&m), w(&f)]; a.extend(slabs.iter().map(r));
+            let mut d = take_ix(0, 1, 2, 1, 1); d[2] = 1; try_send(&mut e, a, d, &[&kp]); }
+        let b = fb(&e, &f);
+        let mut sum: i128 = (0..2).map(|i| b.makers[i].margin as i128).sum::<i128>() + b.fee_accum as i128 + e.ins_bal() as i128 + e.market_state().fees as i128;
+        for a in mk.iter().map(|m| m.u).chain(tk_.iter().map(|t| t.1)).chain(std::iter::once(ku)) { sum += e.user_state(&a).cash as i128; }
+        let v = e.vault_amount() as i128;
+        assert!((sum - v).abs() <= 32, "seed {seed}: cash {sum} vs vault {v}");
+    }
+    println!("liquidation fuzz: {liqs} liquidations, {takes} takes");
+    assert!(liqs > 20, "the fuzz must actually liquidate");
+}
