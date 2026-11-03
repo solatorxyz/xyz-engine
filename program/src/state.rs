@@ -173,7 +173,8 @@ pub struct Used { pub gen: u32, pub qty: u32 }
 /// Margin locked for quoting here, the notional it may still fill, and fills not yet moved to the maker's User.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct FastMaker { pub slab: Key, pub user: Key, pub margin: i64, pub budget: i64, pub base: i64, pub quote: i64, pub volume: u64 }
+/// target > 0: auto mode, settle moves margin toward target from free collateral and hands it back when the account needs it.
+pub struct FastMaker { pub slab: Key, pub user: Key, pub margin: i64, pub budget: i64, pub base: i64, pub quote: i64, pub volume: u64, pub target: i64 }
 /// Per-market fill state: takers write here, so quotes and fills never contend on a write lock.
 #[repr(C)]
 pub struct FastBook { pub disc: u64, pub market: Key, pub idx: u64, pub n: u64, pub oi_long_delta: i64, pub fee_accum: i64, pub fills: u64,

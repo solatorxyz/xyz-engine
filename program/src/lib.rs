@@ -1713,7 +1713,7 @@ fn fast_join(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     let (n, sk) = (f.n as usize, key(&a[3]));
     if n >= FAST_MAKERS { return Err(err(E::Cap)); }
     if f.makers[..n].iter().any(|x| x.slab == sk) { return Err(err(E::BadAccount)); }
-    f.makers[n] = FastMaker { slab: sk, user: s.user, margin: 0, budget: 0, base: 0, quote: 0, volume: 0 };
+    f.makers[n] = FastMaker { slab: sk, user: s.user, margin: 0, budget: 0, base: 0, quote: 0, volume: 0, target: 0 };
     f.n += 1;
     Ok(())
 }
@@ -1748,10 +1748,12 @@ fn slab_kill(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
 #[inline(always)]
 fn maker_budget(m: &Market, margin: i64) -> i64 { i64::try_from(margin.max(0) as i128 * 10000 / m.imr_bps as i128).unwrap_or(i64::MAX) }
 /// Lock (amount > 0) or release (amount < 0) quoting margin. A maker can only fill up to margin / IMR of notional between settles.
-/// accs: authority(s), user(w), market(r), fast(w), [other markets]. data: tag, amount i64
+/// Optional target turns on auto mode (0 turns it off); see slab_settle.
+/// accs: authority(s), user(w), market(r), fast(w), [other markets]. data: tag, amount i64, [target i64]
 fn slab_fund(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if a.len() < 4 { return Err(err(E::BadData)); }
     let amt = rd64(d, 1)? as i64;
+    let tgt = if d.len() > 9 { let t = rd64(d, 9)? as i64; if t < 0 { return Err(err(E::BadData)); } Some(t) } else { None };
     let u: &mut User = load(&a[1], pid, DISC_USER, USER_SIZE)?;
     let m: &Market = load(&a[2], pid, DISC_MARKET, MARKET_SIZE)?;
     let f: &mut FastBook = load(&a[3], pid, DISC_FAST, FAST_SIZE)?;
@@ -1762,6 +1764,7 @@ fn slab_fund(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let n = f.n as usize;
     let e = f.makers[..n].iter_mut().find(|x| x.user == uk).ok_or(err(E::BadAccount))?;
     if amt < 0 && (e.base != 0 || e.quote != 0) { return Err(err(E::Ledger)); } // settle first
+    if let Some(t) = tgt { e.target = t; }
     let nm = i64c(e.margin as i128 + amt as i128)?;
     if nm < 0 { return Err(err(E::Margin)); }
     settle_funding_all(pid, u, &a[2..])?;
@@ -1797,6 +1800,16 @@ fn slab_settle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     }
     let (eq, _, mm) = health(pid, u, &a[1..], nw, false)?;
     if eq < mm { u.cash = i64c(u.cash as i128 + e.margin as i128)?; e.margin = 0; }
+    else if e.target > 0 {
+        // Auto mode works like cross margin through the keeper's settles: idle cash tops the margin up to target,
+        // and margin goes back to cash first when the rest of the account falls short of initial margin. Skipped on a stale price.
+        if let Ok((eq, im, _)) = health(pid, u, &a[1..], nw, true) {
+            let mv: i128 = if eq < im { -((im - eq).min(e.margin as i128)) }
+                else if e.target > e.margin { ((e.target - e.margin) as i128).min((u.cash as i128).max(0)).min(eq - im) }
+                else { -((e.margin - e.target) as i128) };
+            u.cash = i64c(u.cash as i128 - mv)?; e.margin = i64c(e.margin as i128 + mv)?;
+        }
+    }
     e.budget = maker_budget(m, e.margin);
     gc_pos(u);
     Ok(())

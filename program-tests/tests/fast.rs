@@ -192,3 +192,56 @@ fn setup(e: &mut Env) -> (Address, Mk) { e.oracle_update("", 1000_00000000, None
     let m = e.market;
     println!("settle: {:?}", e.send("", vec![w(&k.u), r(&m), w(&f)], vec![65], &[], true));
 }
+fn fund_t(e: &mut Env, f: &Address, k: &Mk, amt: i64, target: i64, ok: bool) {
+    let mut d = vec![64u8]; d.extend_from_slice(&amt.to_le_bytes()); d.extend_from_slice(&target.to_le_bytes());
+    let m = e.market;
+    e.send("", vec![AccountMeta::new(k.kp.pubkey(), true), w(&k.u), r(&m), w(f)], d, &[&k.kp], ok);
+}
+#[test] fn auto_margin_follows_target_from_idle_cash() {
+    let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let f = fast_new(&mut e, 0);
+    let k = maker(&mut e, &f, 10_000_000_000, 0);
+    fund_t(&mut e, &f, &k, 0, -1, false);
+    fund_t(&mut e, &f, &k, 0, 2_000_000_000, true);
+    settle(&mut e, &f, &k);
+    let b = fb(&e, &f); assert_eq!((b.makers[0].margin, b.makers[0].budget), (2_000_000_000, 20_000_000_000), "settle tops margin up to target");
+    assert_eq!(e.user_state(&k.u).cash, 8_000_000_000);
+    // fills spend the budget; the next settle refills it from cash without the maker signing anything
+    let (tp, tu) = e.user(100_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 100_000, true);
+    assert!(fb(&e, &f).makers[0].budget < 20_000_000_000);
+    settle(&mut e, &f, &k);
+    assert_eq!(fb(&e, &f).makers[0].budget, 20_000_000_000);
+    // a target above the account's free collateral stops there
+    fund_t(&mut e, &f, &k, 0, 1_000_000_000_000, true);
+    settle(&mut e, &f, &k);
+    let m1 = fb(&e, &f).makers[0].margin; assert!(m1 > 2_000_000_000);
+    settle(&mut e, &f, &k);
+    assert_eq!(fb(&e, &f).makers[0].margin, m1, "it stops where the account would fall below initial margin");
+    let (m, _) = (e.market, 0); let _ = m;
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 1, true);
+    // lowering the target hands the excess back
+    fund_t(&mut e, &f, &k, 0, 1_000_000_000, true);
+    settle(&mut e, &f, &k);
+    assert_eq!(fb(&e, &f).makers[0].margin, 1_000_000_000);
+    // target 0 = manual: settle leaves margin alone
+    fund_t(&mut e, &f, &k, 0, 0, true); fund_m(&mut e, &f, &k, 500_000_000, true);
+    settle(&mut e, &f, &k);
+    assert_eq!(fb(&e, &f).makers[0].margin, 1_500_000_000);
+}
+#[test] fn auto_margin_goes_back_when_the_account_is_short() {
+    let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let f = fast_new(&mut e, 0);
+    let k = maker(&mut e, &f, 10_000_000_000, 0);
+    fund_t(&mut e, &f, &k, 6_500_000_000, 6_500_000_000, true);
+    let (tp, tu) = e.user(100_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 500_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 500_000, true);
+    let q = fb(&e, &f).makers[0].quote;
+    settle(&mut e, &f, &k);
+    let (u, b) = (e.user_state(&k.u), fb(&e, &f));
+    assert_eq!(u.pos[0].base, -500_000);
+    assert_eq!(u.cash as i128 + b.makers[0].margin as i128, 10_000_000_000i128 + q as i128, "nothing created or lost");
+    assert!(b.makers[0].margin > 0 && b.makers[0].margin < 6_500_000_000, "margin {} handed back to cover initial margin", b.makers[0].margin);
+    // the account now meets initial margin again: a taker order that needs exactly the released cash still clears
+    assert_eq!(b.makers[0].budget, b.makers[0].margin as i64 * 10);
+}
