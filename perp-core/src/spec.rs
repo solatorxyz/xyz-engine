@@ -7,6 +7,7 @@ pub const IMR_BPS: u64 = 1000;
 pub const MMR_BPS: u64 = 500;
 pub const MAX_STALENESS_SLOTS: u64 = 3;
 pub const LIQ_FEE_BPS: u64 = 25;
+pub const LIQ_KEEPER_SHARE_BPS: u64 = 2000;
 pub const LIQ_BAND_PCT: u64 = 5;
 pub const LIQ_BOOK_CHUNK_BPS: u64 = 2500;
 pub const LIQ_BOOK_BAND_BPS: u64 = 500;

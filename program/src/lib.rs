@@ -1505,9 +1505,9 @@ fn liquidate_book(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let b = t.pos[pi].base;
     if b == 0 { return Err(err(E::NotLiquidatable)); }
     let ab = b.unsigned_abs();
-    let q = ab.min(max_qty).min(liq_chunk(ab));
-    if q == 0 { return Err(err(E::BadData)); }
     let px = mark(m); let bid = b < 0;
+    let q = ab.min(max_qty).min(liq_chunk(ab)).min(liq_needed(eq, mm, ab, px, m.mmr_bps));
+    if q == 0 { return Err(err(E::BadData)); }
     let taker_bps = TIERS[(t.tier as usize).min(TIERS.len() - 1)].0;
     // AUDIT V6-1: escalate the band (5% -> 10% -> 20%); each wider step doubles the liquidation fee (penalty to insurance)
     let (mut filled, mut step) = (0u64, 0u64);
@@ -1537,7 +1537,7 @@ fn liquidate_book(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let (eq2, _, _) = phealth(pid, t, pi, mkts, nw, false)?;
     let n = mulf(f.filled as i128, px);
     let fee = bps_dn(n, LIQ_FEE_BPS << step).min(eq2.max(0));
-    credit(t, pi, -fee)?; ins.balance = i64c(ins.balance as i128 + fee)?;
+    credit(t, pi, -fee)?; pay_liq_fee(pid, &a[3..], &tk, m, ins, fee)?;
     if eq2 < 0 {
         if -eq2 > ins.balance.max(0) as i128 { return Err(err(E::UseAdl)); }
         let closed = if t.pos[pi].flags & POS_ISO != 0 { t.pos[pi].base == 0 } else { t.pos.iter().all(|p| p.base == 0 || p.flags & POS_ISO != 0) };
@@ -1547,7 +1547,32 @@ fn liquidate_book(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     gc_pos(t);
     Ok(())
 }
+/// Liquidation fee: LIQ_KEEPER_SHARE_BPS goes to the keeper that sent the liquidation (the first other User account passed;
+/// it must hold cash against the same vault), the rest to insurance. Without a keeper account all of it goes to insurance.
+/// Paying whoever does the work lets anyone run a liquidator, so liquidations don't hang on one operator.
+fn pay_liq_fee(pid: &Address, rest: &[AccountView], tk: &Key, m: &Market, ins: &mut Insurance, fee: i128) -> ProgramResult {
+    let mut to_ins = fee;
+    if let Some(x) = rest.iter().find(|x| x.owned_by(pid) && disc_of(x) == DISC_USER && key(x) != *tk) {
+        let k: &mut User = load(x, pid, DISC_USER, USER_SIZE)?;
+        if k.home_vault != m.vault { return Err(err(E::Vault)); }
+        let share = fee * spec::LIQ_KEEPER_SHARE_BPS as i128 / 10000;
+        k.cash = i64c(k.cash as i128 + share)?; to_ins -= share;
+    }
+    ins.balance = i64c(ins.balance as i128 + to_ins)?;
+    Ok(())
+}
 struct Fill1 { filled: u64 }
+/// Lots to close so that afterwards equity >= 1.25 x maintenance. Closing q of |base| lots at the mark frees q/|base| of
+/// the maintenance requirement and costs at most the widest-band fee (LIQ_FEE_BPS << 2), so
+/// q >= (1.25 mm - eq) / (notional x (1.25 mmr - worst fee) / |base|). Partial liquidation like Hyperliquid's: an account just
+/// under maintenance loses a sliver instead of a fixed 25% chunk (the chunk stays as the cap per transaction). At least 1 lot.
+fn liq_needed(eq: i128, mm: i128, ab: u64, px: u64, mmr_bps: u64) -> u64 {
+    let worst_fee = (LIQ_FEE_BPS << (LIQ_BOOK_BAND_STEPS - 1)) as i128;
+    let relief = mulf(ab as i128, px) * (5 * mmr_bps as i128 - 4 * worst_fee); // x 40000 per |base| lots
+    let deficit = (5 * mm - 4 * eq).max(0) * 10000; // (1.25 mm - eq) x 40000
+    if relief <= 0 { return u64::MAX; }
+    u64::try_from((deficit * ab as i128 + relief - 1) / relief).unwrap_or(u64::MAX).max(1)
+}
 #[inline(always)]
 fn liq_chunk(ab: u64) -> u64 { ((ab as u128 * LIQ_BOOK_CHUNK_BPS as u128 + 9999) / 10000).max(1) as u64 }
 // ---------- ADL ranking (AUDIT M-5) ----------
@@ -1985,9 +2010,9 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let b = t.pos[pi].base;
     if b == 0 { return Err(err(E::NotLiquidatable)); }
     let ab = b.unsigned_abs();
-    let mut left = ab.min(max_qty).min(liq_chunk(ab));
-    if left == 0 { return Err(err(E::BadData)); }
     let px = mark(m); let bid = b < 0;
+    let mut left = ab.min(max_qty).min(liq_chunk(ab)).min(liq_needed(eq, mm, ab, px, m.mmr_bps));
+    if left == 0 { return Err(err(E::BadData)); }
     // same price window as an ordinary take: a liquidation never reaches quotes a taker couldn't
     let band = px / 10000 * spec::QUOTE_BAND_BPS;
     let (blo, bhi) = bound_range(m);
@@ -2033,7 +2058,7 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     f.fills += 1;
     let (eq2, _, _) = phealth(pid, t, pi, mkts, nw, false)?;
     let fee = bps_dn(notional, LIQ_FEE_BPS).min(eq2.max(0));
-    credit(t, pi, -fee)?; ins.balance = i64c(ins.balance as i128 + fee)?;
+    credit(t, pi, -fee)?; pay_liq_fee(pid, &a[4 + ns..], &tk, m, ins, fee)?;
     if eq2 < 0 {
         if -eq2 > ins.balance.max(0) as i128 { return Err(err(E::UseAdl)); }
         let closed = if t.pos[pi].flags & POS_ISO != 0 { t.pos[pi].base == 0 } else { t.pos.iter().all(|p| p.base == 0 || p.flags & POS_ISO != 0) };

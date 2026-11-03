@@ -523,3 +523,59 @@ fn fast_new_side(e: &mut Env, idx: u64, side: u8) -> Address {
     let mut d = vec![70u8, 1]; d.extend_from_slice(&u64::MAX.to_le_bytes());
     assert!(!try_send(&mut e, vec![w(&bu), r(&m2), w(&ins), w(&fask), r(&k.slab)], d.clone(), &[]), "healthy and wrong book");
 }
+/// The keeper that sends a liquidation earns LIQ_KEEPER_SHARE_BPS of the liquidation fee; insurance gets the rest.
+/// Without a keeper account insurance gets it all; a keeper bound to another vault is refused.
+#[test] fn liquidation_fee_pays_the_keeper() {
+    let run = |with_keeper: bool| -> (i64, i64, i64) {
+        let mut e = Env::new(); let (f, k) = setup(&mut e);
+        let (tp, tu) = e.user(1_000_000_000); let (_kp, ku) = e.user(1);
+        quote(&mut e, &k, &[(ASK, 100_010, 100_000)], true);
+        tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 90_000, true);
+        settle(&mut e, &f, &k);
+        let s = e.slot + 1; e.set_time(s); e.oracle_update("", 910_00000000, None);
+        quote(&mut e, &k, &[(0, 90_990, 100_000)], true);
+        let (m, ins) = (e.market, e.ins); let (i0, k0) = (e.ins_bal(), e.user_state(&ku).cash);
+        let mut a = vec![w(&tu), r(&m), w(&ins), w(&f), r(&k.slab)]; if with_keeper { a.push(w(&ku)); }
+        let mut d = vec![70u8, 1]; d.extend_from_slice(&u64::MAX.to_le_bytes());
+        e.send("", a, d, &[], true);
+        let fee = (90_990i64 * 22_500 * 25) / 10_000;
+        (fee, e.ins_bal() - i0, e.user_state(&ku).cash - k0)
+    };
+    let (fee, ins, kp) = run(false); assert_eq!((ins, kp), (fee, 0));
+    let (fee, ins, kp) = run(true); assert_eq!(kp, fee * 2000 / 10_000, "keeper share"); assert_eq!(ins + kp, fee, "nothing created or lost");
+    // a keeper account from another vault is refused
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(1_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 90_000, true);
+    let s = e.slot + 1; e.set_time(s); e.oracle_update("", 910_00000000, None);
+    quote(&mut e, &k, &[(0, 90_990, 100_000)], true);
+    let stranger = Address::new_unique(); e.prog_acct(stranger, USER_SIZE);
+    let mut d0 = e.data(&stranger); d0[0..8].copy_from_slice(&DISC_USER.to_le_bytes()); d0[64..96].copy_from_slice(&[9u8; 32]);
+    e.svm.set_account(stranger, Account { lamports: 1_000_000_000, data: d0, owner: e.pid, executable: false, rent_epoch: 0 }).unwrap();
+    let (m, ins) = (e.market, e.ins); let mut d = vec![70u8, 1]; d.extend_from_slice(&u64::MAX.to_le_bytes());
+    assert!(!try_send(&mut e, vec![w(&tu), r(&m), w(&ins), w(&f), r(&k.slab), w(&stranger)], d, &[]));
+}
+/// Just under maintenance, liquidation closes only what restores 1.25x maintenance (well under the 25% chunk) and the
+/// account comes out healthy; deep under, the 25% chunk still caps one transaction.
+#[test] fn liquidation_is_partial_when_barely_under() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(1_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 90_000, true);
+    // 9x long: equity = 90k x px - 8.0054e9, maintenance = 5% of 90k x px: under below px 93,630. Use 93,600.
+    let s = e.slot + 1; e.set_time(s); e.oracle_update("", 936_00000000, None);
+    let m0 = e.market_state(); let px = m0.mark_px.max(m0.oracle_px) as i128;
+    let u0 = e.user_state(&tu); let eq0 = u0.cash as i128 + 90_000i128 * px; let mm0 = 90_000i128 * px * 500 / 10_000;
+    assert!(eq0 < mm0, "set up just under maintenance: eq {eq0} mm {mm0}");
+    quote(&mut e, &k, &[(0, (px - 5) as u32, 100_000)], true);
+    let (m, ins) = (e.market, e.ins); let mut d = vec![70u8, 1]; d.extend_from_slice(&u64::MAX.to_le_bytes());
+    e.send("", vec![w(&tu), r(&m), w(&ins), w(&f), r(&k.slab)], d, &[], true);
+    let u = e.user_state(&tu); let closed = 90_000 - u.pos[0].base;
+    println!("partial liquidation closed {closed} of 90000 (25% chunk = 22500)");
+    assert!(closed > 0 && closed < 22_500, "closed {closed}: less than the 25% chunk");
+    let eq = u.cash as i128 + u.pos[0].base as i128 * px; let mm = u.pos[0].base as i128 * px * 500 / 10_000;
+    assert!(eq >= mm, "healthy after one partial liquidation: eq {eq} mm {mm}");
+    let (m, ins) = (e.market, e.ins); let mut d = vec![70u8, 1]; d.extend_from_slice(&u64::MAX.to_le_bytes());
+    assert!(!try_send(&mut e, vec![w(&tu), r(&m), w(&ins), w(&f), r(&k.slab)], d, &[]), "no second liquidation needed");
+}

@@ -40,3 +40,9 @@ Use `sdk/ts/everytick.ts` (builders, decoders, `fastDepth`). `sdk/ts/smoke.ts` s
 - Trading: `take_fast` with all approved slabs for the market. Show fills from the program's fill events.
 - Positions: decode_user plus, for makers, the FastBook entry (unsettled base and quote) so equity matches what liquidation sees.
 - Maker panel: margin, budget, auto target, kill switch.
+
+## Liquidation (2026-11-04)
+- Partial: one liquidation closes only what brings equity back to 1.25x maintenance (worst-band fee assumed), capped at the
+  25% chunk. Example from the tests: a 9x long just under maintenance closed 10,674 of 90,000 lots, not 22,500.
+- Keeper reward: append your own User account (same vault) to liquidate_book / liquidate_fast and receive 20% of the
+  liquidation fee (LIQ_KEEPER_SHARE_BPS); insurance gets the rest. No keeper account: all to insurance.
