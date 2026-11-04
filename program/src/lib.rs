@@ -2582,6 +2582,80 @@ mod kani_proofs {
         kani::assume(a < (1 << 50) && b < (1 << 50) && bps <= 10_000);
         assert_eq!(moved(a, b, bps), (a as i128 - b as i128).abs() * 10000 > b as i128 * bps as i128);
     }
+    /// The split path (|a| < 2^32, any b, prices above 2^32 included) is the exact i128 product.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn mulf_split_path_exact() {
+        let a: i128 = kani::any(); let b: u64 = kani::any();
+        kani::assume(a.unsigned_abs() < (1u128 << 32));
+        assert_eq!(mulf(a, b), a * b as i128);
+    }
+    /// The native bps paths round exactly like the i128 formulas.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn bps_fast_paths_exact() {
+        let x: i128 = kani::any(); let b: u64 = kani::any();
+        kani::assume(x >= 0 && x < FAST && b <= 65_535);
+        assert_eq!(bps_up(x, b), (x * b as i128 + 9999) / 10000);
+        assert_eq!(bps_dn(x, b), x * b as i128 / 10000);
+    }
+    /// Booking the taker once per take (Acc) leaves cash, position and cost basis exactly as booking every fill does, for any
+    /// three fills from any starting position, including fills that reach zero or cross it.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    #[kani::unwind(4)]
+    fn taker_booked_once_equals_every_fill() {
+        let mut u1: User = unsafe { core::mem::zeroed() };
+        let (b0, c0): (i64, i64) = (kani::any(), kani::any());
+        kani::assume(b0 > -2000 && b0 < 2000 && c0 > -(1 << 40) && c0 < (1 << 40));
+        u1.pos[0].base = b0; u1.pos[0].cost = c0;
+        let mut u2: User = unsafe { core::mem::zeroed() };
+        u2.pos[0].base = b0; u2.pos[0].cost = c0;
+        let bid: bool = kani::any();
+        let mut acc = Acc { q: 0, nt: 0, fee: 0 };
+        for _ in 0..3 {
+            let (fq, p, fee): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+            kani::assume(fq >= 1 && fq <= 1500 && p >= 1 && p < (1 << 20) && fee <= (1 << 20));
+            let nt = p * fq;
+            acc.add(&mut u1, 0, bid, fq, nt, fee).unwrap();
+            let paid: i128 = if bid { nt as i128 } else { -(nt as i128) };
+            credit(&mut u2, 0, -(fee as i128) - paid).unwrap();
+            let ob = u2.pos[0].base; u2.pos[0].base = if bid { ob + fq as i64 } else { ob - fq as i64 };
+            u2.pos[0].cost = cost_after(ob, u2.pos[0].base, u2.pos[0].cost, paid).unwrap();
+        }
+        acc.book(&mut u1, 0, bid).unwrap();
+        assert_eq!((u1.cash, u1.pos[0].base, u1.pos[0].cost), (u2.cash, u2.pos[0].base, u2.pos[0].cost));
+    }
+    /// A fill moves exactly what one side gives to the other: the maker's lots and quote mirror the taker's, the maker budget
+    /// drops by the notional, and the quote's used size grows by the lots (any two fills against one or two levels).
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    #[kani::unwind(3)]
+    fn fills_conserve_lots_and_notional() {
+        let mut f: FastBook = unsafe { core::mem::zeroed() };
+        let mut u: User = unsafe { core::mem::zeroed() };
+        f.makers[0].budget = i64::MAX >> 2;
+        let bid: bool = kani::any();
+        let mut acc = Acc { q: 0, nt: 0, fee: 0 };
+        let (mut nts, mut lots) = (0u64, 0u64);
+        for _ in 0..2 {
+            let (fq, p, l): (u64, u64, usize) = (kani::any(), kani::any(), kani::any());
+            kani::assume(fq >= 1 && fq < (1 << 32) && p >= 1 && p < (1 << 32) && l < 2);
+            let q = Quote { px: p as u32, qty: u32::MAX, gen: 7, slot: 0 };
+            let before = f.used[0][l].qty as u64;
+            let nt = fill_maker(&mut f, 0, &q, l, bid, p, fq).unwrap();
+            assert_eq!(nt, p * fq);
+            kani::assume(before + fq < (1 << 32));
+            if f.used[0][l].gen == 7 { assert!(f.used[0][l].qty as u64 == before + fq || before == 0); }
+            acc.add(&mut u, 0, bid, fq, nt, 0).unwrap();
+            nts += nt; lots += fq;
+        }
+        acc.book(&mut u, 0, bid).unwrap();
+        assert_eq!(u.pos[0].base + f.makers[0].base, 0);
+        assert_eq!(u.cash as i128 + f.makers[0].quote as i128, 0);
+        assert_eq!(f.makers[0].budget as i128, (i64::MAX >> 2) as i128 - nts as i128);
+        assert_eq!(f.makers[0].volume, lots);
+    }
     #[kani::proof]
     fn liq_chunk_bounds() {
         let ab: u64 = kani::any(); kani::assume(ab > 0 && ab < (1u64 << 40));
