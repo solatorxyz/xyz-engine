@@ -80,6 +80,7 @@ pub const EVENTS_LIQUIDATION: u64 = 2;
 pub const EVENTS_TRIGGER: u64 = 3;
 pub const EVENTS_ADL: u64 = 4;
 pub const EVENTS_LIQ_NOFILL: u64 = 5;
+pub const EVENTS_FAST_FILL: u64 = 6;
 pub const CANCEL_BY_CID_BIT: u64 = 128;
 pub const MAX_SPLINE_LEVELS: u64 = 16;
 pub const MAX_KEEPER_TIP: u64 = 1000000;

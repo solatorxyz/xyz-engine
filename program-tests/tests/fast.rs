@@ -104,7 +104,7 @@ fn setup(e: &mut Env) -> (Address, Mk) { e.oracle_update("", 1000_00000000, None
 #[test] fn stale_off_band_killed_and_selftrade_quotes_are_skipped() {
     let mut e = Env::new(); let (f, k) = setup(&mut e);
     let (tp, tu) = e.user(10_000_000_000);
-    quote(&mut e, &k, &[(ASK, 100_010, 100), (ASK + 1, 200_000, 100), (ASK + 2, 1, 100)], true);
+    quote(&mut e, &k, &[(ASK, 1, 100), (ASK + 1, 100_010, 100), (ASK + 2, 200_000, 100)], true);
     let s = e.slot;
     e.set_time(s + 2); e.oracle_update("", 1000_00000000, None);
     tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, u64::MAX >> 2, 150, true);
@@ -271,7 +271,7 @@ impl Rng { fn n(&mut self, m: u64) -> u64 { self.0 ^= self.0 << 13; self.0 ^= se
                 0..=2 => { let i = g.n(3) as usize; let mid = (px / 1_000_000) as u64;
                     let v: Vec<(u16, u32, u32)> = (0..4).map(|_| { let s = g.n(2) as u16; let l = g.n(8) as u16;
                         let off = 1 + g.n(300); let p = if s == 1 { mid + off } else { mid - off }; (s << 3 | l, p as u32, (1 + g.n(50_000)) as u32) }).collect();
-                    quote(&mut e, &mk[i], &v, true); }
+                    let v = fit(&e, &mk[i].slab, &v); quote(&mut e, &mk[i], &v, true); }
                 3..=5 => { let i = g.n(3) as usize; let side = g.n(2) as u8; let mid = (px / 1_000_000) as u64;
                     let lim = if side == 0 { mid + g.n(600) } else { mid - g.n(600) };
                     let m = e.market; let (kp, u) = (&tk_[i].0, tk_[i].1);
@@ -411,6 +411,45 @@ fn take_accts(e: &Env, kp: &Keypair, u: &Address, f: &Address, slabs: &[Address]
     assert!(!send_many(&mut e, vec![assert_ix(&tu, &[], &[(fake, 0)], i64::MIN)], &[]));
     assert!(!send_many(&mut e, vec![(vec![r(&tu)], vec![71u8, 1, 0])], &[]), "short data");
 }
+/// Random quote items made valid for best-first ladders (asks up, bids down, ties allowed): each live item's price is clamped
+/// between its live neighbours' prices on the slab as it will be (items apply in order). Clamping makes equal prices with
+/// different quote slots inside one ladder, the tie matching must break by age.
+fn fit(e: &Env, slab: &Address, v: &[(u16, u32, u32)]) -> Vec<(u16, u32, u32)> {
+    let mut lad: std::collections::HashMap<usize, [(u32, u32); 8]> = Default::default();
+    let mut out = Vec::new();
+    for &(i, p, q) in v {
+        let (g, l) = (i as usize / 8, i as usize % 8); let ask = g & 1 == 1;
+        let cur = lad.entry(g).or_insert_with(|| { let mut a = [(0, 0); 8]; for k in 0..8 { let x = slab_q(e, slab, g * 8 + k); a[k] = (x.px, x.qty); } a });
+        let mut p = p;
+        if q > 0 {
+            let before = cur[..l].iter().filter(|x| x.1 > 0).map(|x| x.0); let after = cur[l + 1..].iter().filter(|x| x.1 > 0).map(|x| x.0);
+            if ask { if let Some(b) = before.max() { p = p.max(b); } if let Some(a) = after.min() { p = p.min(a); } }
+            else { if let Some(b) = before.min() { p = p.min(b); } if let Some(a) = after.max() { p = p.max(a); } }
+        }
+        cur[l] = (p, q); out.push((i, p, q));
+    }
+    out
+}
+/// Ladders are best-first: a level better than one above it is refused. Equal prices are allowed, and among them the older
+/// quote fills first even when it sits further down the ladder.
+#[test] fn ladders_are_best_first_and_ties_go_to_the_older_quote() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    quote(&mut e, &k, &[(ASK, 100_020, 100), (ASK + 1, 100_010, 100)], false);
+    quote(&mut e, &k, &[(1, 99_990, 100), (2, 99_995, 100)], false);
+    quote(&mut e, &k, &[(ASK, 100_010, 100), (ASK + 1, 100_010, 100)], true);
+    quote(&mut e, &k, &[(ASK, 100_010, 0), (ASK + 2, 0, 0)], true);
+    quote(&mut e, &k, &[(ASK, 100_000, 5), (ASK + 1, 0, 0)], true);
+    quote(&mut e, &k, &[(ASK, 100_010, 0), (ASK + 1, 100_010, 100)], true);
+    let s = e.slot; e.set_time(s + 2); e.oracle_update("", 1000_00000000, None);
+    quote(&mut e, &k, &[(ASK, 100_010, 100)], true); // same price, newer, higher up the ladder
+    let (tp, tu) = e.user(10_000_000_000);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 30, true);
+    let b = fb(&e, &f);
+    assert_eq!((b.used[0][8].qty, b.used[0][9].qty), (0, 30), "the older quote at level 1 fills first");
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 100, true);
+    let b = fb(&e, &f);
+    assert_eq!((b.used[0][8].qty, b.used[0][9].qty), (30, 100), "then the newer one");
+}
 fn slab_q(e: &Env, k: &Address, i: usize) -> Quote { let d = e.data(k); let o = 96 + i * 16; Quote { px: u32::from_le_bytes(d[o..o + 4].try_into().unwrap()),
     qty: u32::from_le_bytes(d[o + 4..o + 8].try_into().unwrap()), gen: u32::from_le_bytes(d[o + 8..o + 12].try_into().unwrap()), slot: u32::from_le_bytes(d[o + 12..o + 16].try_into().unwrap()) } }
 /// Reference model of take_fast's maker matching, written from the rules, not from the code: repeatedly take the best usable
@@ -461,7 +500,7 @@ fn model_take(e: &Env, f: &Address, slabs: &[(Address, Address)], taker: &Addres
                 0..=2 => { let i = g.n(3) as usize; let mid = (px / 1_000_000) as u64;
                     let v: Vec<(u16, u32, u32)> = (0..3).map(|_| { let s = g.n(2) as u16; let l = g.n(8) as u16; let off = 1 + g.n(6);  // few price points: many ties
                         (s << 3 | l, (if s == 1 { mid + off } else { mid - off }) as u32, (1 + g.n(400)) as u32) }).collect();
-                    quote(&mut e, &mk[i], &v, true); }
+                    let v = fit(&e, &mk[i].slab, &v); quote(&mut e, &mk[i], &v, true); }
                 3..=5 => { let i = g.n(2) as usize; let bid = g.n(2) == 0; let mid = (px / 1_000_000) as u64;
                     let limit = if bid { mid + g.n(8) } else { mid - g.n(8) }; let qty = 1 + g.n(900);
                     let (kp, u) = (tk_[i].0.insecure_clone(), tk_[i].1);
@@ -650,7 +689,7 @@ fn exec_fast(e: &mut Env, kp: &Keypair, ku: &Address, tu: &Address, f: &Address,
             match g.n(8) {
                 0..=1 => { for m in &mk { let v: Vec<(u16, u32, u32)> = (0..4).map(|l| { let s = (l % 2) as u16; let off = 1 + g.n(40);
                     (s << 3 | (l / 2) as u16, (if s == 1 { mid + off } else { mid - off }) as u32, (1 + g.n(60_000)) as u32) }).collect();
-                    quote(&mut e, m, &v, true); } }
+                    let v = fit(&e, &m.slab, &v); quote(&mut e, m, &v, true); } }
                 2..=3 => { let i = g.n(3) as usize; let side = g.n(2) as u8; let lim = if side == 0 { mid + 500 } else { mid - 500 };
                     let (kp, u) = (tk_[i].0.insecure_clone(), tk_[i].1); let m = e.market;
                     let mut a = vec![AccountMeta::new(kp.pubkey(), true), w(&u), r(&m), w(&f)]; a.extend(slabs.iter().map(r));
@@ -701,7 +740,7 @@ fn exec_fast(e: &mut Env, kp: &Keypair, ku: &Address, tu: &Address, f: &Address,
     assert!(try_at(&mut e, pstar.floor() as u64 - 2), "below the liquidation price: liquidated");
 }
 
-/// CU of a take with a full fast book: 8 makers, 8 levels a side, ladders best-first (as the MM quotes) and worst-first.
+/// CU of a take with a full fast book: 8 makers, 8 levels a side, ladders best-first (as the MM quotes; worst-first is refused).
 #[test] fn compute_units_eight_makers() {
     for worst_first in [false, true] {
         let mut e = Env::new(); let (f, k0) = setup(&mut e);
@@ -711,12 +750,40 @@ fn exec_fast(e: &mut Env, kp: &Keypair, ku: &Address, tu: &Address, f: &Address,
                 let l = if worst_first { 7 - (i & 7) } else { i & 7 };
                 (i as u16, if i & 8 != 0 { 100_010 + l * 8 + j as u32 } else { 99_990 - l * 8 - j as u32 }, 1000)
             }).collect();
-            quote(&mut e, k, &v, true);
+            quote(&mut e, k, &v, !worst_first);
         }
+        if worst_first { continue; } // a worst-first ladder is rejected (ladders are best-first)
         let (tp, tu) = e.user(10_000_000_000);
         let slabs: Vec<Address> = ks.iter().map(|k| k.slab).collect();
-        let tag = if worst_first { "worst-first" } else { "best-first" };
+        let tag = "best-first";
         println!("8 makers {tag} take 1 fill: {:?}", tk(&mut e, &tp, &tu, &f, &slabs, &[], 0, PX + 100, 10, true));
         println!("8 makers {tag} take 5 fills: {:?}", tk(&mut e, &tp, &tu, &f, &slabs, &[], 0, PX + 100, 4500, true));
     }
+}
+
+/// CU profile of take_fast (build with --features cuprof): checkpoint deltas for 1 maker / 1 fill, 8 makers / 1 fill, 8 makers / 5 fills.
+#[test] fn cu_profile() {
+    fn show(e: &Env, label: &str) {
+        let mut pts: Vec<(u64, u64)> = Vec::new(); let mut tag = None;
+        for l in e.logs.iter() {
+            let v: Vec<&str> = l.trim_start_matches("Program log: ").split(", ").collect();
+            if v.len() == 5 && v[0] == "0xc0" { tag = u64::from_str_radix(&v[1][2..], 16).ok(); continue; }
+            if let (Some(t), Some(r)) = (tag, l.strip_prefix("Program consumption: ")) { pts.push((t, r.split(' ').next().unwrap().parse().unwrap())); tag = None; }
+        }
+        let mut out = String::new();
+        for w in pts.windows(2) { out += &format!(" {}->{}:{}", w[0].0, w[1].0, w[0].1 - w[1].1); }
+        println!("PROFILE {label}:{out}");
+    }
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let mut ks = vec![k];
+    for _ in 0..7 { let m = maker(&mut e, &f, 10_000_000_000, 1_000_000_000); ks.push(m); }
+    let (tp, tu) = e.user(100_000_000_000);
+    for (i, m) in ks.iter().enumerate() {
+        let v: Vec<(u16, u32, u32)> = (0..8).map(|l| (ASK + l as u16, 100_010 + 10 * l as u32 + i as u32, 1000)).collect();
+        quote(&mut e, m, &v, true);
+    }
+    let c = tk(&mut e, &tp, &tu, &f, &[ks[0].slab], &[], 0, PX + 1000, 10, true); show(&e, &format!("1 slab 1 fill total={c:?}"));
+    let all: Vec<Address> = ks.iter().map(|m| m.slab).collect();
+    let c = tk(&mut e, &tp, &tu, &f, &all, &[], 0, PX + 1000, 10, true); show(&e, &format!("8 slabs 1 fill total={c:?}"));
+    let c = tk(&mut e, &tp, &tu, &f, &all, &[], 0, PX + 1000, 4500, true); show(&e, &format!("8 slabs 5 fills total={c:?}"));
 }

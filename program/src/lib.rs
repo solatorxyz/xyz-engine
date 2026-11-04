@@ -35,6 +35,10 @@ const _: () = {
     assert!(spec::IX_INIT_MARKET == IX_INIT_MARKET as u64 && spec::IX_AGGREGATE == IX_AGGREGATE as u64 && spec::IX_WITHDRAW == IX_WITHDRAW as u64);
 };
 use state::*;
+#[cfg(feature = "cuprof")]
+macro_rules! cp { ($n:expr) => { unsafe { pinocchio::syscalls::sol_log_64_(0xC0, $n, 0, 0, 0); pinocchio::syscalls::sol_log_compute_units_(); } } }
+#[cfg(not(feature = "cuprof"))]
+macro_rules! cp { ($n:expr) => {} }
 
 #[cfg(target_os = "solana")]
 mod ep {
@@ -639,6 +643,34 @@ impl EvBuf {
         self.n += 1; if self.n == EV_MAX { self.flush(); }
     }
     fn flush(&mut self) { if self.n > 0 { self.b[34] = self.n as u8; emit(&[&self.b[..35 + self.n * EV_ENTRY]]); self.n = 0; } }
+}
+/// Fast-path fill event, one sol_log_data per take (or per 32 fills), 16 bytes a fill:
+/// [EVENTS_FAST_FILL, taker_side, taker 32, n u8, n x (px u32, qty u32, id u64)], id = maker index << 32 | quote generation.
+/// The maker is FastBook.makers[index] of the book in the same transaction (indices never move: makers are only appended).
+/// The buffer is not zeroed: only the bytes written are logged.
+const FEV_MAX: usize = 32;
+const FEV_ENTRY: usize = 16;
+struct FastEv { b: core::mem::MaybeUninit<[u8; 35 + FEV_MAX * FEV_ENTRY]>, n: usize }
+impl FastEv {
+    #[inline(always)]
+    fn new(taker: &Key, taker_bid: bool) -> Self {
+        let mut e = FastEv { b: core::mem::MaybeUninit::uninit(), n: 0 };
+        let p = e.b.as_mut_ptr() as *mut u8;
+        unsafe { *p = spec::EVENTS_FAST_FILL as u8; *p.add(1) = if taker_bid { 0 } else { 1 }; core::ptr::copy_nonoverlapping(taker.as_ptr(), p.add(2), 32); }
+        e
+    }
+    #[inline(always)]
+    fn push(&mut self, px: u64, q: u64, id: u64) {
+        let p = unsafe { (self.b.as_mut_ptr() as *mut u8).add(35 + self.n * FEV_ENTRY) };
+        unsafe { (p as *mut u32).write_unaligned(px as u32); (p.add(4) as *mut u32).write_unaligned(q as u32); (p.add(8) as *mut u64).write_unaligned(id); }
+        self.n += 1; if self.n == FEV_MAX { self.flush(); }
+    }
+    fn flush(&mut self) {
+        if self.n == 0 { return; }
+        let p = self.b.as_mut_ptr() as *mut u8;
+        unsafe { *p.add(34) = self.n as u8; emit(&[core::slice::from_raw_parts(p, 35 + self.n * FEV_ENTRY)]); }
+        self.n = 0;
+    }
 }
 #[inline(always)]
 fn arrival(c: &(*mut Shard, usize, u64, bool)) -> u64 { unsafe { (*c.0).orders[c.1].meta >> 32 } }
@@ -1778,15 +1810,37 @@ fn slab_quote(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if body.len() % spec::QUOTE_ITEM_SIZE != 0 { return Err(err(E::BadData)); }
     let slot = clock()?.slot as u32;
     s.gen = s.gen.wrapping_add(1); let g = s.gen as u32;
+    let mut touched = [0u64; SLAB_QUOTES / SLAB_LEVELS / 64];
     for it in body.chunks_exact(spec::QUOTE_ITEM_SIZE) {
         let i = u16::from_le_bytes([it[0], it[1]]) as usize;
         if i >= SLAB_QUOTES { return Err(err(E::BadData)); }
         let q = unsafe { s.quotes.get_unchecked_mut(i) };
         q.px = u32::from_le_bytes([it[2], it[3], it[4], it[5]]); q.qty = u32::from_le_bytes([it[6], it[7], it[8], it[9]]);
         q.gen = g; q.slot = slot;
+        let lad = i / SLAB_LEVELS; touched[lad >> 6] |= 1 << (lad & 63);
+    }
+    // Every ladder this touched must stay best-first (asks up, bids down; equal prices allowed), so a taker can stop at
+    // the first usable level. The check runs here, on the maker's own account, not on the contended take path.
+    for (w, &bits) in touched.iter().enumerate() {
+        let mut b = bits;
+        while b != 0 {
+            let lad = w << 6 | b.trailing_zeros() as usize; b &= b - 1;
+            if !ladder_ok(&s.quotes[lad * SLAB_LEVELS..lad * SLAB_LEVELS + SLAB_LEVELS], lad & 1 == 1) { return Err(err(E::BadData)); }
+        }
     }
     s.count = s.count.wrapping_add((body.len() / spec::QUOTE_ITEM_SIZE) as u64);
     Ok(())
+}
+/// One side's ladder is best-first: live levels (qty > 0) have a price and never get better further down (asks never lower,
+/// bids never higher). Pulled levels (qty 0) can sit anywhere.
+fn ladder_ok(q: &[Quote], ask: bool) -> bool {
+    let mut last = 0u32;
+    for x in q {
+        if x.qty == 0 { continue; }
+        if x.px == 0 || (last != 0 && ((ask && x.px < last) || (!ask && x.px > last))) { return false; }
+        last = x.px;
+    }
+    true
 }
 /// Emergency stop for all quotes of a maker. accs: authority(s), slab(w). data: tag, on u8
 fn slab_kill(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
@@ -1869,6 +1923,7 @@ fn slab_settle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
 /// accs: authority(s), user(w), market(r), fast(w), slabs(r) x ns, [shards], [other markets]
 /// data: tag, side u8, flags u8, ns u8, limit u64, qty u64
 fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    cp!(1);
     if a.len() < 4 || d.len() != 20 { return Err(err(E::BadData)); }
     let (bid, fl, ns) = (d[1] as u64 == SIDE_BID, d[2] as u64, d[3] as usize);
     let (limit, mut left) = (rd64(d, 4)?, rd64(d, 12)?);
@@ -1878,15 +1933,21 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let f: &mut FastBook = load(&a[3], pid, DISC_FAST, FAST_SIZE)?;
     let (uk, mk) = (key(&a[1]), key(&a[2]));
     if f.market != mk { return Err(err(E::BadAccount)); }
+    cp!(2);
     let clk = clock()?; let slot = clk.slot; let nw: Now = (slot, clk.unix_timestamp);
     let rest = &a[4 + ns..];
     let dmax = if a[0].is_signer() && u.authority == key(&a[0]) { u64::MAX } else if a[0].is_signer() {
         delegate_max_qty(pid, rest, &key(&a[0]), &uk, slot).ok_or(err(E::BadAccount))? } else { return Err(err(E::BadAccount)); };
     if left > dmax { return Err(err(E::Cap)); }
+    cp!(3);
     home(u, m)?;
+    cp!(4);
     claim_all(pid, u, &uk, rest)?;
+    cp!(5);
     let pi = pos_idx(u, &mk, m.funding_index)?;
+    cp!(6);
     settle_funding_all(pid, u, &a[2..])?;
+    cp!(7);
     let reduce = fl & FLAG_REDUCE_ONLY != 0;
     if reduce {
         let b = u.pos[pi].base;
@@ -1915,91 +1976,100 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     }
     let tier = (u.tier as usize).min(TIERS.len() - 1);
     let taker_bps = TIERS[tier].0;
+    cp!(8);
     fast_match(pid, f, &sl[..cnt], base_ix, opp, bid, lo, hi, rest, &mk, m, u, &uk, pi, limit, left, slot, taker_bps)?;
+    cp!(9);
     if !reduce {
         if m.max_oi != 0 && m.oi_long > m.max_oi { return Err(err(E::Cap)); }
         let p = &u.pos[pi];
         if m.max_position != 0 && core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs()) > m.max_position as i128 { return Err(err(E::Cap)); }
+        cp!(10);
         let (eq, im, _) = health(pid, u, &a[2..], nw, true)?;
         if eq < im { return Err(err(E::Margin)); }
+        cp!(11);
         if p.flags & POS_ISO != 0 { let (e2, i2, _) = iso_health(pid, u, pi, &a[2..], nw, true)?; if e2 < i2 { return Err(err(E::Margin)); } }
     }
     gc_pos(u);
+    cp!(12);
     Ok(())
 }
 
 #[inline(always)]
 /// Taker matching shared by take_fast and trigger orders: the better of the best maker quote and the best resting order fills
 /// first, until `left` lots are done or nothing is inside `limit`. Books the taker's side, maker fills, fees and OI. Returns lots.
+/// Each slab's best usable level is its first usable one (ladders are best-first). A fill changes only the hit maker's budget and
+/// used table, so only that slab is looked at again, from its first usable level at the price it hit: a sweep walks each ladder
+/// once (a merge of sorted lists).
 fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: usize, bid: bool, lo: u64, hi: u64,
               rest: &[AccountView], mk: &Key, m: &Market, u: &mut User, uk: &Key, pi: usize, limit: u64, mut left: u64, slot: u64,
               taker_bps: u64) -> Result<u64, ProgramError> {
     let (want, base0) = (left, long(u.pos[pi].base));
-    let mut ev = EvBuf::new(uk, bid);
+    let mut ev = FastEv::new(uk, bid);
+    // only the first sl.len() entries are ever read, and each is written first
+    let mut cand: [core::mem::MaybeUninit<Cand>; FAST_MAKERS] = [core::mem::MaybeUninit::uninit(); FAST_MAKERS];
+    for (k, &(sp, mi)) in sl.iter().enumerate() { cand[k].write(slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0)); }
+    let (mut acc, mut fees) = (Acc { q: 0, nt: 0, fee: 0 }, 0u64);
     while left > 0 {
-        let (bk, bl, bp, ba) = best_quote(f, sl, base_ix, opp, bid, slot, lo, hi).unwrap_or((usize::MAX, 0, 0, 0));
+        let (mut bk, mut best): (usize, Cand) = (usize::MAX, (0, 0, 0, 0, 0));
+        for (k, c) in cand[..sl.len()].iter().enumerate() {
+            let c = unsafe { c.assume_init_ref() };
+            if c.0 != 0 && (bk == usize::MAX || (bid && c.0 < best.0) || (!bid && c.0 > best.0) || (c.0 == best.0 && c.2 < best.2)) { bk = k; best = *c; }
+        }
+        let (bp, ba, _, bl, b0) = best;
         // resting orders strictly better than the best quote (or all of them when no quote is usable)
         if !rest.is_empty() || m.strict_take != 0 {
+            acc.book(u, pi, bid)?; // resting-order matching books the taker's position itself
             let lim = if bk == usize::MAX { limit } else if bid { limit.min(bp - 1) } else { limit.max(bp + 1) };
             let tf = take(pid, rest, mk, m, u, uk, pi, bid, lim, left, slot, taker_bps, STP_CANCEL_OLDEST)?;
             left -= tf.filled;
             if left == 0 || tf.abort { break; }
         }
         if bk == usize::MAX || (bid && bp > limit) || (!bid && bp < limit) { break; }
-        left -= book_fill(f, sl, bk, bl, bp, ba.min(left), base_ix, opp, bid, u, pi, taker_bps, &mut ev)?;
-        // More to fill on a book with several makers: switch to per-slab candidates (kept out of line so a one-fill take
-        // pays nothing for it).
-        if left > 0 && sl.len() > 1 {
-            left = fast_match_more(pid, f, sl, base_ix, opp, bid, lo, hi, rest, mk, m, u, uk, pi, limit, left, slot, taker_bps, &mut ev)?;
-            break;
-        }
+        let fq = ba.min(left);
+        let (sp, mi) = sl[bk];
+        let q = unsafe { &(*sp).quotes[base_ix + bl] };
+        let nt = fill_maker(f, mi, q, opp << 3 | bl, bid, bp, fq)?;
+        let fee = bps_up(nt as i128, taker_bps) as u64;
+        fees += fee;
+        acc.add(u, pi, bid, fq, nt, fee)?;
+        ev.push(bp, fq, (mi as u64) << 32 | q.gen as u64);
+        left -= fq;
+        if left > 0 { cand[bk].write(slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, b0)); }
     }
+    acc.book(u, pi, bid)?;
+    f.fee_accum = i64c(f.fee_accum as i128 + fees as i128)?;
     ev.flush();
     f.oi_long_delta += long(u.pos[pi].base) - base0;
     f.fills += 1;
     Ok(want - left)
 }
-/// Book `fq` lots against slab `bk` level `bl` at `bp` for the taker: maker fill, taker fee, position and cost. Returns `fq`.
-#[inline(always)]
-fn book_fill(f: &mut FastBook, sl: &[(*const Slab, usize)], bk: usize, bl: usize, bp: u64, fq: u64, base_ix: usize, opp: usize, bid: bool,
-             u: &mut User, pi: usize, taker_bps: u64, ev: &mut EvBuf) -> Result<u64, ProgramError> {
-    let (sp, mi) = sl[bk];
-    let q = unsafe { &(*sp).quotes[base_ix + bl] };
-    let nt = fill_maker(f, mi, q, opp << 3 | bl, bid, bp, fq)?;
-    let fee = bps_up(nt as i128, taker_bps);
-    let sg: i128 = if bid { 1 } else { -1 };
-    f.fee_accum = i64c(f.fee_accum as i128 + fee)?;
-    credit(u, pi, -fee - sg * nt as i128)?;
-    let ob = u.pos[pi].base; u.pos[pi].base = ob.checked_add(sg as i64 * fq as i64).ok_or(err(E::Math))?;
-    u.pos[pi].cost = cost_after(ob, u.pos[pi].base, u.pos[pi].cost, sg * nt as i128)?;
-    ev.push(&f.makers[mi].user, bp, fq, (mi as u64) << 32 | q.gen as u64);
-    Ok(fq)
-}
-/// The rest of a multi-fill take: every slab's own best level is kept, and a fill rescans only the slab it hit (a fill
-/// changes only that maker's budget and used table). Same order as best_quote: price, older quote, earlier slab. Returns lots left.
-#[inline(never)]
-fn fast_match_more(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: usize, bid: bool, lo: u64, hi: u64,
-                   rest: &[AccountView], mk: &Key, m: &Market, u: &mut User, uk: &Key, pi: usize, limit: u64, mut left: u64, slot: u64,
-                   taker_bps: u64, ev: &mut EvBuf) -> Result<u64, ProgramError> {
-    let mut cand: [Cand; FAST_MAKERS] = [(0, 0, 0, 0); FAST_MAKERS];
-    for (k, &(sp, mi)) in sl.iter().enumerate() { cand[k] = slab_best(f, sp, mi, base_ix, opp, bid, slot, lo, hi, (0, 0, 0, 0)); }
-    while left > 0 {
-        let (mut bk, mut best): (usize, Cand) = (usize::MAX, (0, 0, 0, 0));
-        for (k, c) in cand[..sl.len()].iter().enumerate() {
-            if c.0 != 0 && (bk == usize::MAX || (bid && c.0 < best.0) || (!bid && c.0 > best.0) || (c.0 == best.0 && c.2 < best.2)) { bk = k; best = *c; }
-        }
-        let (bl, bp, ba) = (best.3, best.0, best.1);
-        if !rest.is_empty() || m.strict_take != 0 {
-            let lim = if bk == usize::MAX { limit } else if bid { limit.min(bp - 1) } else { limit.max(bp + 1) };
-            let tf = take(pid, rest, mk, m, u, uk, pi, bid, lim, left, slot, taker_bps, STP_CANCEL_OLDEST)?;
-            left -= tf.filled;
-            if left == 0 || tf.abort { break; }
-        }
-        if bk == usize::MAX || (bid && bp > limit) || (!bid && bp < limit) { break; }
-        left -= book_fill(f, sl, bk, bl, bp, ba.min(left), base_ix, opp, bid, u, pi, taker_bps, ev)?;
-        if left > 0 { let (sp, mi) = sl[bk]; cand[bk] = slab_best(f, sp, mi, base_ix, opp, bid, slot, lo, hi, (0, 0, 0, 0)); }
+/// The taker side of a take's maker fills (lots, notional, fees), booked to the User once instead of per fill. Exact: the
+/// cost basis only accumulates while the position keeps its sign, so a fill that brings it to zero or across is booked at that
+/// boundary on its own terms (see cost_after), same as booking every fill. A take moves at most 2^32 lots at prices < 2^32,
+/// so notional and fees fit u64; the sign is a branch, never an i128 multiply (a software routine on SBF).
+struct Acc { q: u64, nt: u64, fee: u64 }
+impl Acc {
+    #[inline(always)]
+    fn add(&mut self, u: &mut User, pi: usize, bid: bool, fq: u64, nt: u64, fee: u64) -> ProgramResult {
+        let (b0, q, d) = (u.pos[pi].base, self.q as i64, fq as i64);
+        let (b, nb) = if bid { (b0 + q, b0 + q + d) } else { (b0 - q, b0 - q - d) };
+        let cross = b != 0 && (nb == 0 || (b > 0) != (nb > 0));
+        if cross && nb != 0 { self.book(u, pi, bid)?; }
+        self.q += fq; self.nt += nt; self.fee += fee;
+        if cross { self.book(u, pi, bid)?; }
+        Ok(())
     }
-    Ok(left)
+    #[inline(always)]
+    fn book(&mut self, u: &mut User, pi: usize, bid: bool) -> ProgramResult {
+        if self.q == 0 { return Ok(()); }
+        let paid = if bid { self.nt as i128 } else { -(self.nt as i128) };
+        credit(u, pi, -(self.fee as i128) - paid)?;
+        let ob = u.pos[pi].base;
+        u.pos[pi].base = if bid { ob.checked_add(self.q as i64) } else { ob.checked_sub(self.q as i64) }.ok_or(err(E::Math))?;
+        u.pos[pi].cost = cost_after(ob, u.pos[pi].base, u.pos[pi].cost, paid)?;
+        self.q = 0; self.nt = 0; self.fee = 0;
+        Ok(())
+    }
 }
 /// Approved makers' slabs found in `xs`, skipping killed ones and the taker's own. Every slab must belong to this book.
 fn fast_slabs(pid: &Address, f: &FastBook, xs: &[AccountView], uk: &Key) -> Result<([(*const Slab, usize); FAST_MAKERS], usize), ProgramError> {
@@ -2014,55 +2084,44 @@ fn fast_slabs(pid: &Address, f: &FastBook, xs: &[AccountView], uk: &Key) -> Resu
     }
     Ok((sl, cnt))
 }
-/// One level a taker could hit: price (0 = none), lots, quote slot, level.
-type Cand = (u64, u64, u32, usize);
-/// Best usable level of one maker's slab on the side a taker hits, inside [lo, hi], that beats `best` (price 0 = no bound).
-/// Better price first, then the older quote. Lots are capped by the maker's remaining budget.
+/// One level a taker could hit: price (0 = none), lots, quote slot, level, and the first usable level at that price (a fill
+/// leaves every level above that one unusable, so the slab is looked at again from there).
+type Cand = (u64, u64, u32, usize, usize);
+/// Best usable level of one maker's slab on the side a taker hits, inside [lo, hi], from level `from` on. Ladders are best-first
+/// (slab_quote), so that is the first usable level, except that a later level at the same price with an older quote goes first.
+/// Lots are capped by the maker's remaining budget.
 #[inline(always)]
-fn slab_best(f: &FastBook, sp: *const Slab, mi: usize, base_ix: usize, opp: usize, bid: bool, slot: u64, lo: u64, hi: u64, best: Cand) -> Cand {
+fn slab_first(f: &FastBook, sp: *const Slab, mi: usize, base_ix: usize, opp: usize, bid: bool, slot: u64, lo: u64, hi: u64, from: usize) -> Cand {
     let s = unsafe { &*sp };
     let e = &f.makers[mi];
-    let (mut bp, mut ba, mut bs, mut bl) = best;
-    let mut hit = false;
-    if e.budget <= 0 { return (0, 0, 0, 0); }
-    for l in 0..SLAB_LEVELS {
+    if e.budget <= 0 { return (0, 0, 0, 0, 0); }
+    let mut best: Cand = (0, 0, 0, 0, 0);
+    for l in from..SLAB_LEVELS {
         let q = unsafe { s.quotes.get_unchecked(base_ix + l) };
         let p = q.px as u64;
-        // Price first: a level that cannot beat the best so far costs one compare, so a sorted ladder is decided at its
-        // first usable level. The winner is the same as checking usability first.
-        if q.qty == 0 || (bp != 0 && ((bid && p > bp) || (!bid && p < bp) || (p == bp && q.slot >= bs))) { continue; }
-        if p == 0 || p < lo || p > hi || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
+        if q.qty == 0 || p == 0 { continue; }
+        if best.0 != 0 && (p != best.0 || q.slot >= best.2) { if p != best.0 { break; } continue; }
+        // beyond the band on the far side every later level is too
+        if bid { if p > hi { break; } if p < lo { continue; } } else { if p < lo { break; } if p > hi { continue; } }
+        if slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
         let u_ = unsafe { f.used.get_unchecked(mi).get_unchecked(opp << 3 | l) };
         let av = (if u_.gen == q.gen { q.qty.saturating_sub(u_.qty) } else { q.qty }) as u64;
         let av = av.min(e.budget as u64 / p);
         if av == 0 { continue; }
-        bp = p; ba = av; bs = q.slot; bl = l; hit = true;
+        best = (p, av, q.slot, l, if best.0 == 0 { l } else { best.4 });
     }
-    if hit { (bp, ba, bs, bl) } else { (0, 0, 0, 0) }
+    best
 }
 /// Best usable maker quote across slabs: (slab slot, level, price, lots available). Better price first, then the older
-/// quote, then the earlier slab. A level that cannot beat the best so far costs one compare, so on a full book with
-/// sorted ladders most levels are decided by price alone; the winner is the same as checking usability first.
+/// quote, then the earlier slab.
 #[inline(always)]
 fn best_quote(f: &FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: usize, bid: bool, slot: u64, lo: u64, hi: u64) -> Option<(usize, usize, u64, u64)> {
-    let (mut bk, mut bl, mut bp, mut ba, mut bs) = (usize::MAX, 0usize, 0u64, 0u64, u32::MAX);
+    let (mut bk, mut best): (usize, Cand) = (usize::MAX, (0, 0, 0, 0, 0));
     for (k, &(sp, mi)) in sl.iter().enumerate() {
-        let s = unsafe { &*sp };
-        let e = &f.makers[mi];
-        if e.budget <= 0 { continue; }
-        for l in 0..SLAB_LEVELS {
-            let q = unsafe { s.quotes.get_unchecked(base_ix + l) };
-            let p = q.px as u64;
-            if q.qty == 0 || (bk != usize::MAX && ((bid && p > bp) || (!bid && p < bp) || (p == bp && q.slot >= bs))) { continue; }
-            if p == 0 || p < lo || p > hi || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
-            let u_ = unsafe { f.used.get_unchecked(mi).get_unchecked(opp << 3 | l) };
-            let av = (if u_.gen == q.gen { q.qty.saturating_sub(u_.qty) } else { q.qty }) as u64;
-            let av = av.min(e.budget as u64 / p);
-            if av == 0 { continue; }
-            bk = k; bl = l; bp = p; ba = av; bs = q.slot;
-        }
+        let c = slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0);
+        if c.0 != 0 && (bk == usize::MAX || (bid && c.0 < best.0) || (!bid && c.0 > best.0) || (c.0 == best.0 && c.2 < best.2)) { bk = k; best = c; }
     }
-    if bk == usize::MAX { None } else { Some((bk, bl, bp, ba)) }
+    if bk == usize::MAX { None } else { Some((bk, best.3, best.0, best.1)) }
 }
 /// Book `fq` lots at `p` against maker `mi` (quote level `ul` in its used table). Returns the notional.
 #[inline(always)]
@@ -2127,7 +2186,7 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     }
     let base0 = long(t.pos[pi].base);
     let (mut filled, mut notional) = (0u64, 0i128);
-    let mut ev = EvBuf::new(&tk, bid);
+    let mut ev = FastEv::new(&tk, bid);
     while left > 0 {
         let Some((bk, bl, bp, ba)) = best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi) else { break };
         let (sp, mi) = sl[bk];
@@ -2138,7 +2197,7 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
         credit(t, pi, -sg * nt as i128)?;
         let ob = t.pos[pi].base; t.pos[pi].base = ob.checked_add(sg as i64 * fq as i64).ok_or(err(E::Math))?;
         t.pos[pi].cost = cost_after(ob, t.pos[pi].base, t.pos[pi].cost, sg * nt as i128)?;
-        ev.push(&f.makers[mi].user, bp, fq, (mi as u64) << 32 | q.gen as u64);
+        ev.push(bp, fq, (mi as u64) << 32 | q.gen as u64);
         filled += fq; notional += nt as i128; left -= fq;
     }
     ev.flush();
