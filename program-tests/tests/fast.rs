@@ -775,6 +775,8 @@ fn exec_fast(e: &mut Env, kp: &Keypair, ku: &Address, tu: &Address, f: &Address,
         println!("PROFILE {label}:{out}");
     }
     let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let v: Vec<(u16, u32, u32)> = (0..95).map(|i| (i as u16, if (i & 8) != 0 { 100_010 + i as u32 } else { 99_990 - i as u32 }, 1000)).collect();
+    let c = quote(&mut e, &k, &v, true); show(&e, &format!("slab_quote 95 total={c:?}"));
     let mut ks = vec![k];
     for _ in 0..7 { let m = maker(&mut e, &f, 10_000_000_000, 1_000_000_000); ks.push(m); }
     let (tp, tu) = e.user(100_000_000_000);

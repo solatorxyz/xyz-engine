@@ -97,17 +97,22 @@ fn rd64(d: &[u8], o: usize) -> Result<u64, ProgramError> {
 fn i64c(x: i128) -> Result<i64, ProgramError> { i64::try_from(x).map_err(|_| err(E::Math)) }
 // i128 division is a software routine on SBF (hundreds of CU); use native u64 math when the value fits (OPT).
 const FAST: i128 = 1 << 48;
-/// CU: signed x unsigned product. With overflow-checks on, an i128 multiply is a checked software routine;
-/// when both magnitudes are < 2^32 the exact product comes from one native u64 multiply (same result).
+/// CU: signed x unsigned product. With overflow-checks on, an i128 multiply is a checked software routine, and so is a checked
+/// u64 multiply (SBF has no high-word multiply). When |a| < 2^32 the exact product comes from native wrapping u64 multiplies that
+/// cannot wrap: one when b < 2^32 too, else b's two 32-bit halves (prices in 1e-8 units are above 2^32). Same result.
 #[inline(always)]
 fn mulf(a: i128, b: u64) -> i128 {
     let ua = a.unsigned_abs();
-    if ua < (1 << 32) && b < (1 << 32) { let r = (ua as u64 * b) as i128; if a < 0 { -r } else { r } } else { a * b as i128 }
+    if ua < (1 << 32) {
+        let x = ua as u64;
+        let r = if b < (1 << 32) { x.wrapping_mul(b) as i128 } else { ((x.wrapping_mul(b >> 32) as i128) << 32) + x.wrapping_mul(b & 0xFFFF_FFFF) as i128 };
+        if a < 0 { -r } else { r }
+    } else { a * b as i128 }
 }
 #[inline(always)]
-fn bps_up(x: i128, b: u64) -> i128 { if x >= 0 && x < FAST && b <= 65_535 { ((x as u64 * b + 9999) / 10000) as i128 } else { (x * b as i128 + 9999) / 10000 } }
+fn bps_up(x: i128, b: u64) -> i128 { if x >= 0 && x < FAST && b <= 65_535 { ((x as u64).wrapping_mul(b) + 9999) as i128 / 10000 } else { (x * b as i128 + 9999) / 10000 } }
 #[inline(always)]
-fn bps_dn(x: i128, b: u64) -> i128 { if x >= 0 && x < FAST && b <= 65_535 { (x as u64 * b / 10000) as i128 } else { x * b as i128 / 10000 } }
+fn bps_dn(x: i128, b: u64) -> i128 { if x >= 0 && x < FAST && b <= 65_535 { ((x as u64).wrapping_mul(b) / 10000) as i128 } else { x * b as i128 / 10000 } }
 
 // ---------- events (sol_log_data; indexers parse "Program data:" lines) ----------
 #[inline(always)]
@@ -1810,35 +1815,40 @@ fn slab_quote(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if body.len() % spec::QUOTE_ITEM_SIZE != 0 { return Err(err(E::BadData)); }
     let slot = clock()?.slot as u32;
     s.gen = s.gen.wrapping_add(1); let g = s.gen as u32;
-    let mut touched = [0u64; SLAB_QUOTES / SLAB_LEVELS / 64];
+    // ladders this touched, in order of first touch (items come ladder by ladder, so this is one compare an item; a ladder
+    // touched again later is listed again, which only re-checks it)
+    let mut lads: [core::mem::MaybeUninit<u16>; MAX_QUOTE_ITEMS] = [core::mem::MaybeUninit::uninit(); MAX_QUOTE_ITEMS];
+    let (mut nl, mut prev) = (0usize, usize::MAX);
     for it in body.chunks_exact(spec::QUOTE_ITEM_SIZE) {
         let i = u16::from_le_bytes([it[0], it[1]]) as usize;
         if i >= SLAB_QUOTES { return Err(err(E::BadData)); }
         let q = unsafe { s.quotes.get_unchecked_mut(i) };
         q.px = u32::from_le_bytes([it[2], it[3], it[4], it[5]]); q.qty = u32::from_le_bytes([it[6], it[7], it[8], it[9]]);
         q.gen = g; q.slot = slot;
-        let lad = i / SLAB_LEVELS; touched[lad >> 6] |= 1 << (lad & 63);
+        let lad = i / SLAB_LEVELS;
+        if lad != prev { if nl == MAX_QUOTE_ITEMS { return Err(err(E::BadData)); } lads[nl].write(lad as u16); nl += 1; prev = lad; }
     }
     // Every ladder this touched must stay best-first (asks up, bids down; equal prices allowed), so a taker can stop at
     // the first usable level. The check runs here, on the maker's own account, not on the contended take path.
-    for (w, &bits) in touched.iter().enumerate() {
-        let mut b = bits;
-        while b != 0 {
-            let lad = w << 6 | b.trailing_zeros() as usize; b &= b - 1;
-            if !ladder_ok(&s.quotes[lad * SLAB_LEVELS..lad * SLAB_LEVELS + SLAB_LEVELS], lad & 1 == 1) { return Err(err(E::BadData)); }
-        }
+    for x in &lads[..nl] {
+        let lad = unsafe { x.assume_init() } as usize;
+        if !ladder_ok(unsafe { s.quotes.as_ptr().add(lad * SLAB_LEVELS) }, lad & 1 == 1) { return Err(err(E::BadData)); }
     }
     s.count = s.count.wrapping_add((body.len() / spec::QUOTE_ITEM_SIZE) as u64);
     Ok(())
 }
-/// One side's ladder is best-first: live levels (qty > 0) have a price and never get better further down (asks never lower,
-/// bids never higher). Pulled levels (qty 0) can sit anywhere.
-fn ladder_ok(q: &[Quote], ask: bool) -> bool {
-    let mut last = 0u32;
-    for x in q {
-        if x.qty == 0 { continue; }
-        if x.px == 0 || (last != 0 && ((ask && x.px < last) || (!ask && x.px > last))) { return false; }
-        last = x.px;
+/// Most items one slab_quote can carry (a 1,232-byte transaction holds about 120).
+const MAX_QUOTE_ITEMS: usize = 128;
+/// One side's ladder is best-first: live levels (qty > 0) never get better further down (asks never lower, bids never
+/// higher). Pulled levels (qty 0) can sit anywhere; a live level at price 0 is never usable (takers skip it).
+#[inline(always)]
+fn ladder_ok(q: *const Quote, ask: bool) -> bool {
+    if ask {
+        let mut last = 0u32;
+        for l in 0..SLAB_LEVELS { let x = unsafe { &*q.add(l) }; if x.qty != 0 { if x.px < last { return false; } last = x.px; } }
+    } else {
+        let mut last = u32::MAX;
+        for l in 0..SLAB_LEVELS { let x = unsafe { &*q.add(l) }; if x.qty != 0 { if x.px > last { return false; } last = x.px; } }
     }
     true
 }
@@ -1959,7 +1969,7 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
         if stale(m, nw) { return Err(err(E::Stale)); }
     }
     let px0 = mark(m);
-    let band = px0 / 10000 * spec::QUOTE_BAND_BPS;
+    let band = (px0 / 10000).wrapping_mul(spec::QUOTE_BAND_BPS); // < 2^64: px0 / 10000 * 500
     let (blo, bhi) = bound_range(m);
     let (lo, hi) = (px0.saturating_sub(band).max(blo), (px0 + band).min(bhi));
     let opp = if bid { 1usize } else { 0usize };
@@ -2126,12 +2136,12 @@ fn best_quote(f: &FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: us
 /// Book `fq` lots at `p` against maker `mi` (quote level `ul` in its used table). Returns the notional.
 #[inline(always)]
 fn fill_maker(f: &mut FastBook, mi: usize, q: &Quote, ul: usize, bid: bool, p: u64, fq: u64) -> Result<u64, ProgramError> {
-    let nt = p * fq; // px < 2^32, qty < 2^32
+    let nt = p.wrapping_mul(fq); // px < 2^32, qty < 2^32: cannot wrap (a checked multiply is a software routine)
     let e = &mut f.makers[mi];
-    let sg: i64 = if bid { 1 } else { -1 };
     e.budget -= nt as i64;
-    e.base = e.base.checked_sub(sg * fq as i64).ok_or(err(E::Math))?;
-    e.quote = i64c(e.quote as i128 + sg as i128 * nt as i128)?;
+    // the sign is a branch: a checked i64 / i128 multiply by +-1 is a software routine
+    e.base = if bid { e.base.checked_sub(fq as i64) } else { e.base.checked_add(fq as i64) }.ok_or(err(E::Math))?;
+    e.quote = i64c(e.quote as i128 + if bid { nt as i128 } else { -(nt as i128) })?;
     e.volume += fq;
     let us = &mut f.used[mi][ul];
     if us.gen == q.gen { us.qty += fq as u32; } else { us.gen = q.gen; us.qty = fq as u32; }
@@ -2435,6 +2445,24 @@ fn vault_set(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     Ok(())
 }
 
+#[cfg(test)]
+mod arith_tests {
+    use super::*;
+    struct R(u64);
+    impl R { fn n(&mut self) -> u64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0 } }
+    /// The native-multiply paths give exactly the i128 product / rounding, across magnitudes and the 2^32 edges.
+    #[test] fn fast_arithmetic_matches_i128() {
+        let mut r = R(0x9E3779B97F4A7C15);
+        let edge = [0u64, 1, (1 << 32) - 1, 1 << 32, (1 << 32) + 1, u64::MAX >> 1, u64::MAX];
+        for i in 0..2_000_000u64 {
+            let a = match i % 4 { 0 => (r.n() % (1 << 32)) as i128, 1 => -((r.n() % (1 << 32)) as i128), 2 => (r.n() >> (r.n() % 64)) as i128, _ => -((r.n() >> 1 >> (r.n() % 63)) as i128) };
+            let b = if i % 7 == 0 { edge[(r.n() % 7) as usize] } else { r.n() >> (r.n() % 64) };
+            if (a.unsigned_abs() as f64) * (b as f64) < 1.6e38 { assert_eq!(mulf(a, b), a * b as i128, "mulf({a}, {b})"); }
+            let x = (r.n() >> (r.n() % 64)) as i128 % (FAST + 3); let bp = r.n() % 70_000;
+            assert_eq!(bps_up(x, bp), (x * bp as i128 + 9999) / 10000); assert_eq!(bps_dn(x, bp), x * bp as i128 / 10000);
+        }
+    }
+}
 // ---------- Kani proofs of program-level arithmetic fast paths ----------
 // Each fast path (native u64) must give the same value as the checked i128 path it replaces.
 #[cfg(kani)]
