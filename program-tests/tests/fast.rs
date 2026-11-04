@@ -700,3 +700,23 @@ fn exec_fast(e: &mut Env, kp: &Keypair, ku: &Address, tu: &Address, f: &Address,
     assert!(!try_at(&mut e, pstar.ceil() as u64 + 2), "above the liquidation price: refused");
     assert!(try_at(&mut e, pstar.floor() as u64 - 2), "below the liquidation price: liquidated");
 }
+
+/// CU of a take with a full fast book: 8 makers, 8 levels a side, ladders best-first (as the MM quotes) and worst-first.
+#[test] fn compute_units_eight_makers() {
+    for worst_first in [false, true] {
+        let mut e = Env::new(); let (f, k0) = setup(&mut e);
+        let mut ks = vec![k0]; for _ in 1..8 { ks.push(maker(&mut e, &f, 10_000_000_000, 1_000_000_000)); }
+        for (j, k) in ks.iter().enumerate() {
+            let v: Vec<(u16, u32, u32)> = (0..16u32).map(|i| {
+                let l = if worst_first { 7 - (i & 7) } else { i & 7 };
+                (i as u16, if i & 8 != 0 { 100_010 + l * 8 + j as u32 } else { 99_990 - l * 8 - j as u32 }, 1000)
+            }).collect();
+            quote(&mut e, k, &v, true);
+        }
+        let (tp, tu) = e.user(10_000_000_000);
+        let slabs: Vec<Address> = ks.iter().map(|k| k.slab).collect();
+        let tag = if worst_first { "worst-first" } else { "best-first" };
+        println!("8 makers {tag} take 1 fill: {:?}", tk(&mut e, &tp, &tu, &f, &slabs, &[], 0, PX + 100, 10, true));
+        println!("8 makers {tag} take 5 fills: {:?}", tk(&mut e, &tp, &tu, &f, &slabs, &[], 0, PX + 100, 4500, true));
+    }
+}

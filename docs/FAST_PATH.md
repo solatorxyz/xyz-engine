@@ -18,7 +18,7 @@ Makers quote into their own `Slab`. Takers fill against slabs through one per-ma
 | 63 | slab_quote | about 95 levels per tx, 1,849 CU. No margin read. Quotes expire after 30 slots and only fill within ±5% of mark |
 | 64 | slab_fund | lock or release quoting margin; optional `target` > 0 turns on auto mode |
 | 65 | slab_settle | permissionless; moves fills into the maker's User, refills budget. Auto mode tops up or hands margin back. Below maintenance returns all margin |
-| 66 | take_fast | IOC; best price across slabs and, if shards are passed, resting orders. 2,710 CU for 1 fill |
+| 66 | take_fast | IOC; best price across slabs and, if shards are passed, resting orders. 2,485 CU for 1 fill on 1 maker, 4,379 on 8 makers |
 | 67 | slab_kill | maker's stop switch |
 | 70 | liquidate_fast | 25% chunk against maker quotes; same price window as a take; fee to insurance; empty fast book with every maker passed and no shards opens the ADL window |
 
@@ -56,3 +56,21 @@ Use `sdk/ts/everytick.ts` (builders, decoders, `fastDepth`). `sdk/ts/smoke.ts` s
 - Liquidation price for the UI: `liquidation_price()` (Python) / `liquidationPrice()` (TS) solve equity = maintenance for one
   position with the others held at their marks. Checked against the program: 2 ticks above it liquidation is refused, 2 below it
   goes through.
+
+## Matching cost (2026-11-04)
+The hot FastBook account takes at most 12M CU per block (mainnet per-account limit; blocks are 100M CU), so CU per take sets
+how many takes one book side can clear per block. A take tx also pays about 1,400 CU outside the program (signature, write locks).
+- The best-quote scan checks price before anything else: a level that cannot beat the best so far costs one compare, so a
+  ladder quoted best-first is decided at its first usable level. Same winner as before (price, older quote, earlier slab).
+- A take that needs a second fill on a book with several makers keeps each slab's own best level and rescans only the slab it
+  just hit (a fill changes only that maker's budget and used table). One-fill takes never enter that path.
+- Slabs passed in FastBook order skip the maker lookup.
+
+| take (LiteSVM) | before | after |
+|---|---|---|
+| 1 maker, 1 fill | 2,721 | 2,485 |
+| 8 makers, 1 fill | 6,762 | 4,379 |
+| 8 makers, 5 fills | 23,929 | 10,558 |
+| 8 makers, 5 fills, ladders worst-first | 24,174 | 14,577 |
+
+The reference model test (300 seeds, 20,079 takes, 3 makers, unsorted ladders with ties) matches fill for fill.

@@ -1906,10 +1906,10 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let base_ix = (f.idx as usize) << 4 | opp << 3;
     let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
     let mut cnt = 0;
-    for x in a[4..4 + ns].iter() {
+    for (j, x) in a[4..4 + ns].iter().enumerate() {
         let s: &Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
         let k = key(x);
-        let mi = f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))?;
+        let mi = if j < f.n as usize && f.makers[j].slab == k { j } else { f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))? };
         if s.kill != 0 || s.user == uk { continue; } // no self-trade against own slab
         sl[cnt] = (s as *const Slab, mi); cnt += 1;
     }
@@ -1946,23 +1946,60 @@ fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base
             if left == 0 || tf.abort { break; }
         }
         if bk == usize::MAX || (bid && bp > limit) || (!bid && bp < limit) { break; }
-        let (sp, mi) = sl[bk];
-        let q = unsafe { &(*sp).quotes[base_ix + bl] };
-        let fq = ba.min(left);
-        let nt = fill_maker(f, mi, q, opp << 3 | bl, bid, bp, fq)?;
-        let fee = bps_up(nt as i128, taker_bps);
-        let sg: i128 = if bid { 1 } else { -1 };
-        f.fee_accum = i64c(f.fee_accum as i128 + fee)?;
-        credit(u, pi, -fee - sg * nt as i128)?;
-        let ob = u.pos[pi].base; u.pos[pi].base = ob.checked_add(sg as i64 * fq as i64).ok_or(err(E::Math))?;
-        u.pos[pi].cost = cost_after(ob, u.pos[pi].base, u.pos[pi].cost, sg * nt as i128)?;
-        ev.push(&f.makers[mi].user, bp, fq, (mi as u64) << 32 | q.gen as u64);
-        left -= fq;
+        left -= book_fill(f, sl, bk, bl, bp, ba.min(left), base_ix, opp, bid, u, pi, taker_bps, &mut ev)?;
+        // More to fill on a book with several makers: switch to per-slab candidates (kept out of line so a one-fill take
+        // pays nothing for it).
+        if left > 0 && sl.len() > 1 {
+            left = fast_match_more(pid, f, sl, base_ix, opp, bid, lo, hi, rest, mk, m, u, uk, pi, limit, left, slot, taker_bps, &mut ev)?;
+            break;
+        }
     }
     ev.flush();
     f.oi_long_delta += long(u.pos[pi].base) - base0;
     f.fills += 1;
     Ok(want - left)
+}
+/// Book `fq` lots against slab `bk` level `bl` at `bp` for the taker: maker fill, taker fee, position and cost. Returns `fq`.
+#[inline(always)]
+fn book_fill(f: &mut FastBook, sl: &[(*const Slab, usize)], bk: usize, bl: usize, bp: u64, fq: u64, base_ix: usize, opp: usize, bid: bool,
+             u: &mut User, pi: usize, taker_bps: u64, ev: &mut EvBuf) -> Result<u64, ProgramError> {
+    let (sp, mi) = sl[bk];
+    let q = unsafe { &(*sp).quotes[base_ix + bl] };
+    let nt = fill_maker(f, mi, q, opp << 3 | bl, bid, bp, fq)?;
+    let fee = bps_up(nt as i128, taker_bps);
+    let sg: i128 = if bid { 1 } else { -1 };
+    f.fee_accum = i64c(f.fee_accum as i128 + fee)?;
+    credit(u, pi, -fee - sg * nt as i128)?;
+    let ob = u.pos[pi].base; u.pos[pi].base = ob.checked_add(sg as i64 * fq as i64).ok_or(err(E::Math))?;
+    u.pos[pi].cost = cost_after(ob, u.pos[pi].base, u.pos[pi].cost, sg * nt as i128)?;
+    ev.push(&f.makers[mi].user, bp, fq, (mi as u64) << 32 | q.gen as u64);
+    Ok(fq)
+}
+/// The rest of a multi-fill take: every slab's own best level is kept, and a fill rescans only the slab it hit (a fill
+/// changes only that maker's budget and used table). Same order as best_quote: price, older quote, earlier slab. Returns lots left.
+#[inline(never)]
+fn fast_match_more(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: usize, bid: bool, lo: u64, hi: u64,
+                   rest: &[AccountView], mk: &Key, m: &Market, u: &mut User, uk: &Key, pi: usize, limit: u64, mut left: u64, slot: u64,
+                   taker_bps: u64, ev: &mut EvBuf) -> Result<u64, ProgramError> {
+    let mut cand: [Cand; FAST_MAKERS] = [(0, 0, 0, 0); FAST_MAKERS];
+    for (k, &(sp, mi)) in sl.iter().enumerate() { cand[k] = slab_best(f, sp, mi, base_ix, opp, bid, slot, lo, hi, (0, 0, 0, 0)); }
+    while left > 0 {
+        let (mut bk, mut best): (usize, Cand) = (usize::MAX, (0, 0, 0, 0));
+        for (k, c) in cand[..sl.len()].iter().enumerate() {
+            if c.0 != 0 && (bk == usize::MAX || (bid && c.0 < best.0) || (!bid && c.0 > best.0) || (c.0 == best.0 && c.2 < best.2)) { bk = k; best = *c; }
+        }
+        let (bl, bp, ba) = (best.3, best.0, best.1);
+        if !rest.is_empty() || m.strict_take != 0 {
+            let lim = if bk == usize::MAX { limit } else if bid { limit.min(bp - 1) } else { limit.max(bp + 1) };
+            let tf = take(pid, rest, mk, m, u, uk, pi, bid, lim, left, slot, taker_bps, STP_CANCEL_OLDEST)?;
+            left -= tf.filled;
+            if left == 0 || tf.abort { break; }
+        }
+        if bk == usize::MAX || (bid && bp > limit) || (!bid && bp < limit) { break; }
+        left -= book_fill(f, sl, bk, bl, bp, ba.min(left), base_ix, opp, bid, u, pi, taker_bps, ev)?;
+        if left > 0 { let (sp, mi) = sl[bk]; cand[bk] = slab_best(f, sp, mi, base_ix, opp, bid, slot, lo, hi, (0, 0, 0, 0)); }
+    }
+    Ok(left)
 }
 /// Approved makers' slabs found in `xs`, skipping killed ones and the taker's own. Every slab must belong to this book.
 fn fast_slabs(pid: &Address, f: &FastBook, xs: &[AccountView], uk: &Key) -> Result<([(*const Slab, usize); FAST_MAKERS], usize), ProgramError> {
@@ -1977,8 +2014,35 @@ fn fast_slabs(pid: &Address, f: &FastBook, xs: &[AccountView], uk: &Key) -> Resu
     }
     Ok((sl, cnt))
 }
-/// Best usable maker quote on the side a taker hits, inside [lo, hi]: (slab slot, level, price, lots available).
+/// One level a taker could hit: price (0 = none), lots, quote slot, level.
+type Cand = (u64, u64, u32, usize);
+/// Best usable level of one maker's slab on the side a taker hits, inside [lo, hi], that beats `best` (price 0 = no bound).
 /// Better price first, then the older quote. Lots are capped by the maker's remaining budget.
+#[inline(always)]
+fn slab_best(f: &FastBook, sp: *const Slab, mi: usize, base_ix: usize, opp: usize, bid: bool, slot: u64, lo: u64, hi: u64, best: Cand) -> Cand {
+    let s = unsafe { &*sp };
+    let e = &f.makers[mi];
+    let (mut bp, mut ba, mut bs, mut bl) = best;
+    let mut hit = false;
+    if e.budget <= 0 { return (0, 0, 0, 0); }
+    for l in 0..SLAB_LEVELS {
+        let q = unsafe { s.quotes.get_unchecked(base_ix + l) };
+        let p = q.px as u64;
+        // Price first: a level that cannot beat the best so far costs one compare, so a sorted ladder is decided at its
+        // first usable level. The winner is the same as checking usability first.
+        if q.qty == 0 || (bp != 0 && ((bid && p > bp) || (!bid && p < bp) || (p == bp && q.slot >= bs))) { continue; }
+        if p == 0 || p < lo || p > hi || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
+        let u_ = unsafe { f.used.get_unchecked(mi).get_unchecked(opp << 3 | l) };
+        let av = (if u_.gen == q.gen { q.qty.saturating_sub(u_.qty) } else { q.qty }) as u64;
+        let av = av.min(e.budget as u64 / p);
+        if av == 0 { continue; }
+        bp = p; ba = av; bs = q.slot; bl = l; hit = true;
+    }
+    if hit { (bp, ba, bs, bl) } else { (0, 0, 0, 0) }
+}
+/// Best usable maker quote across slabs: (slab slot, level, price, lots available). Better price first, then the older
+/// quote, then the earlier slab. A level that cannot beat the best so far costs one compare, so on a full book with
+/// sorted ladders most levels are decided by price alone; the winner is the same as checking usability first.
 #[inline(always)]
 fn best_quote(f: &FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: usize, bid: bool, slot: u64, lo: u64, hi: u64) -> Option<(usize, usize, u64, u64)> {
     let (mut bk, mut bl, mut bp, mut ba, mut bs) = (usize::MAX, 0usize, 0u64, 0u64, u32::MAX);
@@ -1988,14 +2052,14 @@ fn best_quote(f: &FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: us
         if e.budget <= 0 { continue; }
         for l in 0..SLAB_LEVELS {
             let q = unsafe { s.quotes.get_unchecked(base_ix + l) };
-            if q.qty == 0 || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
             let p = q.px as u64;
-            if p == 0 || p < lo || p > hi { continue; }
+            if q.qty == 0 || (bk != usize::MAX && ((bid && p > bp) || (!bid && p < bp) || (p == bp && q.slot >= bs))) { continue; }
+            if p == 0 || p < lo || p > hi || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
             let u_ = unsafe { f.used.get_unchecked(mi).get_unchecked(opp << 3 | l) };
             let av = (if u_.gen == q.gen { q.qty.saturating_sub(u_.qty) } else { q.qty }) as u64;
             let av = av.min(e.budget as u64 / p);
             if av == 0 { continue; }
-            if bk == usize::MAX || (bid && p < bp) || (!bid && p > bp) || (p == bp && q.slot < bs) { bk = k; bl = l; bp = p; ba = av; bs = q.slot; }
+            bk = k; bl = l; bp = p; ba = av; bs = q.slot;
         }
     }
     if bk == usize::MAX { None } else { Some((bk, bl, bp, ba)) }
@@ -2053,10 +2117,10 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let base_ix = (f.idx as usize) << 4 | opp << 3;
     let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
     let (mut cnt, mut seen) = (0usize, 0u64);
-    for x in a[4..4 + ns].iter() {
+    for (j, x) in a[4..4 + ns].iter().enumerate() {
         let s: &Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
         let k = key(x);
-        let mi = f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))?;
+        let mi = if j < f.n as usize && f.makers[j].slab == k { j } else { f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))? };
         seen |= 1 << mi;
         if s.kill != 0 || s.user == tk { continue; }
         sl[cnt] = (s as *const Slab, mi); cnt += 1;
