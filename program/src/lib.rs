@@ -180,6 +180,7 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
     match tag as u64 {
         spec::IX_SLAB_QUOTE => slab_quote(pid, accs, data),
         spec::IX_TAKE_FAST => take_fast(pid, accs, data),
+        spec::IX_TAKE_FAST_BATCH => take_fast_batch(pid, accs, data),
         IX_PLACE => batch(pid, accs, data, true),
         IX_BATCH => batch(pid, accs, data, false),
         IX_CANCEL => batch(pid, accs, data, false),
@@ -652,16 +653,20 @@ impl EvBuf {
 /// Fast-path fill event, one sol_log_data per take (or per 32 fills), 16 bytes a fill:
 /// [EVENTS_FAST_FILL, taker_side, taker 32, n u8, n x (px u32, qty u32, id u64)], id = maker index << 32 | quote generation.
 /// The maker is FastBook.makers[index] of the book in the same transaction (indices never move: makers are only appended).
+/// A take_fast_batch logs one EVENTS_FAST_BATCH for all its takers: [tag, 0, fast book 32, n u8, entries], with
+/// id = order slot << 40 | taker side (1 = sell) << 39 | maker index << 32 | gen (order slot k = the k-th order of the batch).
 /// The buffer is not zeroed: only the bytes written are logged.
 const FEV_MAX: usize = 32;
 const FEV_ENTRY: usize = 16;
 struct FastEv { b: core::mem::MaybeUninit<[u8; 35 + FEV_MAX * FEV_ENTRY]>, n: usize }
 impl FastEv {
     #[inline(always)]
-    fn new(taker: &Key, taker_bid: bool) -> Self {
+    fn new(taker: &Key, taker_bid: bool) -> Self { FastEv::with(spec::EVENTS_FAST_FILL as u8, if taker_bid { 0 } else { 1 }, taker) }
+    #[inline(always)]
+    fn with(tag: u8, b1: u8, k: &Key) -> Self {
         let mut e = FastEv { b: core::mem::MaybeUninit::uninit(), n: 0 };
         let p = e.b.as_mut_ptr() as *mut u8;
-        unsafe { *p = spec::EVENTS_FAST_FILL as u8; *p.add(1) = if taker_bid { 0 } else { 1 }; core::ptr::copy_nonoverlapping(taker.as_ptr(), p.add(2), 32); }
+        unsafe { *p = tag; *p.add(1) = b1; core::ptr::copy_nonoverlapping(k.as_ptr(), p.add(2), 32); }
         e
     }
     #[inline(always)]
@@ -1064,7 +1069,7 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
         let px0 = mark(m); let band = px0 / 10000 * spec::QUOTE_BAND_BPS; let (blo, bhi) = bound_range(m);
         let (lo, hi) = (px0.saturating_sub(band).max(blo), (px0 + band).min(bhi));
         let (sl, cnt) = fast_slabs(pid, fb, rest, &tk)?;
-        fast_match(pid, fb, &sl[..cnt], (fb.idx as usize) << 4 | opp << 3, opp, bid, lo, hi, rest, &mk, m, t, &tk, pi, tr.limit_px, qty, slot, taker_bps)?
+        { let mut ev = FastEv::new(&tk, bid); let r = fast_match(pid, fb, &sl[..cnt], (fb.idx as usize) << 4 | opp << 3, opp, bid, lo, hi, rest, &mk, m, t, &tk, pi, tr.limit_px, qty, slot, taker_bps, &mut ev, 0)?; ev.flush(); r }
     } else { take(pid, rest, &mk, m, t, &tk, pi, bid, tr.limit_px, qty, slot, taker_bps, STP_CANCEL_OLDEST)?.filled };
     if filled == 0 { return Err(err(E::NotTriggered)); } // AUDIT M-1: no tip / no slice burn without a fill
     let w = &mut t.triggers[si];
@@ -1987,7 +1992,9 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let tier = (u.tier as usize).min(TIERS.len() - 1);
     let taker_bps = TIERS[tier].0;
     cp!(8);
-    fast_match(pid, f, &sl[..cnt], base_ix, opp, bid, lo, hi, rest, &mk, m, u, &uk, pi, limit, left, slot, taker_bps)?;
+    let mut ev = FastEv::new(&uk, bid);
+    fast_match(pid, f, &sl[..cnt], base_ix, opp, bid, lo, hi, rest, &mk, m, u, &uk, pi, limit, left, slot, taker_bps, &mut ev, 0)?;
+    ev.flush();
     cp!(9);
     if !reduce {
         if m.max_oi != 0 && m.oi_long > m.max_oi { return Err(err(E::Cap)); }
@@ -2004,6 +2011,94 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     Ok(())
 }
 
+/// Many takers against one fast book in one instruction. The market, the book, the maker slabs and the clock are read once,
+/// and a relayer holding the takers' session delegates signs once (a taker can also sign for itself), so a batch of N takers
+/// pays one signature and one book write lock. An order that can't go (no authority, over its delegate cap, other vault, stale
+/// or paused market, isolated position, OI cap, margin for its worst case) is skipped and the others still fill. Margin is
+/// checked before matching for the most the order can do (worst_ok), which is stricter than take_fast's check after it; no
+/// resting-book orders take part (as take_fast without shards). Markets with strict_take are refused.
+/// accs: market(r), other markets(r) x nm, fast(w), slabs(r) x ns, n x [user(w), signer(s), delegate record(r) or any account
+/// when the signer is the owner], rest (resting-book shards whose maker fills a taker claims first)
+/// data: tag, nm u8, ns u8, n u8, n x (side u8, flags u8, limit u64, qty u64)
+fn take_fast_batch(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if d.len() < 4 { return Err(err(E::BadData)); }
+    let (nm, ns, n) = (d[1] as usize, d[2] as usize, d[3] as usize);
+    let (fi, ti) = (1 + nm, 2 + nm + ns);
+    if d.len() != 4 + n * 18 || ns > FAST_MAKERS || n > 255 || a.len() < ti + 3 * n { return Err(err(E::BadData)); }
+    let m: &Market = load(&a[0], pid, DISC_MARKET, MARKET_SIZE)?;
+    let f: &mut FastBook = load(&a[fi], pid, DISC_FAST, FAST_SIZE)?;
+    let mk = key(&a[0]);
+    if f.market != mk || m.strict_take != 0 { return Err(err(E::BadAccount)); }
+    let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
+    let px0 = mark(m);
+    let band = (px0 / 10000).wrapping_mul(spec::QUOTE_BAND_BPS);
+    let (blo, bhi) = bound_range(m);
+    let (lo, hi) = (px0.saturating_sub(band).max(blo), (px0 + band).min(bhi));
+    let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
+    let mut cnt = 0;
+    for (j, x) in a[fi + 1..fi + 1 + ns].iter().enumerate() {
+        let s: &Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
+        let k = key(x);
+        let mi = if j < f.n as usize && f.makers[j].slab == k { j } else { f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))? };
+        if s.kill != 0 { continue; }
+        sl[cnt] = (s as *const Slab, mi); cnt += 1;
+    }
+    let (mkts, rest) = (&a[..1 + nm], &a[ti + 3 * n..]);
+    let mut ev = FastEv::with(spec::EVENTS_FAST_BATCH as u8, 0, &key(&a[fi]));
+    for k in 0..n {
+        let o = 4 + k * 18;
+        let o_ = (d[o] as u64 == SIDE_BID, d[o + 1] as u64, rd64(d, o + 2)?, rd64(d, o + 10)?);
+        let x = &a[ti + 3 * k..ti + 3 * k + 3];
+        batch_take(pid, f, m, &mk, mkts, rest, &sl[..cnt], &x[0], &x[1], &x[2], nw, lo, hi, o_, &mut ev, (k as u64) << 40)?;
+    }
+    ev.flush();
+    Ok(())
+}
+/// One order of take_fast_batch. Ok(()) also when the order is skipped; an error (arithmetic) fails the whole batch.
+#[inline(always)]
+fn batch_take(pid: &Address, f: &mut FastBook, m: &Market, mk: &Key, mkts: &[AccountView], rest: &[AccountView], all: &[(*const Slab, usize)],
+              ua: &AccountView, sa: &AccountView, ra: &AccountView, nw: Now, lo: u64, hi: u64, (bid, fl, limit, mut left): (bool, u64, u64, u64),
+              ev: &mut FastEv, idt: u64) -> ProgramResult {
+    if left == 0 || left > u32::MAX as u64 || !sa.is_signer() { return Ok(()); }
+    let Ok(u) = load::<User>(ua, pid, DISC_USER, USER_SIZE) else { return Ok(()) };
+    let uk = key(ua);
+    let dmax = if u.authority == key(sa) { u64::MAX } else { match delegate_max_qty(pid, core::slice::from_ref(ra), &key(sa), &uk, nw.0) { Some(x) => x, None => return Ok(()) } };
+    let opp = if bid { 1usize } else { 0usize };
+    if left > dmax || u.home_vault != m.vault || (f.side != 0 && f.side != opp as u64 + 1) { return Ok(()); }
+    claim_all(pid, u, &uk, rest)?;
+    let Ok(pi) = pos_idx(u, mk, m.funding_index) else { return Ok(()) };
+    if settle_funding_all(pid, u, mkts).is_err() { gc_pos(u); return Ok(()); }
+    let taker_bps = TIERS[(u.tier as usize).min(TIERS.len() - 1)].0;
+    if fl & FLAG_REDUCE_ONLY != 0 {
+        let b = u.pos[pi].base;
+        left = left.min(if bid && b < 0 { (-b) as u64 } else if !bid && b > 0 { b as u64 } else { 0 });
+    } else if m.paused != 0 || stale(m, nw) || u.pos[pi].flags & POS_ISO != 0 || (m.max_oi != 0 && m.oi_long > m.max_oi)
+        || !worst_ok(pid, u, pi, mkts, nw, m, bid, left, if bid { limit.min(hi) } else { limit.max(lo) }, taker_bps) { left = 0; }
+    if left > 0 {
+        let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
+        let mut cnt = 0;
+        for &(sp, mi) in all { if unsafe { (*sp).user } != uk { sl[cnt] = (sp, mi); cnt += 1; } } // no self-trade
+        fast_match(pid, f, &sl[..cnt], (f.idx as usize) << 4 | opp << 3, opp, bid, lo, hi, &[], mk, m, u, &uk, pi, limit, left, nw.0, taker_bps, ev, idt | (opp as u64 ^ 1) << 39)?;
+    }
+    gc_pos(u);
+    Ok(())
+}
+/// Initial margin holds for the most an order of `qty` lots can do: every lot filled at `worst` (its limit, kept inside the band)
+/// at the taker fee. Equity moves by lots * (mark - price) - fee for a buy (price - mark for a sell), so the worst case bounds
+/// any fill from below; initial margin follows the gross exposure, which over a partial fill never exceeds the larger of now
+/// and full fill. So when this holds, every possible fill of the order leaves equity >= initial margin. Also the position cap.
+fn worst_ok(pid: &Address, u: &User, pi: usize, mkts: &[AccountView], nw: Now, m: &Market, bid: bool, qty: u64, worst: u64, taker_bps: u64) -> bool {
+    let Ok((eq, im, _)) = health(pid, u, mkts, nw, true) else { return false };
+    let (p, px, q) = (&u.pos[pi], mark(m), qty as i128);
+    let nt = mulf(q, worst);
+    let slip = if bid { nt - mulf(q, px) } else { mulf(q, px) - nt };
+    let eq_w = eq - slip.max(0) - bps_up(nt, taker_bps);
+    let gross = |b: i128| core::cmp::max((b + p.bid_open as i128).abs(), (b - p.ask_open as i128).abs());
+    let (g0, g1) = (gross(p.base as i128), gross(if bid { p.base as i128 + q } else { p.base as i128 - q }));
+    if m.max_position != 0 && g1 > m.max_position as i128 { return false; }
+    let im_w = if g1 > g0 { im - bps_up(mulf(g0, px), m.imr_bps) + bps_up(mulf(g1, px), m.imr_bps) } else { im };
+    eq_w >= im_w
+}
 #[inline(always)]
 /// Taker matching shared by take_fast and trigger orders: the better of the best maker quote and the best resting order fills
 /// first, until `left` lots are done or nothing is inside `limit`. Books the taker's side, maker fills, fees and OI. Returns lots.
@@ -2012,9 +2107,8 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
 /// once (a merge of sorted lists).
 fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: usize, bid: bool, lo: u64, hi: u64,
               rest: &[AccountView], mk: &Key, m: &Market, u: &mut User, uk: &Key, pi: usize, limit: u64, mut left: u64, slot: u64,
-              taker_bps: u64) -> Result<u64, ProgramError> {
+              taker_bps: u64, ev: &mut FastEv, idt: u64) -> Result<u64, ProgramError> {
     let (want, base0) = (left, long(u.pos[pi].base));
-    let mut ev = FastEv::new(uk, bid);
     // only the first sl.len() entries are ever read, and each is written first
     let mut cand: [core::mem::MaybeUninit<Cand>; FAST_MAKERS] = [core::mem::MaybeUninit::uninit(); FAST_MAKERS];
     for (k, &(sp, mi)) in sl.iter().enumerate() { cand[k].write(slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0)); }
@@ -2042,13 +2136,12 @@ fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base
         let fee = bps_up(nt as i128, taker_bps) as u64;
         fees += fee;
         acc.add(u, pi, bid, fq, nt, fee)?;
-        ev.push(bp, fq, (mi as u64) << 32 | q.gen as u64);
+        ev.push(bp, fq, idt | (mi as u64) << 32 | q.gen as u64);
         left -= fq;
         if left > 0 { cand[bk].write(slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, b0)); }
     }
     acc.book(u, pi, bid)?;
     f.fee_accum = i64c(f.fee_accum as i128 + fees as i128)?;
-    ev.flush();
     f.oi_long_delta += long(u.pos[pi].base) - base0;
     f.fills += 1;
     Ok(want - left)

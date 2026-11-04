@@ -789,3 +789,88 @@ fn exec_fast(e: &mut Env, kp: &Keypair, ku: &Address, tu: &Address, f: &Address,
     let c = tk(&mut e, &tp, &tu, &f, &all, &[], 0, PX + 1000, 10, true); show(&e, &format!("8 slabs 1 fill total={c:?}"));
     let c = tk(&mut e, &tp, &tu, &f, &all, &[], 0, PX + 1000, 4500, true); show(&e, &format!("8 slabs 5 fills total={c:?}"));
 }
+
+/// Several fill books for one side of one market: each holds its own used tables and maker budgets over the same maker quotes,
+/// so takers on different books write disjoint accounts (their User and their book) and run in parallel. Each book fills a
+/// quote up to its size, so a maker on N books offers N times the size, capped by each book's budget.
+#[test] fn several_books_per_side_fill_in_parallel_and_conserve() {
+    let mut e = Env::new(); e.oracle_update("", 1000_00000000, None);
+    let (a1, a2) = (fast_new_side(&mut e, 0, 2), fast_new_side(&mut e, 0, 2));
+    let k = maker(&mut e, &a1, 10_000_000_000, 1_000_000_000);
+    let (adm, m) = (e.admin.pubkey(), e.market);
+    e.send("", vec![AccountMeta::new(adm, true), r(&m), w(&a2), r(&k.slab)], vec![62], &[], true);
+    fund_m(&mut e, &a2, &k, 1_000_000_000, true);
+    quote(&mut e, &k, &[(ASK, 100_010, 100)], true);
+    let (t1, u1) = e.user(10_000_000_000); let (t2, u2) = e.user(10_000_000_000);
+    tk(&mut e, &t1, &u1, &a1, &[k.slab], &[], 0, PX + 100, 80, true);
+    tk(&mut e, &t2, &u2, &a2, &[k.slab], &[], 0, PX + 100, 80, true);
+    assert_eq!((e.user_state(&u1).pos[0].base, e.user_state(&u2).pos[0].base), (80, 80));
+    tk(&mut e, &t1, &u1, &a1, &[k.slab], &[], 0, PX + 100, 80, true);
+    assert_eq!(e.user_state(&u1).pos[0].base, 100, "each book fills the quote up to its size once");
+    settle(&mut e, &a1, &k); settle(&mut e, &a2, &k);
+    assert_eq!(e.user_state(&k.u).pos[0].base, -180);
+    let (b1, b2) = (fb(&e, &a1), fb(&e, &a2));
+    assert_eq!((b1.makers[0].base, b2.makers[0].base), (0, 0), "settled into the maker's position");
+}
+
+fn set_delegate(e: &mut Env, owner: &Keypair, u: &Address, rec: &Address, delegate: &Address, expiry: u64, max_qty: u64) {
+    let mut d = vec![42u8]; d.extend_from_slice(delegate.as_ref()); d.extend_from_slice(&expiry.to_le_bytes()); d.extend_from_slice(&max_qty.to_le_bytes());
+    e.send("", vec![AccountMeta::new(owner.pubkey(), true), r(u), w(rec)], d, &[owner], true);
+}
+fn batch_ix(e: &Env, f: &Address, slabs: &[Address], takers: &[(Address, Address, u8, u8, u64, u64)], recs: &[Address]) -> (Vec<AccountMeta>, Vec<u8>) {
+    let m = e.market;
+    let mut a = vec![r(&m), w(f)]; a.extend(slabs.iter().map(r));
+    let mut d = vec![72u8, 0, slabs.len() as u8, takers.len() as u8];
+    for (i, (u, sg, side, fl, limit, qty)) in takers.iter().enumerate() {
+        a.push(w(u)); a.push(AccountMeta::new_readonly(*sg, true)); a.push(r(recs.get(i).unwrap_or(u)));
+        d.push(*side); d.push(*fl); d.extend_from_slice(&limit.to_le_bytes()); d.extend_from_slice(&qty.to_le_bytes());
+    }
+    (a, d)
+}
+/// A relayer with session delegates sends many takers in one instruction: they fill in order against the same quotes,
+/// an order over its margin (worst case) or without authority is skipped, the rest still fill, and the book conserves.
+#[test] fn batched_takes_fill_in_order_and_skip_bad_orders() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    quote(&mut e, &k, &[(ASK, 100_010, 300), (ASK + 1, 100_020, 300)], true);
+    let relayer = Keypair::new(); e.svm.airdrop(&relayer.pubkey(), 1_000_000_000).unwrap();
+    let mut us = Vec::new();
+    for dep in [10_000_000_000u64, 10_000_000_000, 1_000_000, 10_000_000_000] {
+        let (kp, u) = e.user(dep); let rec = Address::new_unique(); e.prog_acct(rec, DELEGATE_SIZE);
+        let s = e.slot; set_delegate(&mut e, &kp, &u, &rec, &relayer.pubkey(), s + 1000, 1_000); us.push((kp, u, rec));
+    }
+    let rp = relayer.pubkey();
+    let stranger = Keypair::new();
+    let takers = vec![(us[0].1, rp, 0u8, 0u8, PX + 100, 200u64), (us[1].1, rp, 0, 0, PX + 100, 200), (us[2].1, rp, 0, 0, PX + 100, 200),
+                      (us[3].1, stranger.pubkey(), 0, 0, PX + 100, 50), (us[3].1, rp, 0, 0, PX + 100, 5_000)];
+    let recs: Vec<Address> = vec![us[0].2, us[1].2, us[2].2, us[3].2, us[3].2];
+    let (a, d) = batch_ix(&e, &f, &[k.slab], &takers, &recs);
+    assert!(send_many(&mut e, vec![(a, d)], &[&relayer, &stranger]));
+    let b = |e: &Env, u: &Address| e.user_state(u).pos.iter().find(|p| p.market == e.market.to_bytes()).map_or(0, |p| p.base);
+    assert_eq!((b(&e, &us[0].1), b(&e, &us[1].1)), (200, 200), "both fill, in order: 300 at 100_010 then 300 at 100_020");
+    assert_eq!(b(&e, &us[2].1), 0, "1 USDC of collateral can't carry 200 lots: skipped");
+    assert_eq!(b(&e, &us[3].1), 0, "a stranger's signature and an order over the delegate cap are skipped");
+    let fbk = fb(&e, &f); assert_eq!(fbk.makers[0].base, -400);
+    assert_eq!((fbk.used[0][8].qty, fbk.used[0][9].qty), (300, 100));
+    // the batch path and take_fast agree on what fills
+    let (tp, tu) = e.user(10_000_000_000); tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 1_000, true);
+    assert_eq!(b(&e, &tu), 200, "what the batch left: 200 at 100_020");
+}
+/// CU of a batch: per taker, against take_fast for the same fills.
+#[test] fn compute_units_batch() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let v: Vec<(u16, u32, u32)> = (0..8).map(|l| (ASK + l as u16, 100_010 + 10 * l as u32, 100_000)).collect();
+    quote(&mut e, &k, &v, true);
+    let relayer = Keypair::new(); e.svm.airdrop(&relayer.pubkey(), 1_000_000_000).unwrap(); let rp = relayer.pubkey();
+    let mut us = Vec::new();
+    for _ in 0..10 { let (kp, u) = e.user(10_000_000_000); let rec = Address::new_unique(); e.prog_acct(rec, DELEGATE_SIZE);
+        let s = e.slot; set_delegate(&mut e, &kp, &u, &rec, &rp, s + 1000, 1_000_000); us.push((kp, u, rec)); }
+    for n in [1usize, 5, 10] {
+        let takers: Vec<_> = us[..n].iter().map(|x| (x.1, rp, 0u8, 0u8, PX + 100, 10u64)).collect();
+        let rest: Vec<Address> = us[..n].iter().map(|x| x.2).collect();
+        let (a, d) = batch_ix(&e, &f, &[k.slab], &takers, &rest);
+        let ix = Instruction { program_id: e.pid, accounts: a, data: d };
+        let tx = Transaction::new_signed_with_payer(&[ix], Some(&e.admin.pubkey()), &[&e.admin, &relayer], e.svm.latest_blockhash());
+        let cu = e.svm.send_transaction(tx).map(|m| m.compute_units_consumed).unwrap(); e.svm.expire_blockhash();
+        println!("batch {n} takers 1 fill each: {cu} CU, {} per taker", cu / n as u64);
+    }
+}
