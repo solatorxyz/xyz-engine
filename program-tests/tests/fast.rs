@@ -874,3 +874,48 @@ fn batch_ix(e: &Env, f: &Address, slabs: &[Address], takers: &[(Address, Address
         println!("batch {n} takers 1 fill each: {cu} CU, {} per taker", cu / n as u64);
     }
 }
+
+/// Random batches agree with the same orders sent one at a time through take_fast: the same script runs on two books, one
+/// batched (relayer with session delegates), one order by order. Takers are well collateralised, so the batch's stricter
+/// worst-case margin never skips; every taker's position, every maker's fills and the fees must match after every round.
+#[test] fn random_batches_match_sequential_takes() {
+    let mut rounds = 0;
+    for seed in 1..=20u64 {
+        let mut g = Rng(seed.wrapping_mul(0x2545F4914F6CDD1D) | 1);
+        let mut envs: Vec<(Env, Address, Vec<Mk>, Vec<(Keypair, Address, Address)>, Keypair)> = (0..2).map(|_| {
+            let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let f = fast_new(&mut e, 0);
+            let mk: Vec<Mk> = (0..3).map(|_| maker(&mut e, &f, 50_000_000_000, 5_000_000_000)).collect();
+            let rl = Keypair::new(); e.svm.airdrop(&rl.pubkey(), 1_000_000_000).unwrap();
+            let tk_ = (0..6).map(|_| { let (kp, u) = e.user(100_000_000_000); let rec = Address::new_unique(); e.prog_acct(rec, DELEGATE_SIZE);
+                let s = e.slot; set_delegate(&mut e, &kp, &u, &rec, &rl.pubkey(), s + 100_000, u64::MAX); (kp, u, rec) }).collect();
+            (e, f, mk, tk_, rl)
+        }).collect();
+        for _ in 0..15 {
+            for _ in 0..2 {
+                let i = g.n(3) as usize;
+                let v: Vec<(u16, u32, u32)> = (0..4).map(|_| { let s = g.n(2) as u16; let l = g.n(8) as u16; let off = 1 + g.n(8);
+                    (s << 3 | l, (if s == 1 { 100_000 + off } else { 100_000 - off }) as u32, (1 + g.n(400)) as u32) }).collect();
+                let v = { let (e, _, mk, _, _) = &envs[0]; fit(e, &mk[i].slab, &v) };
+                for (e, _, mk, _, _) in envs.iter_mut() { quote(e, &mk[i], &v, true); }
+            }
+            let orders: Vec<(usize, u8, u64, u64)> = (0..1 + g.n(6)).map(|_| { let side = g.n(2) as u8;
+                (g.n(6) as usize, side, if side == 0 { 100_000 + g.n(10) } else { 100_000 - g.n(10) }, 1 + g.n(700)) }).collect();
+            { let (e, f, mk, tk_, rl) = &mut envs[0];
+              let takers: Vec<_> = orders.iter().map(|&(t, side, lim, q)| (tk_[t].1, rl.pubkey(), side, 0u8, lim, q)).collect();
+              let recs: Vec<Address> = orders.iter().map(|&(t, ..)| tk_[t].2).collect();
+              let slabs: Vec<Address> = mk.iter().map(|m| m.slab).collect();
+              let (a, d) = batch_ix(e, f, &slabs, &takers, &recs); let rl = rl.insecure_clone();
+              assert!(send_many(e, vec![(a, d)], &[&rl])); }
+            { let (e, f, mk, tk_, _) = &mut envs[1];
+              let slabs: Vec<Address> = mk.iter().map(|m| m.slab).collect();
+              for &(t, side, lim, q) in &orders { let (kp, u) = (tk_[t].0.insecure_clone(), tk_[t].1); tk(e, &kp, &u, f, &slabs, &[], side, lim, q, true); } }
+            let pos = |e: &Env, u: &Address| e.user_state(u).pos.iter().find(|p| p.market == e.market.to_bytes()).map_or((0, 0), |p| (p.base, p.cost));
+            for t in 0..6 { assert_eq!(pos(&envs[0].0, &envs[0].3[t].1), pos(&envs[1].0, &envs[1].3[t].1), "seed {seed}: taker {t} position"); 
+                            assert_eq!(envs[0].0.user_state(&envs[0].3[t].1).cash, envs[1].0.user_state(&envs[1].3[t].1).cash, "seed {seed}: taker {t} cash"); }
+            let (b0, b1) = (fb(&envs[0].0, &envs[0].1), fb(&envs[1].0, &envs[1].1));
+            for k in 0..3 { assert_eq!((b0.makers[k].base, b0.makers[k].quote, b0.makers[k].budget), (b1.makers[k].base, b1.makers[k].quote, b1.makers[k].budget), "seed {seed}: maker {k}"); }
+            assert_eq!(b0.fee_accum, b1.fee_accum); rounds += 1;
+        }
+    }
+    println!("{rounds} rounds: batch == sequential");
+}
