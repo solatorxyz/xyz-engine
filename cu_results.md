@@ -2,24 +2,24 @@
 |---|---|
 | init_market | 2009 |
 | init_rank (admin) | 193 |
-| update_oracle (Pyth parse+conf+staleness, funding accrue) | 1198 |
+| update_oracle (Pyth parse+conf+staleness, funding accrue) | 1213 |
 | deposit (SPL transfer CPI) | 1383 |
 | deposit (SPL transfer CPI) | 1383 |
 | deposit (SPL transfer CPI) | 1383 |
 | deposit (SPL transfer CPI) | 1383 |
-| place 1 post-only (resting, no match) | 1725 |
-| batch place 10 (5 bid + 5 ask levels) | 9372 |
-| batch replace (cancel 10 + place 10) | 12163 |
+| place 1 post-only (resting, no match) | 1726 |
+| batch place 10 (5 bid + 5 ask levels) | 9382 |
+| batch replace (cancel 10 + place 10) | 12173 |
 | batch cancel 10 | 3665 |
-| taker IOC: match 5 levels across 3 shards | 6872 |
-| taker IOC: match 1 level | 2822 |
+| taker IOC: match 5 levels across 3 shards | 6873 |
+| taker IOC: match 1 level | 2823 |
 | withdraw (margin check + PDA-signed SPL CPI) | 2131 |
-| batch replace + claim maker fills (3 shards w/ ledgers) | 11337 |
-| update_oracle + premium/mark from full shard set (5 shards) | 3810 |
+| batch replace + claim maker fills (3 shards w/ ledgers) | 11347 |
+| update_oracle + premium/mark from full shard set (5 shards) | 4297 |
 | liquidate (takeover at mark: health x2, transfer, fees) | 4579 |
 | deposit (SPL transfer CPI) | 1383 |
 | adl_rank (permissionless re-score) | 2026 |
-| ADL (bankrupt -> on-chain ranked counterparty -> insurance) | 6896 |
+| ADL (bankrupt -> on-chain ranked counterparty -> insurance) | 7336 |
 | settle_funding (permissionless, 1 position) | 199 |
 | aggregate OI/fees from 9 shards (crank) | 733 |
 | liquidate_book (permissionless, 1 chunk into the book, no liquidator capital) | 5625 |

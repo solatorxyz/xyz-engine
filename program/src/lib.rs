@@ -1474,9 +1474,19 @@ fn update_oracle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
         let mid = match (best_b, best_a) { (Some(b), Some(a)) => Some((b + a) / 2), _ => None };
         // 5) mark = clamp(median(oracle, oracle + EMA(mid - oracle), mid), oracle +- MARK_CLAMP_BPS)
         //    with a fresh external perp price: median(oracle + EMA, mid, external)
-        // EMA weight: slots since the last book sample (event_seq holds its slot; 0 = none yet, then the update gap)
-        let dsm = if m.event_seq == 0 { ds } else { slot.saturating_sub(m.event_seq) }; m.event_seq = slot;
-        let (e, mp) = mark_from(px, m.mark_ema as i128, dsm, mid, ext); m.mark_ema = i64c(e)?; m.mark_px = mp;
+        // Mid EMA input: the smaller (same-signed) of this sample's mid deviation and the previous sample's, weighted by the
+        // slots between the two samples (capped). A skew is credited only for time it was present at both sample ends, so a
+        // caller choosing when to sample gains nothing from the gap it waited. event_seq packs the previous sample's slot
+        // (40 bits) and deviation in ppm of the oracle (18 bits, offset).
+        let (ps, pdev) = (m.event_seq & ((1u64 << 40) - 1), (m.event_seq >> 40) as i64 - (1i64 << 17));
+        let ndev = mid.map_or(0i128, |x| x as i128 - px as i128);
+        let nppm = (ndev * 1_000_000 / px as i128).clamp(-100_000, 100_000) as i64;
+        let used = if ps == 0 || (pdev > 0) != (nppm > 0) || pdev == 0 || nppm == 0 { 0i128 }
+            else { (if pdev > 0 { pdev.min(nppm) } else { pdev.max(nppm) }) as i128 * px as i128 / 1_000_000 };
+        let gap = if ps == 0 { 0 } else { slot.saturating_sub(ps).min(spec::MARK_SAMPLE_MAX_SLOTS) };
+        m.event_seq = (slot & ((1u64 << 40) - 1)) | (((nppm + (1i64 << 17)) as u64) << 40);
+        let (e, _) = mark_from(px, m.mark_ema as i128, gap, Some((px as i128 + used).max(1) as u64), ext);
+        let (_, mp) = mark_from(px, e, 0, mid, ext); m.mark_ema = i64c(e)?; m.mark_px = mp;
     } else {
         let (_, mp) = mark_from(px, m.mark_ema as i128, 0, Some((px as i128 + m.mark_ema as i128).max(1) as u64), ext); m.mark_px = mp;
     }
@@ -2070,6 +2080,9 @@ fn adl(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     let n = mulf(dq as i128, px);
     let l0 = long(tb) + long(cb);
     let (otb, ocb) = (t.pos[ti].base, c.pos[ci].base);
+    // the counterparty's unrealized profit on the lots closed here: what deleveraging at the bankruptcy price would take,
+    // and the most it pays toward the target's deficit (never its collateral, never more than its equity)
+    let c_gain = ((mulf(ocb as i128, px) - c.pos[ci].cost as i128) * q as i128 / ocb.unsigned_abs() as i128).max(0);
     t.pos[ti].base += dq; c.pos[ci].base -= dq;
     m.oi_long = (m.oi_long as i64 + long(t.pos[ti].base) + long(c.pos[ci].base) - l0) as u64;
     credit(t, ti, -n)?; credit(c, ci, n)?;
@@ -2083,7 +2096,7 @@ fn adl(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if eq2 < 0 {
         let deficit = share(-eq2); // the rest stays with the target's remaining lots, for the next step
         let from_ins = deficit.min(ins.balance.max(0) as i128);
-        let from_c = (deficit - from_ins).min(ce.max(0)); // AUDIT M-5: never push the counterparty below zero
+        let from_c = (deficit - from_ins).min(ce.max(0)).min(c_gain); // AUDIT M-5: never below zero, never beyond its gain on these lots
         ins.balance = i64c(ins.balance as i128 - from_ins)?;
         credit(c, ci, -from_c)?; ce -= from_c;
         credit(t, ti, deficit)?; // VERIFY-1: the unrecovered part is carried in bad_debt, not also in the target's cash
@@ -2821,10 +2834,15 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let taker_bps = TIERS[(t.tier as usize).min(TIERS.len() - 1)].0;
     let mut in_shards = 0i64; let mut shard_fill = 0u64; let mut step = 0u64;
     // resting orders and maker quotes fill best price first: before each maker level, the shards' orders strictly better than it
-    let mut shard_take = |t: &mut User, lim: u64, left: u64| -> Result<(u64, i128), ProgramError> {
+    // the shards' best price is read once and refreshed only after a shard fill (not before every maker level)
+    let mut sbest: Option<u64> = if hybrid { best(&a[4 + ns..], pid, &mk, sside, m.oracle_px).map(|b| b.2) } else { None };
+    let mut shard_take = |t: &mut User, lim: u64, left: u64, sbest: &mut Option<u64>| -> Result<(u64, i128), ProgramError> {
+        let reach = match *sbest { Some(p) => if bid { p <= lim } else { p >= lim }, None => false };
+        if !reach { return Ok((0, 0)); }
         let lb = long(t.pos[pi].base);
         let tf = take(pid, &a[4 + ns..], &mk, m, t, &tk, pi, bid, lim, left, slot, taker_bps, STP_CANCEL_OLDEST)?;
         in_shards += long(t.pos[pi].base) - lb; shard_fill += tf.filled;
+        *sbest = best(&a[4 + ns..], pid, &mk, sside, m.oracle_px).map(|b| b.2);
         Ok((tf.filled, tf.notional))
     };
     let mut ev = FastEv::new(&tk, bid);
@@ -2833,7 +2851,7 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
         let best = best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi, book_px(f, m, slot));
         if hybrid {
             let lim = match best { Some((_, _, bp, _)) => if bid { hi.min(bp - 1) } else { lo.max(bp + 1) }, None => if bid { hi } else { lo } };
-            let (sf, sn) = shard_take(t, lim, left)?;
+            let (sf, sn) = shard_take(t, lim, left, &mut sbest)?;
             left -= sf; filled += sf; notional += sn;
             if left == 0 { break; }
         }
@@ -2853,11 +2871,15 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     ev.flush();
     // nothing within the quote band: the shards' orders further out, as a book liquidation would (10%, then 20%; each wider step
     // doubles the fee, a penalty to insurance)
-    while filled == 0 && hybrid && step + 1 < LIQ_BOOK_BAND_STEPS {
+    let lad = ((f.idx as usize) << 1 | opp).min(SLAB_LADDERS - 1);
+    let ladders_off = f.px_signer != [0; 32] && sl[..cnt].iter().any(|&(sp, _)| {
+        let fr = (unsafe { (*sp).lad[lad].flags } >> spec::LADDER_FRESH_SHIFT) as u64;
+        fr != 0 && (f.fast_px == 0 || slot > f.fast_slot + fr.min(spec::FAST_PX_MAX_SLOTS)) });
+    while filled == 0 && hybrid && !ladders_off && step + 1 < LIQ_BOOK_BAND_STEPS {
         step += 1;
         let band = (px as u128 * (LIQ_BOOK_BAND_BPS << step) as u128 / 10000) as u64;
         let lim = if bid { (px + band).min(bhi) } else { px.saturating_sub(band).max(blo).max(1) };
-        let (sf, sn) = shard_take(t, lim, left)?;
+        let (sf, sn) = shard_take(t, lim, left, &mut sbest)?;
         left -= sf; filled += sf; notional += sn;
     }
     if filled == 0 {
@@ -2881,12 +2903,7 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
             }
         }
         // a fresh-only ladder switched off only because the stored signed price is older than its own window is not "empty"
-        let lad = ((f.idx as usize) << 1 | opp).min(SLAB_LADDERS - 1);
-        for &(sp, _) in &sl[..cnt] {
-            if f.px_signer == [0; 32] { break; } // no signer: fresh-only ladders can never quote here, they are simply off
-            let fr = (unsafe { (*sp).lad[lad].flags } >> spec::LADDER_FRESH_SHIFT) as u64;
-            if fr != 0 && (f.fast_px == 0 || slot > f.fast_slot + fr.min(spec::FAST_PX_MAX_SLOTS)) { return Err(err(E::NoFill)); }
-        }
+        if ladders_off { return Err(err(E::NoFill)); }
         t.pos[pi].flags = (t.pos[pi].flags & (POS_ISO | POS_PIN)) | spec::POS_FLAG_ADL_ELIGIBLE | (slot << 8);
         emit(&[&[spec::EVENTS_LIQ_NOFILL as u8], &tk, &slot.to_le_bytes()]);
         return Ok(());

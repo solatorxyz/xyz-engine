@@ -109,6 +109,10 @@ pub const FUNDING_MAX_RATE_HOURLY_PPB: u64 = 40000000;
 pub const FUNDING_IMPACT_NOTIONAL: u64 = 1000000;
 pub const FUNDING_HOURS_PER_8H: u64 = 8;
 pub const MARK_EMA_SLOTS: u64 = 375;
+/// One book sample moves the mid EMA by at most this many slots' worth (gap / MARK_EMA_SLOTS). The mid credited is the
+/// smaller (same-signed) of the previous sample's and this one's: a skew counts only for slots it was present at both ends
+/// of, never for a gap the caller chose to wait. Pushers sample every ~2 s (5 slots), so an honest book runs at full speed.
+pub const MARK_SAMPLE_MAX_SLOTS: u64 = 5;
 pub const MARK_CLAMP_BPS: u64 = 500;
 pub const ORACLE_MAX_DIVERGENCE_BPS: u64 = 100;
 pub const ORACLE_RESUME_BPS: u64 = 50;

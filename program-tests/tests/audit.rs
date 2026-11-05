@@ -510,10 +510,15 @@ fn adm_d(tag: u8, op: u8, v: u64, k: Option<&Address>) -> Vec<u8> {
     assert_eq!(e.market_state().mark_ema, 0, "1-lot dust is no mid");
     e.send("", trade_accts(&kp, &u, &m, &[b, a]), batch_data(&[], &[place_item(0, 0, 199_950, 10, 0, 0), place_item(1, 0, 200_050, 10, 0, 0)]), &[&kp], true);
     e.set_time(e.slot + 1); e.oracle_update("", 1000_00000000, Some((b, a)));
+    // first sample of this skew: nothing credited yet (a skew counts for the slots between two samples it was present at)
+    assert_eq!(e.market_state().mark_ema, 0);
+    e.set_time(e.slot + 1); e.oracle_update("", 1000_00000000, Some((b, a)));
     let s = e.market_state();
-    // mid = 2x oracle; ema after 1 slot = 100000/375; median(oracle, oracle+ema, mid) = oracle+ema
-    assert_eq!(s.mark_ema, 100_000 / 375); assert_eq!(s.mark_px, 100_000 + 100_000 / 375);
-    for _ in 0..4 { e.set_time(e.slot + 400); e.oracle_update("", 1000_00000000, Some((b, a))); }
+    // mid = 2x oracle, present at both ends of a 1-slot gap; the credited deviation is capped at 10% of the oracle (the mark
+    // itself is clamped at 5%): ema = 10000/375; median(oracle, oracle+ema, mid) = oracle+ema
+    assert_eq!(s.mark_ema, 10_000 / 375); assert_eq!(s.mark_px, 100_000 + 10_000 / 375);
+    // a sample is at most MARK_SAMPLE_MAX_SLOTS (5) of weight however long it waited: 60 x 5/375 toward the 10k cap -> clamp
+    for _ in 0..60 { e.set_time(e.slot + 400); e.oracle_update("", 1000_00000000, Some((b, a))); }
     assert_eq!(e.market_state().mark_px, 105_000); // clamp
     e.set_time(e.slot + 1); e.oracle_update("", 1000_00000000, None); // omitted book -> sample 0, EMA decays
     assert!(e.market_state().mark_px <= 105_000);
