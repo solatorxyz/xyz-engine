@@ -59,7 +59,7 @@ fn upd(e: &mut Env, ms: &[Address]) -> Option<u32> {
     assert_eq!(upd(&mut e, &ms), Some(E_ORACLE), "1 of 3 posted, quorum 2");
     let (k, a) = (&ks[1], ms[1]);
     assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000, ts), &[k]), None);
-    assert_eq!(upd(&mut e, &ms[..1]), Some(E_ORACLE), "members not passed do not count");
+    assert_eq!(upd(&mut e, &ms[..1]), Some(19), "a member left out is refused outright");
     assert_eq!(upd(&mut e, &ms), None);
 }
 #[test] fn init_validation() {
@@ -74,7 +74,7 @@ fn upd(e: &mut Env, ms: &[Address]) -> Option<u32> {
 #[test] fn every_member_must_be_passed() {
     let (mut e, ks, ms) = set_env(); let ts = e.ts;
     for i in 0..3 { let (k, a) = (&ks[i], ms[i]); assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000, ts), &[k]), None); }
-    assert_eq!(upd(&mut e, &ms[..2]), Some(E_ORACLE), "two of three passed: refused even though the quorum is 2");
+    assert_eq!(upd(&mut e, &ms[..2]), Some(19), "two of three passed: refused even though the quorum is 2");
     assert_eq!(upd(&mut e, &ms), None);
 }
 #[test] fn two_disagreeing_members_are_unusable() {

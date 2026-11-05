@@ -194,8 +194,6 @@ fn set_market_u64(e: &mut Env, off: usize, v: u64) {
     let acc = la(&[b0]);
     assert_eq!(try_send(&mut e, acc, amt(5, 13), &[&lq]), Some(MISSING_SHARDS));
     let acc = la(&[b0, b1]);
-    assert_eq!(try_send(&mut e, acc, amt(5, 13), &[&lq]), Some(MISSING_SHARDS), "every shard of a market with resting orders");
-    let acc = la(&[b0, b1, a0, s9]);
     e.send("", acc, amt(5, 13), &[&lq], true);
     assert_eq!(e.shard_state(&b1).n, 0);
 }

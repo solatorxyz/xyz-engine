@@ -353,6 +353,9 @@ fn init_shard(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if m.n_shards >= MAX_SHARD_NO { return Err(err(E::Cap)); } // AUDIT L-3: shard_no fits the id high bits
     let lo = rd64(d, 2)?;
     if lo % m.bucket_width != 0 || d[1] > 1 { return Err(err(E::BadData)); }
+    // a side holds at most what one take can walk (keepers and liquidators must pass every opposite shard), 64 in all
+    // (complete views of a market)
+    if m.n_side[d[1] as usize] >= MAX_TAKE_SHARDS as u64 || m.n_shards >= 64 { return Err(err(E::Cap)); }
     let s = unsafe { &mut *(a[2].borrow_unchecked().as_ptr() as *mut Shard) };
     s.disc = DISC_SHARD; s.market = key(&a[1]); s.side = d[1] as u64; s.lo = lo; s.width = m.bucket_width;
     s.shard_no = m.n_shards; m.n_shards += 1; m.n_side[d[1] as usize] += 1;
@@ -472,7 +475,7 @@ fn set_isolated(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
     if p.base != 0 || p.bid_open != 0 || p.ask_open != 0 || p.n_orders != 0 { return Err(err(E::Isolated)); }
     // a maker's market stays cross: its fills are margined by the whole account (maker margin + budget), never by an
     // isolated bucket the settle can't see
-    if p.flags & POS_PIN != 0 { return Err(err(E::Isolated)); }
+    if d[1] != 0 && p.flags & POS_PIN != 0 { return Err(err(E::Isolated)); }
     if d[1] != 0 { p.flags |= POS_ISO; } else if p.flags & POS_ISO != 0 { p.flags &= !POS_ISO; u.cash = i64c(u.cash as i128 + p.iso_margin as i128)?; p.iso_margin = 0; }
     gc_pos(u);
     Ok(())
@@ -1010,6 +1013,9 @@ fn batch(pid: &Address, a: &mut [AccountView], d: &[u8], single: bool) -> Progra
     claim_all(pid, u, &uk, rest)?;
     let pi = pos_idx(u, &mk, m.funding_index)?;
     settle_funding_all(pid, u, &a[2..])?;
+    // a resting bid above the mark (ask below it) loses (price - mark) x qty the moment it fills: that loss is margined now,
+    // so an order alone can't make the account bankrupt when it fills (initial margin is only charged at the mark)
+    let mut adverse: i128 = 0; let mpx = mark(m);
     // 1) cancels first (cancel priority within the instruction)
     for _ in 0..nc {
         cancel(rest, pid, &mk, &uk, u, pi, rd64(d, o)?, d[o + 8], rd64(d, o + 9)?)?;
@@ -1083,6 +1089,9 @@ fn batch(pid: &Address, a: &mut [AccountView], d: &[u8], single: bool) -> Progra
             let ord = Order { id: 0, owner: [0; 32], price, qty: total, expiry_slot: expiry, band_bps: band, cid,
                 meta: k | (maker_rebate << 8) | (n_lv << 16), a1, a2: a2s, a3, lvl_left: lvl };
             if u.pos[pi].n_orders >= MAX_OPEN_ORDERS_PER_MARKET { return Err(err(E::Cap)); } // AUDIT M-2
+            let p0 = if k == KIND_PEG { peg_price(m.oracle_px, a1, a2, a3) } else { price };
+            if bid && p0 > mpx { adverse += mulf(total as i128, p0 - mpx); }
+            if !bid && p0 < mpx && k != KIND_SPLINE { adverse += mulf(total as i128, mpx - p0); }
             // LOAD-1: in a batch, a full bucket (64 orders) skips only this item (like ALO/FOK skips) instead of
             // failing the whole replace -- otherwise one crowded price bucket wipes every other quote and cancel in the tx.
             match insert(rest, pid, &mk, &uk, bid, ord, slot) {
@@ -1099,8 +1108,8 @@ fn batch(pid: &Address, a: &mut [AccountView], d: &[u8], single: bool) -> Progra
         let p = &u.pos[pi]; // per-account position limit (gross incl. resting orders)
         if m.max_position != 0 && core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs()) > m.max_position as i128 { return Err(err(E::Cap)); }
         let (eq, im, _) = health(pid, u, &a[2..], nw, true)?;
-        if eq < im { return Err(err(E::Margin)); }
-        if u.pos[pi].flags & POS_ISO != 0 { let (e2, i2, _) = iso_health(pid, u, pi, &a[2..], nw, true)?; if e2 < i2 { return Err(err(E::Margin)); } }
+        if eq - adverse < im { return Err(err(E::Margin)); }
+        if u.pos[pi].flags & POS_ISO != 0 { let (e2, i2, _) = iso_health(pid, u, pi, &a[2..], nw, true)?; if e2 - adverse < i2 { return Err(err(E::Margin)); } }
     }
     gc_pos(u);
     Ok(())
@@ -1187,17 +1196,17 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
     if twap {
         w.qty -= qty.min(w.qty); w.slices_left -= 1; w.next_slot = slot + tr.interval;
         if w.slices_left == 0 { w.kind = 0; }
-        t.cash = i64c(t.cash as i128 - tip as i128)?;
+        credit(t, pi, -(tip as i128))?;
         let (eq, im, _) = phealth(pid, t, pi, &a[3..], nw, true)?;
         if eq < im { return Err(err(E::Margin)); }
         // a TWAP slice adds risk like any order: same position and open-interest caps
         let p = &t.pos[pi];
-        if m.max_position != 0 && p.base.unsigned_abs() > m.max_position { return Err(err(E::Cap)); }
+        if m.max_position != 0 && core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs()) > m.max_position as i128 { return Err(err(E::Cap)); }
         if m.max_oi != 0 && m.oi_long as i128 + if bid { qty as i128 } else { 0 } > m.max_oi as i128 { return Err(err(E::Cap)); }
     } else {
         w.kind = 0;
         // TP/SL reduce: never leave bad debt (fills may include resting orders from shards the keeper passed)
-        t.cash = i64c(t.cash as i128 - tip as i128)?;
+        credit(t, pi, -(tip as i128))?;
         let (eq, _, _) = phealth(pid, t, pi, &a[3..], nw, false)?;
         if eq < 0 { return Err(err(E::Margin)); }
         let (ce, _, _) = health(pid, t, &a[3..], nw, false)?; if ce < 0 { return Err(err(E::Margin)); } // cross account too (tip)
@@ -1322,6 +1331,7 @@ fn update_oracle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if !prim && m.oracle2 == [0; 32] { return Ok(()); }
     if m.oracle2 != [0; 32] && (!prim || !a[2..].iter().any(|x| key(x) == m.oracle2)) { return Err(err(E::Oracle)); }
     let r1 = if prim { read_primary(pid, &a[1], &a[2..], &m.feed_id, m, clk.unix_timestamp) } else { Err(E::Oracle) };
+    if matches!(r1, Err(E::MissingShards)) { return Err(err(E::MissingShards)); } // every set member must be passed
     // oracle2 configured but not passed counts as unusable (the crank can't dodge the cross-check by omitting it)
     let r2 = if m.oracle2 != [0; 32] { Some(a[2..].iter().find(|x| key(x) == m.oracle2).map_or(Err(E::Oracle), |x| read_pyth(pid, x, &m.feed_id2, m, clk.unix_timestamp, m.oracle_ts))) } else { None };
     // oracle2: fallback when the primary is unusable; circuit breaker when both are valid but diverge
@@ -1526,8 +1536,9 @@ fn fast_bbo(sh: &[AccountView], pid: &Address, m: &Market, mk: &Key, slot: u64, 
     for fx in sh.iter().filter(|x| disc_of(x) == DISC_FAST) {
         let fk = key(fx);
         if fk != m.fast_book[0] && fk != m.fast_book[1] { return Err(err(E::BadAccount)); }
-        if fk == m.fast_book[1] && m.fast_book[0] == m.fast_book[1] && books > 0 { return Err(err(E::BadAccount)); }
-        books += 1;
+        let bit = if fk == m.fast_book[0] { 1 } else { 2 };
+        if books & bit != 0 || (m.fast_book[0] == m.fast_book[1] && books != 0) { return Err(err(E::BadAccount)); } // each book once
+        books |= bit;
         let f: &FastBook = load(fx, pid, DISC_FAST, FAST_SIZE)?;
         if f.market != *mk { return Err(err(E::BadAccount)); }
         let mut seen = 0u64;
@@ -1608,7 +1619,7 @@ fn read_primary(pid: &Address, x: &AccountView, rest: &[AccountView], feed: &Key
     let mut k = 0;
     for i in 0..n {
         let mk = &s[16 + 32 * i..48 + 32 * i];
-        let Some(acc) = rest.iter().find(|r| r.address().as_ref() == mk) else { return Err(E::Oracle) };
+        let Some(acc) = rest.iter().find(|r| r.address().as_ref() == mk) else { return Err(E::MissingShards) };
         if let Ok((p, c, t)) = read_pyth(pid, acc, feed, m, now, 0) { px[k] = p; cf[k] = c; pt[k] = t; k += 1; }
     }
     if k < q.max(1) { return Err(E::Oracle); }
@@ -1723,9 +1734,9 @@ fn liquidate_core(pid: &Address, a: &mut [AccountView], d: &[u8], vlt: bool) -> 
     if stale(m, nw) { return Err(err(E::Stale)); }
     let mkts = &a[3..];
     claim_all(pid, t, &tk, &a[5..])?;
-    complete_view(pid, t, &tk, mkts, None)?; maker_clear(pid, t, &tk, m, mkts)?;
     settle_funding_all(pid, t, mkts)?; settle_funding_all(pid, lq, mkts)?;
     let pi = t.pos.iter().position(|p| p.market == mk).ok_or(err(E::NotLiquidatable))?;
+    if t.pos[pi].flags & POS_ISO == 0 { maker_clear(pid, t, &tk, m, mkts)?; }
     let (eq, _, mm) = phealth(pid, t, pi, mkts, nw, true)?;
     // the vault steps in only once the book had its chance: equity under 2/3 of maintenance
     if eq >= (if vlt { mm * 2 / 3 } else { mm }) { return Err(err(E::NotLiquidatable)); }
@@ -1796,9 +1807,9 @@ fn liquidate_book(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     if stale(m, nw) { return Err(err(E::Stale)); }
     let mkts = &a[1..];
     claim_all(pid, t, &tk, &a[3..])?;
-    complete_view(pid, t, &tk, mkts, None)?; maker_clear(pid, t, &tk, m, mkts)?;
     settle_funding_all(pid, t, mkts)?;
     let pi = t.pos.iter().position(|p| p.market == mk).ok_or(err(E::NotLiquidatable))?;
+    if t.pos[pi].flags & POS_ISO == 0 { maker_clear(pid, t, &tk, m, mkts)?; }
     let (eq, _, mm) = phealth(pid, t, pi, mkts, nw, true)?;
     if eq >= mm { return Err(err(E::NotLiquidatable)); }
     cancel_all_of(&a[3..], pid, &mk, &tk, t, pi);
@@ -1960,10 +1971,13 @@ fn adl(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if stale(m, nw) { return Err(err(E::Stale)); }
     let (tk, mk) = (key(&a[0]), key(&a[1]));
     let mkts = &a[1..];
-    complete_view(pid, t, &tk, mkts, None)?; maker_clear(pid, t, &tk, m, mkts)?;
+    // fills sitting in the passed shards count, and the target's resting orders here are cancelled (a bankrupt account
+    // can't keep a live order as a free option); the shards holding them must be among the accounts
+    claim_all(pid, t, &tk, &a[4..])?;
     settle_funding_all(pid, t, mkts)?;
     let ti = t.pos.iter().position(|p| p.market == mk).ok_or(err(E::NotBankrupt))?;
-    // resting orders are cancelled by a liquidation first (ADL never leaves them live on a reset account)
+    if t.pos[ti].flags & POS_ISO == 0 { maker_clear(pid, t, &tk, m, mkts)?; }
+    cancel_all_of(&a[4..], pid, &mk, &tk, t, ti);
     if t.pos[ti].bid_open != 0 || t.pos[ti].ask_open != 0 || t.pos[ti].n_orders != 0 { return Err(err(E::MissingShards)); }
     let (eq, _, tmm) = phealth(pid, t, ti, mkts, nw, true)?;
     // AUDIT V6-1: a position marked ADL-eligible by liquidate_book (book empty within the widest band) may be
@@ -2721,9 +2735,9 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     if stale(m, nw) { return Err(err(E::Stale)); }
     let mkts = &a[1..];
     claim_all(pid, t, &tk, &a[4 + ns..])?;
-    complete_view(pid, t, &tk, mkts, None)?; maker_clear(pid, t, &tk, m, mkts)?;
     settle_funding_all(pid, t, mkts)?;
     let pi = t.pos.iter().position(|p| p.market == mk).ok_or(err(E::NotLiquidatable))?;
+    if t.pos[pi].flags & POS_ISO == 0 { maker_clear(pid, t, &tk, m, mkts)?; }
     let (eq, _, mm) = phealth(pid, t, pi, mkts, nw, true)?;
     if eq >= mm { return Err(err(E::NotLiquidatable)); }
     if t.pos[pi].bid_open != 0 || t.pos[pi].ask_open != 0 || t.pos[pi].n_orders != 0 { return Err(err(E::MissingShards)); }
@@ -2766,7 +2780,18 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
         // no fill opens ADL only when the book really is empty: it has makers (a spare empty book proves nothing), all were
         // passed (checked above), and fresh-only ladders are not merely switched off for want of a current signed price
         let px_fresh = f.fast_px != 0 && slot <= f.fast_slot + spec::FAST_PX_MAX_SLOTS;
-        if m.n_shards != 0 || f.n == 0 || unregistered || (f.px_signer != [0; 32] && !px_fresh) { return Err(err(E::NoFill)); }
+        if f.n == 0 || unregistered || (f.px_signer != [0; 32] && !px_fresh) { return Err(err(E::NoFill)); }
+        // a market with shards too: every opposite shard passed (after the slabs) and none holds an order inside the band
+        if m.n_side[if bid { SIDE_ASK } else { SIDE_BID } as usize] != 0 {
+            let side = if bid { SIDE_ASK } else { SIDE_BID };
+            if all_shards(pid, &a[4 + ns..], &mk, m, side).is_err() { return Err(err(E::NoFill)); }
+            for x in a[4 + ns..].iter() {
+                if disc_of(x) != DISC_SHARD || !x.owned_by(pid) { continue; }
+                let s: &Shard = unsafe { &*(x.borrow_unchecked().as_ptr() as *const Shard) };
+                if s.market != mk || s.side != side { continue; }
+                if s.orders[..s.n as usize].iter().any(|o| { let p = eff(o, side == SIDE_BID, m.oracle_px); p >= lo && p <= hi }) { return Err(err(E::NoFill)); }
+            }
+        }
         // a fresh-only ladder switched off only because the stored signed price is older than its own window is not "empty"
         let lad = ((f.idx as usize) << 1 | opp).min(SLAB_LADDERS - 1);
         for &(sp, _) in &sl[..cnt] {

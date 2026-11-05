@@ -360,7 +360,7 @@ fn liq_fast_try(e: &mut Env, f: &Address, t: &Address, slabs: &[Address]) -> boo
     let s = e.slot + 1; e.set_time(s); e.oracle_update("", 910_00000000, None);
     liq_fast(&mut e, &f, &tu, &[k.slab], false); // second maker not passed: NoFill
     assert_eq!(e.user_state(&tu).pos[0].flags & 2, 0);
-    let _ = e.shard(1, 100_000); // a book exists now: the fast book alone proves nothing
+    let _ = e.shard(0, 90_000); // an opposite (bid) shard exists now: the fast book alone proves nothing (it must be passed, empty)
     liq_fast(&mut e, &f, &tu, &[k.slab, k2.slab], false);
     assert_eq!(e.user_state(&tu).pos[0].flags & 2, 0);
     // a fake slab or a slab from another market is rejected
