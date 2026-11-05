@@ -177,3 +177,23 @@ fn snapshot(e: &mut Env) -> Vec<u8> { e.svm.get_account(&e.market).unwrap().data
     assert!(cu2 < 6_000, "IX 78 revert path used {cu2} CU");
     println!("IX78 usable={cu} revert={cu2}");
 }
+#[test] fn soft_update_reverts_a_partial_write() {
+    // the revert path that matters: funding / premium bookkeeping is written before the book scan, and the scan then fails
+    // (one shard of a two-shard market passed) -> IX 4 fails the tx, IX 78 lands with the market byte-identical
+    let (mut e, ks, ms) = set_env(); let ts = e.ts;
+    for i in 0..3 { let (k, a) = (&ks[i], ms[i]); assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000 + i as i64 * 100_000, ts), &[k]), None); }
+    let (s0, s1) = (e.shard(0, 0), e.shard(1, 0));
+    assert_eq!(upd(&mut e, &ms), None, "first full update");
+    let (m, o) = (e.market, e.oracle);
+    // time passes so the funding accrual has something to write; a fresh post keeps the set usable
+    let slot = e.slot + 50; e.set_time(slot); let ts2 = e.ts;
+    for i in 0..3 { let (k, a) = (&ks[i], ms[i]); assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1001_00000000 + i as i64 * 100_000, ts2), &[k]), None); }
+    let before = snapshot(&mut e);
+    let mut acc = vec![w(&m), r(&o)]; for x in &ms { acc.push(r(x)); } acc.push(r(&s0)); // s1 missing
+    assert!(try_send(&mut e, acc.clone(), vec![4], &[]).is_some(), "IX 4 with an incomplete book fails");
+    assert_eq!(try_send(&mut e, acc.clone(), vec![78], &[]), None, "IX 78 lands");
+    assert_eq!(snapshot(&mut e), before, "funding/premium writes made before the failing scan were rolled back");
+    acc.push(r(&s1));
+    assert_eq!(try_send(&mut e, acc, vec![78], &[]), None, "complete book: applies");
+    let after = e.market_state(); assert_eq!(after.oracle_px, 100_100); assert_ne!(snapshot(&mut e), before);
+}

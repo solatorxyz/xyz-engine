@@ -29,7 +29,12 @@ fn agg_env(keeper: &Keypair) -> Env {
     let evil = Keypair::new();
     assert_eq!(try_send(&mut e, vec![AccountMeta::new(evil.pubkey(), true), w(&o)], post(1_00000000, 1, ts + 1), &[&evil]), Some(BAD_ACCOUNT), "unauthorised updater");
     // replay / overtaken post (ts not newer): lands as a no-op, nothing applied (an out-of-order post must not sink its tx)
+    let agg_before = e.svm.get_account(&o).unwrap().data;
     assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&o)], post(1234_00000000, 1, ts), &[&k]), None, "non-increasing ts is a no-op");
+    assert_eq!(e.svm.get_account(&o).unwrap().data, agg_before, "AGG bytes untouched (price, counter, ext)");
+    let mut stale_ext = post(1234_00000000, 1, ts); stale_ext.extend_from_slice(&1234_00000000i64.to_le_bytes()); stale_ext.extend_from_slice(&ts.to_le_bytes());
+    assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&o)], stale_ext, &[&k]), None, "stale post with ext bytes: no-op");
+    assert_eq!(e.svm.get_account(&o).unwrap().data, agg_before, "ext not stored from a stale post");
     assert_eq!(try_send(&mut e, vec![w(&m), r(&o)], vec![4], &[]), None); assert_eq!(e.market_state().oracle_px, 100_000, "old post not applied");
     assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&o)], post(1234_00000000, 1, ts - 5), &[&k]), None, "older ts is a no-op");
     assert_eq!(try_send(&mut e, vec![w(&m), r(&o)], vec![4], &[]), None); assert_eq!(e.market_state().oracle_px, 100_000);
