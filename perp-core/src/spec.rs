@@ -322,6 +322,16 @@ pub const IX_TAKE_FAST_BATCH: u64 = 72;
 pub const QUOTE_MAX_AGE_SLOTS: u32 = 30;
 pub const QUOTE_BAND_BPS: u64 = 500;
 pub const QUOTE_ITEM_SIZE: usize = 10;
+/// Grow a slab / fast book made before the ladder settings to the current size.
+pub const IX_SLAB_GROW: u64 = 73;
+/// In a pegged ladder (LADDER_PEG) a level's price is oracle + px - QUOTE_PEG_BIAS (price units).
+pub const QUOTE_PEG_BIAS: u32 = 1 << 31;
+pub const LADDER_PEG: u16 = 1;
+/// slab_quote items with idx = QUOTE_ITEM_REF | ladder set (oracle price quoted against = px, tolerance bps = qty);
+/// idx = QUOTE_ITEM_INV | ladder set the inventory cap in lots (px; 0 = none) and the ladder flags (qty: LADDER_PEG).
+/// ladder = market idx << 1 | side. Settings items go before the quote items.
+pub const QUOTE_ITEM_REF: u16 = 0x8000;
+pub const QUOTE_ITEM_INV: u16 = 0xC000;
 pub const IX_SET_SESSION: u64 = 68;
 pub const IX_MARKET_CFG: u64 = 69;
 pub const IX_VAULT_INIT: u64 = 50;

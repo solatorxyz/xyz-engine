@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"]
 cuprof = []
 
 [dependencies]
-pinocchio = { version = "0.12", default-features = false, features = ["cpi"] }
+pinocchio = { version = "0.12", default-features = false, features = ["cpi", "account-resize"] }
 pinocchio-token = { version = "0.8", default-features = false }
 
 [target.'cfg(not(target_os = "solana"))'.dependencies]

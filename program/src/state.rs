@@ -164,9 +164,17 @@ pub const FAST_MAKERS: usize = 8;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Quote { pub px: u32, pub qty: u32, pub gen: u32, pub slot: u32 }
+pub const SLAB_LADDERS: usize = SLAB_QUOTES / SLAB_LEVELS;
+/// A maker's protection for one ladder (market, side). ref_px / tol_bps: the ladder stops filling once the oracle is more than
+/// tol_bps away from the oracle price the maker quoted against (0 = off). inv_max: the ladder stops filling once the maker's
+/// inventory in this market would pass inv_max lots long (bid ladder) or short (ask ladder) (0 = off). flags: spec::LADDER_PEG.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Ladder { pub ref_px: u32, pub tol_bps: u16, pub flags: u16, pub inv_max: u32, pub _r1: u32 }
 /// A maker's quotes for every market: written by the maker alone, read by takers. Index = market idx << 4 | side << 3 | level.
 #[repr(C)]
-pub struct Slab { pub disc: u64, pub authority: Key, pub user: Key, pub gen: u64, pub count: u64, pub kill: u64, pub quotes: [Quote; SLAB_QUOTES] }
+pub struct Slab { pub disc: u64, pub authority: Key, pub user: Key, pub gen: u64, pub count: u64, pub kill: u64, pub quotes: [Quote; SLAB_QUOTES],
+    pub lad: [Ladder; SLAB_LADDERS] }
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Used { pub gen: u32, pub qty: u32 }
@@ -175,13 +183,19 @@ pub struct Used { pub gen: u32, pub qty: u32 }
 #[derive(Clone, Copy)]
 /// target > 0: auto mode, settle moves margin toward target from free collateral and hands it back when the account needs it.
 pub struct FastMaker { pub slab: Key, pub user: Key, pub margin: i64, pub budget: i64, pub base: i64, pub quote: i64, pub volume: u64, pub target: i64 }
+/// Copied from the maker's User at every settle / fund: its position in this market (inventory = inv0 + unsettled base) and
+/// its maker rebate in bps.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MakerExt { pub inv0: i64, pub rebate_bps: u64 }
 /// Per-market fill state: takers write here, so quotes and fills never contend on a write lock.
 #[repr(C)]
 pub struct FastBook { pub disc: u64, pub market: Key, pub idx: u64, pub n: u64, pub oi_long_delta: i64, pub fee_accum: i64, pub fills: u64,
     pub makers: [FastMaker; FAST_MAKERS], pub used: [[Used; 2 * SLAB_LEVELS]; FAST_MAKERS],
     /// 0 = both sides; 1 = makers' bids only (sellers write here); 2 = makers' asks only (buyers write here).
     /// A split market has one book per side, so buys and sells never contend for the same write lock.
-    pub side: u64 }
+    pub side: u64,
+    pub ext: [MakerExt; FAST_MAKERS] }
 pub const SLAB_SIZE: usize = core::mem::size_of::<Slab>();
 pub const FAST_SIZE: usize = core::mem::size_of::<FastBook>();
 

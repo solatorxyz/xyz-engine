@@ -20,6 +20,7 @@ Makers quote into their own `Slab`. Takers fill against slabs through one per-ma
 | 65 | slab_settle | permissionless; moves fills into the maker's User, refills budget. Auto mode tops up or hands margin back. Below maintenance returns all margin |
 | 66 | take_fast | IOC; best price across slabs and, if shards are passed, resting orders. 2,235 CU for 1 fill on 1 maker, 3,882 on 8 makers, 6,264 for 5 fills on 8 makers |
 | 67 | slab_kill | maker's stop switch |
+| 73 | slab_grow | grows a slab / fast book made by an earlier version to the current size (new settings zeroed = off); pay the extra rent into the account first |
 | 72 | take_fast_batch | many takers in one tx, signed once by a relayer holding their session delegates; bad orders are skipped. About 2,056 CU per taker at 10 |
 | 70 | liquidate_fast | 25% chunk against maker quotes; same price window as a take; fee to insurance; empty fast book with every maker passed and no shards opens the ADL window |
 
@@ -108,3 +109,35 @@ Kani proofs for the split multiply, fee rounding, booking once and fill conserva
 
 Latency: `sidecar` tpu_relay (127.0.0.1:8897) sends transactions straight to the upcoming leaders over QUIC and forwards
 reads to the RPC proxy. Oracle send to land went 2.5 s -> 0.7 s on devnet. lat_probe2 measures requotes and takes on one websocket.
+
+## Maker protection (2026-11-05, on devnet 7AY437)
+For market makers: quotes that follow the oracle without a requote, a self-pull when the oracle runs away, a hard inventory cap,
+and a rebate. All settings are per ladder (market, side), written by the maker in slab_quote and read by takes; nothing here
+touches a shared account on the quote path.
+- **Settings items** go first in a slab_quote, before the quote items. `idx = 0xC000 | ladder` sets the inventory cap (px, lots,
+  0 = none) and flags (qty: 1 = pegged). `idx = 0x8000 | ladder` sets the price quoted against (px) and a tolerance in bps (qty,
+  0 = off). ladder = market idx << 1 | side (0 bid, 1 ask). SDK: `ladder_items()` / `ladderItems()`.
+- **Pegged ladder:** each level's px is an offset, price = oracle + px - 2^31. When the oracle updates, every pegged quote moves
+  with it; the maker sends nothing. Ladders stay best-first on the raw offsets.
+- **Tolerance:** the ladder stops filling once |oracle - ref| > tol_bps of ref. Fixed-price makers send ref with each requote.
+- **Inventory cap:** the ladder stops at inv_max lots of inventory on its side (bids: long, asks: short). Inventory = position at
+  the maker's last settle (copied into the book as `ext[i].inv0`) + unsettled fast fills. Trades elsewhere count from the next settle.
+- **Rebate:** the maker's tier rebate (TIERS[tier].1 bps, copied at each settle / fund into `ext[i].rebate_bps`) is paid per fill
+  out of the book's fees, never above the taker fee. Liquidation fills pay no rebate.
+- **Self-settle:** slab_settle is permissionless; fast_mm `settle_s N` settles its own fills every N s, so it never waits on a keeper.
+- fast_mm config: `peg 1`, `tol_bps N`, `inv_cap N`, `settle_s N`.
+
+Layout: Slab 32,864 -> 36,960 (Ladder[256] appended), FastBook 2,008 -> 2,136 (MakerExt[8] appended). Older accounts keep working
+after slab_grow (devnet: 50 books and 2 slabs grown, 0.076 SOL). The devnet books were 2,000 bytes (made before the split-side
+field), so takes on 7AY437 failed with BadAccount until they were grown.
+
+| CU (LiteSVM) | before | with protection |
+|---|---|---|
+| slab_quote, 95 items | 3,018 | 3,004 |
+| take, 1 maker, 1 fill | 2,235 | 2,315 |
+| take, 8 makers, 5 fills | 6,264 | 6,765 |
+| batch of 10, per taker | 2,056 | 2,116 |
+
+Devnet latency through our own RPC node (Tokyo, non-voting agave 4.3.2; 60 samples each, all landed):
+requote processed p50 0.097 s / p95 0.46 s, confirmed p50 0.15 s / p95 0.87 s; take processed p50 0.073 s / p95 0.45 s,
+confirmed p50 0.087 s / p95 0.85 s.

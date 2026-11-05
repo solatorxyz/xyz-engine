@@ -919,3 +919,115 @@ fn batch_ix(e: &Env, f: &Address, slabs: &[Address], takers: &[(Address, Address
     }
     println!("{rounds} rounds: batch == sequential");
 }
+
+// ---------- maker protection (2026-11-05) ----------
+fn peg(off: i64) -> u32 { (off + (1i64 << 31)) as u32 }
+const ASK_LAD: u16 = 1; // ladder of idx 0, ask side
+fn later(e: &mut Env, slots: u64) { let s = e.slot + slots; e.set_time(s); }
+
+#[test] fn pegged_quotes_follow_the_oracle() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000);
+    // both ladders pegged; an ask 10 above the oracle and a bid 10 below, written once
+    quote(&mut e, &k, &[(0xC000, 0, 1), (0xC000 | ASK_LAD, 0, 1), (ASK, peg(10), 100), (0, peg(-10), 100)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 40, true);
+    assert_eq!(fb(&e, &f).makers[0].quote, 100_010 * 40);
+    later(&mut e, 3); e.oracle_update("", 1010_00000000, None);
+    // the maker sent nothing, its quotes moved with the oracle
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, 101_000 + 100, 40, true);
+    assert_eq!(fb(&e, &f).makers[0].quote, 100_010 * 40 + 101_010 * 40);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 1, 101_000 - 100, 30, true);
+    let b = fb(&e, &f);
+    assert_eq!((b.makers[0].quote, b.makers[0].base), (100_010 * 40 + 101_010 * 40 - 100_990 * 30, -50));
+    // a taker limit is still a limit: nothing at oracle + 10 when the buyer stops at oracle + 5
+    let t0 = e.user_state(&tu).pos[0].base;
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, 101_005, 10, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, t0);
+    // a pegged ladder is best-first like any other
+    quote(&mut e, &k, &[(ASK, peg(20), 1), (ASK + 1, peg(10), 1)], false);
+    quote(&mut e, &k, &[(ASK, peg(10), 1), (ASK + 1, peg(20), 1)], true);
+    // back to fixed prices in the same instruction
+    quote(&mut e, &k, &[(0xC000 | ASK_LAD, 0, 0), (ASK, 101_030, 5), (ASK + 1, 0, 0)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, 101_100, 5, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, t0 + 5);
+    assert_eq!(fb(&e, &f).makers[0].quote, 100_010 * 40 + 101_010 * 40 - 100_990 * 30 + 101_030 * 5);
+}
+#[test] fn a_ladder_stops_when_the_oracle_moves_past_the_makers_tolerance() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000);
+    // fixed asks, quoted against oracle 100_000, good for 50 bps of oracle move
+    quote(&mut e, &k, &[(0x8000 | ASK_LAD, 100_000, 50), (ASK, 100_400, 100), (0, 99_600, 100)], true);
+    later(&mut e, 3); e.oracle_update("", 1006_00000000, None); // +60 bps
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, 101_200, 10, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 0, "past the tolerance: the ask ladder doesn't fill");
+    // the bid ladder has no tolerance set and still fills
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 1, 99_000, 5, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, -5);
+    later(&mut e, 3); e.oracle_update("", 1003_00000000, None); // +30 bps: inside again
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, 101_200, 10, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 5);
+    // a requote moves the reference
+    quote(&mut e, &k, &[(0x8000 | ASK_LAD, 100_600, 50)], true);
+    later(&mut e, 3); e.oracle_update("", 1006_00000000, None);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, 101_200, 10, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 15);
+    // tolerance is a u16 of bps; unknown setting items fail
+    quote(&mut e, &k, &[(0x8000 | ASK_LAD, 100_000, 70_000)], false);
+    quote(&mut e, &k, &[(0x8000 | 0x3fff, 100_000, 1)], false);
+}
+#[test] fn inventory_cap_stops_a_ladder_at_the_makers_limit() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000);
+    // at most 150 lots short through the ask ladder
+    quote(&mut e, &k, &[(0xC000 | ASK_LAD, 150, 0), (ASK, 100_010, 500), (0, 99_990, 500)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 400, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 150);
+    // settled fills still count
+    settle(&mut e, &f, &k);
+    assert_eq!(fb(&e, &f).ext[0].inv0, -150);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 100, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 150);
+    // buying back through the bid frees room on the ask
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 1, PX - 100, 50, true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 100, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 150);
+    assert_eq!(fb(&e, &f).makers[0].base, 0, "-150 settled, +50 then -50 since");
+    // off again
+    quote(&mut e, &k, &[(0xC000 | ASK_LAD, 0, 0)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 100, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 250);
+}
+#[test] fn maker_rebate_comes_out_of_the_book_fees() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000);
+    let (a, m) = (e.admin.pubkey(), e.market);
+    e.send("", vec![AccountMeta::new(a, true), r(&m), w(&k.u)], vec![23, 1], &[], true); // maker tier 1: 2 bps rebate
+    settle(&mut e, &f, &k); // the book takes the tier from the maker's next settle
+    assert_eq!(fb(&e, &f).ext[0].rebate_bps, 2);
+    quote(&mut e, &k, &[(ASK, 100_010, 100)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 100, true);
+    let nt = 100_010i64 * 100; let (fee, reb) = ((nt + 1999) / 2000, nt * 2 / 10_000);
+    let b = fb(&e, &f); assert_eq!((b.makers[0].quote, b.fee_accum), (nt + reb, fee - reb));
+    settle(&mut e, &f, &k);
+    let (u, t, b2) = (e.user_state(&k.u), e.user_state(&tu), fb(&e, &f));
+    assert_eq!(u.cash as i128 + t.cash as i128 + b2.makers[0].margin as i128 + b2.fee_accum as i128, e.vault_amount() as i128, "nothing created or lost");
+}
+#[test] fn old_slabs_and_books_grow_in_place() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    // cut both back to the sizes the earlier program made, keeping their contents
+    for (key, old) in [(k.slab, SLAB_SIZE - 16 * SLAB_LADDERS), (f, FAST_SIZE - 16 * FAST_MAKERS)] {
+        let mut acc = e.svm.get_account(&key).unwrap(); acc.data.truncate(old); e.svm.set_account(key, acc).unwrap();
+    }
+    let (tp, tu) = e.user(10_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100)], false);
+    e.send("", vec![w(&k.slab)], vec![73], &[], true);
+    e.send("", vec![w(&f)], vec![73], &[], true);
+    e.send("", vec![w(&f)], vec![73], &[], true); // already current
+    assert_eq!((e.data(&k.slab).len(), e.data(&f).len()), (SLAB_SIZE, FAST_SIZE));
+    assert_eq!(fb(&e, &f).makers[0].margin, 1_000_000_000, "contents kept");
+    quote(&mut e, &k, &[(ASK, 100_010, 100)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 10, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 10);
+    let x = Address::new_unique(); e.prog_acct(x, 100);
+    e.send("", vec![w(&x)], vec![73], &[], false);
+}
