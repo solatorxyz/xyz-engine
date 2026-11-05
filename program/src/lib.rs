@@ -128,6 +128,7 @@ fn emit(parts: &[&[u8]]) {
 pub const IX_AGG_INIT: u64 = 40;
 pub const IX_AGG_POST: u64 = 41;
 pub const IX_SET_DELEGATE: u64 = 42;
+pub const IX_OSET_INIT: u64 = 43;
 /// accs: authority(s), agg(w, program-owned, AGG_SIZE, zeroed). data: tag, feed_id[32], expo i32, max_jump_bps u64
 fn agg_init(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if a.len() < 2 || !a[0].is_signer() || d.len() != 45 { return Err(err(E::BadData)); }
@@ -229,6 +230,7 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
         IX_AGG_INIT => agg_init(pid, accs, data),
         IX_AGG_POST => agg_post(pid, accs, data),
         IX_SET_DELEGATE => set_delegate(pid, accs, data),
+        IX_OSET_INIT => oset_init(pid, accs, data),
         _ => match tag {
             IX_INIT_MARKET => init_market(pid, accs, data),
             IX_INIT_SHARD => init_shard(pid, accs, data),
@@ -1124,7 +1126,7 @@ fn admin_propose(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResul
     let m: &mut Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
     if !auth(pid, &m.admin, a) { return Err(err(E::BadAccount)); }
     let op = d[1] as u64;
-    if !(op == 0 || (spec::ADMIN_IMR..=spec::ADMIN_ORACLE2).contains(&op)) || op == spec::ADMIN_MAX_POSITION { return Err(err(E::BadData)); }
+    if !(op == 0 || (spec::ADMIN_IMR..=spec::ADMIN_ORACLE).contains(&op)) || op == spec::ADMIN_MAX_POSITION { return Err(err(E::BadData)); }
     let pv = rd64(d, 2)?;
     if m.pool != [0; 32] && match op { spec::ADMIN_IMR => pv < IMR_BPS, spec::ADMIN_MMR => pv < MMR_BPS, spec::ADMIN_SET_ADMIN => true, _ => false } {
         return Err(err(E::Cap)); // AUDIT V5-4 (also re-checked at execute)
@@ -1155,6 +1157,7 @@ fn admin_execute(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
         spec::ADMIN_SET_ADMIN => { if m.pending_key == [0; 32] { return Err(err(E::BadData)); } m.admin = m.pending_key }
         spec::ADMIN_FUNDING_PERIOD => { if v == 0 { return Err(err(E::BadData)); } m.funding_period = v }
         spec::ADMIN_ORACLE2 => { m.oracle2 = m.pending_key }
+        spec::ADMIN_ORACLE => { if m.pending_key == [0; 32] { return Err(err(E::BadData)); } m.oracle = m.pending_key }
         _ => return Err(err(E::BadData)),
     }
     m.pending_op = 0; m.pending_eta = 0;
@@ -1191,9 +1194,9 @@ fn update_oracle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if a.len() < 2 { return Err(err(E::BadData)); }
     let m: &mut Market = load(&a[0], pid, DISC_MARKET, MARKET_SIZE)?;
     let clk = clock()?;
-    let r1 = if m.oracle == key(&a[1]) { read_pyth(pid, &a[1], &m.feed_id, m, clk.unix_timestamp) } else { Err(E::Oracle) };
+    let r1 = if m.oracle == key(&a[1]) { read_primary(pid, &a[1], &a[2..], &m.feed_id, m, clk.unix_timestamp) } else { Err(E::Oracle) };
     // oracle2 configured but not passed counts as unusable (the crank can't dodge the cross-check by omitting it)
-    let r2 = if m.oracle2 != [0; 32] { Some(a[2..].iter().find(|x| key(x) == m.oracle2).map_or(Err(E::Oracle), |x| read_pyth(pid, x, &m.feed_id2, m, clk.unix_timestamp))) } else { None };
+    let r2 = if m.oracle2 != [0; 32] { Some(a[2..].iter().find(|x| key(x) == m.oracle2).map_or(Err(E::Oracle), |x| read_pyth(pid, x, &m.feed_id2, m, clk.unix_timestamp, m.oracle_ts))) } else { None };
     // oracle2: fallback when the primary is unusable; circuit breaker when both are valid but diverge
     // AUDIT V5-5: hysteresis (trip > MAX_DIVERGENCE, auto-resume only <= RESUME) and a move check whenever
     // only one source is usable while oracle2 is configured. Manual resume: admin ADMIN_PAUSE 0 (re-trips if
@@ -1398,7 +1401,50 @@ fn fast_bbo(sh: &[AccountView], pid: &Address, mk: &Key, slot: u64, px: u64) -> 
     Ok((bb, ba))
 }
 /// PriceUpdateV2: disc8 | write_authority32 | verification_level (1 = Full) | feed_id32 | price i64 | conf u64 | expo i32 | publish_time i64 | ...
-fn read_pyth(pid: &Address, x: &AccountView, feed: &Key, m: &Market, now: i64) -> Result<(u64, u64, i64), E> {
+/// accs: creator(s), set(w, program-owned, OSET_SIZE, zeroed). data: tag, quorum u8, n u8, n x member key[32].
+/// Members must be distinct; quorum > n/2 so two disjoint halves can never both price. The set is only used once the market
+/// admin points the market's oracle at it (timelocked oracle change), so its creator gains nothing.
+fn oset_init(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 2 || !a[0].is_signer() || d.len() < 3 { return Err(err(E::BadData)); }
+    let (q, n) = (d[1] as usize, d[2] as usize);
+    if n == 0 || n > OSET_MAX || q == 0 || q > n || q * 2 <= n || d.len() != 3 + 32 * n { return Err(err(E::BadData)); }
+    if !a[1].owned_by(pid) || !a[1].is_writable() || a[1].data_len() < OSET_SIZE { return Err(err(E::BadAccount)); }
+    let p = unsafe { a[1].borrow_unchecked_mut() };
+    if p[0..8] != [0u8; 8] { return Err(err(E::BadAccount)); }
+    for i in 0..n { for j in 0..i { if d[3 + 32 * i..35 + 32 * i] == d[3 + 32 * j..35 + 32 * j] { return Err(err(E::BadData)); } } }
+    p[0..8].copy_from_slice(&OSET_DISC); p[8] = n as u8; p[9] = q as u8;
+    p[16..16 + 32 * n].copy_from_slice(&d[3..]);
+    Ok(())
+}
+/// Primary oracle: a single AGG / Pyth account, or an OracleSet whose members must all be passed among `rest`. Each member is read
+/// like a single AGG (fresh, same feed, conf within limit; no per-member replay rule), at least `quorum` usable; price = median
+/// (mean of the middle pair for an even count), conf = max(median conf, median |p - median|), publish time = median, which must
+/// not be older than the last applied one. Members that disagree widen conf past max_conf_bps -> unusable.
+fn read_primary(pid: &Address, x: &AccountView, rest: &[AccountView], feed: &Key, m: &Market, now: i64) -> Result<(u64, u64, i64), E> {
+    if !(x.owned_by(pid) && x.data_len() >= OSET_SIZE && unsafe { x.borrow_unchecked() }[0..8] == OSET_DISC) {
+        return read_pyth(pid, x, feed, m, now, m.oracle_ts);
+    }
+    let s = unsafe { x.borrow_unchecked() };
+    let (n, q) = ((s[8] as usize).min(OSET_MAX), s[9] as usize);
+    let (mut px, mut cf, mut pt) = ([0u64; OSET_MAX], [0u64; OSET_MAX], [0i64; OSET_MAX]);
+    let mut k = 0;
+    for i in 0..n {
+        let mk = &s[16 + 32 * i..48 + 32 * i];
+        let Some(acc) = rest.iter().find(|r| r.address().as_ref() == mk) else { return Err(E::Oracle) };
+        if let Ok((p, c, t)) = read_pyth(pid, acc, feed, m, now, 0) { px[k] = p; cf[k] = c; pt[k] = t; k += 1; }
+    }
+    if k < q.max(1) { return Err(E::Oracle); }
+    fn isort<T: Copy + PartialOrd>(v: &mut [T]) { for i in 1..v.len() { let x = v[i]; let mut j = i; while j > 0 && v[j - 1] > x { v[j] = v[j - 1]; j -= 1; } v[j] = x; } }
+    let med_u = |v: &mut [u64]| { isort(v); let n = v.len(); if n % 2 == 1 { v[n / 2] } else { v[n / 2 - 1] / 2 + v[n / 2] / 2 + (v[n / 2 - 1] % 2 + v[n / 2] % 2) / 2 } };
+    let mut ps = px; let med = med_u(&mut ps[..k]);
+    let mut dev = [0u64; OSET_MAX]; for i in 0..k { dev[i] = px[i].abs_diff(med); }
+    let conf = med_u(&mut cf[..k]).max(med_u(&mut dev[..k]));
+    let mut ts = pt; isort(&mut ts[..k]); let t = ts[(k - 1) / 2];
+    if t < m.oracle_ts { return Err(E::Stale); }
+    if (conf as u128) * 10000 > (med as u128) * m.max_conf_bps as u128 { return Err(E::Oracle); }
+    Ok((med, conf, t))
+}
+fn read_pyth(pid: &Address, x: &AccountView, feed: &Key, m: &Market, now: i64, floor: i64) -> Result<(u64, u64, i64), E> {
     if x.data_len() < 133 { return Err(E::Oracle); }
     let p = unsafe { x.borrow_unchecked() };
     let ok = (x.owned_by(&PYTH_RECEIVER) && p[0..8] == PYTH_PRICE_UPDATE_DISC) || (x.owned_by(pid) && p[0..8] == AGG_DISC);
@@ -1409,7 +1455,7 @@ fn read_pyth(pid: &Address, x: &AccountView, feed: &Key, m: &Market, now: i64) -
     let pt = r(93) as i64;
     if price <= 0 || expo != m.expo { return Err(E::Oracle); }
     if now - pt > m.max_age_secs as i64 { return Err(E::Stale); }
-    if pt < m.oracle_ts { return Err(E::Stale); } // AUDIT L-4: no replay of an older update
+    if pt < floor { return Err(E::Stale); } // AUDIT L-4: no replay of an older update (floor = last applied publish time)
     if (conf as u128) * 10000 > (price as u128) * m.max_conf_bps as u128 { return Err(E::Oracle); }
     // CU: native u64 division for the common px_mul == 1 config (same result: both operands positive)
     let (px, conf_px) = if m.px_mul == 1 && m.px_div > 0 { (price as u64 / m.px_div as u64, conf / m.px_div as u64) } else {

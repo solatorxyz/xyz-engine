@@ -151,6 +151,11 @@ pub const MARKET_ORACLE_SLOT_OFF: usize = core::mem::offset_of!(Market, oracle_s
 /// 81 conf u64, 89 expo i32, 93 publish_time i64, 101 prev_publish_time, 109 max_jump_bps, 117 n_sources, 125 posts.
 pub const AGG_DISC: [u8; 8] = *b"PERPAGG\x01";
 pub const AGG_SIZE: usize = 160;
+/// Multi-publisher oracle: up to OSET_MAX AGG accounts (one per independent publisher) for one feed. Layout: disc[8],
+/// n u8, quorum u8, pad[6], members [Key; OSET_MAX]. A market whose oracle is an OracleSet prices at the members' median.
+pub const OSET_DISC: [u8; 8] = *b"PERPOSET";
+pub const OSET_MAX: usize = 8;
+pub const OSET_SIZE: usize = 16 + 32 * OSET_MAX;
 pub const DISC_DELEGATE: u64 = 0x5045525044454c01; // "PERPDEL\x01"
 /// Session key / one-click trading: `delegate` may place and cancel orders for `user` until `expiry_slot`,
 /// each order qty <= `max_qty`. It can never withdraw, transfer, change margin mode or set triggers (those stay authority-only).
