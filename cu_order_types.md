@@ -10,18 +10,18 @@
 | spline: replace by cid (cancel 2 + place 2 ladders) | 3427 |
 | spline: cancel 2 ladders by cid | 1198 |
 | taker IOC sweep 5 discrete levels (3 shards) | 6955 |
-| taker IOC sweep 5 spline levels (1 shard) | 7308 |
+| taker IOC sweep 5 spline levels (1 shard) | 7318 |
 | place oracle-peg ask (offset +15, min/max band) | 1721 |
-| taker IOC vs peg (lazy reprice) | 2867 |
+| taker IOC vs peg (lazy reprice) | 2873 |
 | ALO crossing (skipped, tx ok) | 1488 |
 | ALO slide (re-priced to best ask - 1 tick) | 1666 |
-| FOK unfilled in batch (skipped, rest of batch runs) | 3373 |
-| FOK filled | 3113 |
-| STP decrement (no fill, both reduced) | 2240 |
-| STP cancel-newest (taker dropped) | 2101 |
+| FOK unfilled in batch (skipped, rest of batch runs) | 3379 |
+| FOK filled | 3119 |
+| STP decrement (no fill, both reduced) | 2244 |
+| STP cancel-newest (taker dropped) | 2107 |
 | set_trigger SL (reduce-only) | 321 |
-| exec SL trigger (keeper crank, IOC reduce-only) | 6554 |
-| exec TWAP slice (1/3, sell 10) | 4567 |
+| exec SL trigger (keeper crank, IOC reduce-only) | 6555 |
+| exec TWAP slice (1/3, sell 10) | 4569 |
 | admin pause | 152 |
 | paused: reduce-only allowed | 1062 |
 | deposit under TVL cap (cap check + CPI) | 1388 |

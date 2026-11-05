@@ -25,6 +25,7 @@ pub struct Market {
     /// Long open interest, aggregated LAZILY from shard counters (not written per trade).
     pub oi_long: u64, pub max_oi: u64, pub fees: i64,
     /// admin: 1 = paused (no new risk/deposits; cancels, reduce-only, withdraw, liquidation still work)
+    /// event_seq: slot of the last book sample (mark EMA weight); the name is kept for the layout
     pub paused: u64, pub tvl_cap: u64, pub event_seq: u64,
     /// AUDIT L-4: Pyth publish_time of the stored price (freshness checked at use time, monotonic updates)
     pub oracle_ts: i64,

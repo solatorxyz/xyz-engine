@@ -1474,7 +1474,9 @@ fn update_oracle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
         let mid = match (best_b, best_a) { (Some(b), Some(a)) => Some((b + a) / 2), _ => None };
         // 5) mark = clamp(median(oracle, oracle + EMA(mid - oracle), mid), oracle +- MARK_CLAMP_BPS)
         //    with a fresh external perp price: median(oracle + EMA, mid, external)
-        let (e, mp) = mark_from(px, m.mark_ema as i128, ds, mid, ext); m.mark_ema = i64c(e)?; m.mark_px = mp;
+        // EMA weight: slots since the last book sample (event_seq holds its slot; 0 = none yet, then the update gap)
+        let dsm = if m.event_seq == 0 { ds } else { slot.saturating_sub(m.event_seq) }; m.event_seq = slot;
+        let (e, mp) = mark_from(px, m.mark_ema as i128, dsm, mid, ext); m.mark_ema = i64c(e)?; m.mark_px = mp;
     } else {
         let (_, mp) = mark_from(px, m.mark_ema as i128, 0, Some((px as i128 + m.mark_ema as i128).max(1) as u64), ext); m.mark_px = mp;
     }
@@ -2037,14 +2039,13 @@ fn adl(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     // AUDIT N-4: every candidate passed by the caller is re-scored now (fresh ranking at use time)
     // Entries that can't be used (the target itself, non-user / foreign accounts) are evicted here too, so after
     // this loop every passed account is freshly scored and the walk needs no second health pass (CU).
-    let mut unev = [[0u8; 32]; 8]; let mut nu = 0usize;
     for ca in a[4..].iter() {
         let ck = key(ca);
         if ck == tk { rank_remove(r, side, &ck); continue; }
         let Ok(c) = load::<User>(ca, pid, DISC_USER, USER_SIZE) else { continue };
         if home(c, m).is_err() { rank_remove(r, side, &ck); continue; }
         // its other markets not passed: it can't be re-scored here, so it keeps its place (refused below if it is the top)
-        if settle_funding_all(pid, c, mkts).is_err() { if nu < 8 { unev[nu] = ck; nu += 1; } continue; }
+        if settle_funding_all(pid, c, mkts).is_err() { continue; }
         rank_remove(r, side, &ck);
         if let Some(ci) = c.pos.iter().position(|p| p.market == mk && ((p.base > 0) == (side == 0)) && p.base != 0) {
             let (ce, _, _) = phealth(pid, c, ci, mkts, nw, false)?;
@@ -2053,11 +2054,15 @@ fn adl(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     }
     if rank_n(r, side) == 0 { return Err(err(E::Rank)); }
     let ck = r.entries[side * RANK_N].user;
-    if unev[..nu].contains(&ck) { return Err(err(E::Rank)); } // the top counterparty must be evaluated, never skipped
+
     let ca = a[4..].iter().find(|x| key(x) == ck).ok_or(err(E::Rank))?; // top entry must be passed (and was just re-scored)
     let c: &mut User = load(ca, pid, DISC_USER, USER_SIZE)?;
+    // the top entry must have been re-scored in this call (its markets passed; settling again is a no-op then) and must hold
+    // the opposite side now: an entry that couldn't be evaluated keeps its rank and blocks, it is never skipped or trusted
+    if home(c, m).is_err() || settle_funding_all(pid, c, mkts).is_err() { return Err(err(E::Rank)); }
     let ci = c.pos.iter().position(|p| p.market == mk).ok_or(err(E::Rank))?;
     let cb = c.pos[ci].base;
+    if cb == 0 || (cb > 0) != (side == 0) { return Err(err(E::Rank)); }
     let q = tb.unsigned_abs().min(cb.unsigned_abs()) as i64;
     // the target's deficit belongs to its whole position: this step carries only the closed lots' share of it
     let share = |d: i128| -> i128 { (d * q as i128 + tb.unsigned_abs() as i128 - 1) / tb.unsigned_abs() as i128 };
@@ -2811,19 +2816,28 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     // a market with shards too: every opposite shard is passed (after the slabs) and its resting orders inside the band fill
     // first, so the liquidator can't route around better resting liquidity to maker quotes it prefers
     let sside = if bid { SIDE_ASK } else { SIDE_BID };
-    let mut in_shards = 0i64; let mut shard_fill = 0u64;
-    if m.n_side[sside as usize] != 0 {
-        all_shards(pid, &a[4 + ns..], &mk, m, sside)?;
-        let taker_bps = TIERS[(t.tier as usize).min(TIERS.len() - 1)].0;
+    let hybrid = m.n_side[sside as usize] != 0;
+    if hybrid { all_shards(pid, &a[4 + ns..], &mk, m, sside)?; }
+    let taker_bps = TIERS[(t.tier as usize).min(TIERS.len() - 1)].0;
+    let mut in_shards = 0i64; let mut shard_fill = 0u64; let mut step = 0u64;
+    // resting orders and maker quotes fill best price first: before each maker level, the shards' orders strictly better than it
+    let mut shard_take = |t: &mut User, lim: u64, left: u64| -> Result<(u64, i128), ProgramError> {
         let lb = long(t.pos[pi].base);
-        let tf = take(pid, &a[4 + ns..], &mk, m, t, &tk, pi, bid, if bid { hi } else { lo }, left, slot, taker_bps, STP_CANCEL_OLDEST)?;
-        in_shards = long(t.pos[pi].base) - lb; shard_fill = tf.filled;
-        left -= tf.filled; filled += tf.filled; notional += tf.notional;
-    }
+        let tf = take(pid, &a[4 + ns..], &mk, m, t, &tk, pi, bid, lim, left, slot, taker_bps, STP_CANCEL_OLDEST)?;
+        in_shards += long(t.pos[pi].base) - lb; shard_fill += tf.filled;
+        Ok((tf.filled, tf.notional))
+    };
     let mut ev = FastEv::new(&tk, bid);
     let mut levels = 0u32;
     while left > 0 && levels < spec::LIQ_FAST_MAX_LEVELS {
-        let Some((bk, bl, bp, ba)) = best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi, book_px(f, m, slot)) else { break };
+        let best = best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi, book_px(f, m, slot));
+        if hybrid {
+            let lim = match best { Some((_, _, bp, _)) => if bid { hi.min(bp - 1) } else { lo.max(bp + 1) }, None => if bid { hi } else { lo } };
+            let (sf, sn) = shard_take(t, lim, left)?;
+            left -= sf; filled += sf; notional += sn;
+            if left == 0 { break; }
+        }
+        let Some((bk, bl, bp, ba)) = best else { break };
         levels += 1;
         let (sp, mi) = sl[bk];
         let q = unsafe { &(*sp).quotes[base_ix + bl] };
@@ -2837,6 +2851,15 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
         filled += fq; notional += nt as i128; left -= fq;
     }
     ev.flush();
+    // nothing within the quote band: the shards' orders further out, as a book liquidation would (10%, then 20%; each wider step
+    // doubles the fee, a penalty to insurance)
+    while filled == 0 && hybrid && step + 1 < LIQ_BOOK_BAND_STEPS {
+        step += 1;
+        let band = (px as u128 * (LIQ_BOOK_BAND_BPS << step) as u128 / 10000) as u64;
+        let lim = if bid { (px + band).min(bhi) } else { px.saturating_sub(band).max(blo).max(1) };
+        let (sf, sn) = shard_take(t, lim, left)?;
+        left -= sf; filled += sf; notional += sn;
+    }
     if filled == 0 {
         // no fill opens ADL only when the book really is empty: it has makers (a spare empty book proves nothing), all were
         // passed (checked above), and fresh-only ladders are not merely switched off for want of a current signed price
@@ -2871,7 +2894,7 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     f.oi_long_delta += long(t.pos[pi].base) - base0 - in_shards; // the shard part is booked on its shard by take()
     if filled > shard_fill { f.fills += 1; }
     let (eq2, _, _) = phealth(pid, t, pi, mkts, nw, false)?;
-    let fee = bps_dn(notional, LIQ_FEE_BPS).min(eq2.max(0));
+    let fee = bps_dn(notional, LIQ_FEE_BPS << step).min(eq2.max(0));
     credit(t, pi, -fee)?; pay_liq_fee(pid, &a[4 + ns..], &tk, m, ins, fee)?;
     if eq2 < 0 {
         if -eq2 > ins.balance.max(0) as i128 { return Err(err(E::UseAdl)); }
