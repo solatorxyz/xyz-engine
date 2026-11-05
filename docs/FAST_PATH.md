@@ -39,7 +39,9 @@ A maker can fill at most margin / IMR of notional between settles. That bounds w
 ## Frontend (Codex owns UI)
 Use `sdk/ts/everytick.ts` (builders, decoders, `fastDepth`). `sdk/ts/smoke.ts` shows reading a FastBook, slabs, a User and a Market from RPC.
 - Order book: `fastDepth(decodeFastBook(fast), slabs, slot, mark)` gives live maker levels (used qty, age, ±5% band and budget applied). Merge with shard orders.
-- Trading: `take_fast` with all approved slabs for the market. Show fills from the program's fill events.
+- Trading: `take_fast` with all approved slabs for the market. Show fills from the program's fill events. Markets re-price
+  in the publishers' own transactions (post-and-push), so a taker bundle needs no `update_oracle`; if one is included to be
+  safe, use `UPDATE_ORACLE_SOFT` (IX 78, same accounts) so a momentarily unusable oracle cannot fail the take itself.
 - Positions: decode_user plus, for makers, the FastBook entry (unsettled base and quote) so equity matches what liquidation sees.
 - Maker panel: margin, budget, auto target, kill switch.
 
