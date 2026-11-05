@@ -2,7 +2,7 @@
 |---|---|
 | init_market | 2005 |
 | init_rank (admin) | 180 |
-| update_oracle (Pyth parse+conf+staleness, funding accrue) | 1001 |
+| update_oracle (Pyth parse+conf+staleness, funding accrue) | 1039 |
 | deposit (SPL transfer CPI) | 1376 |
 | deposit (SPL transfer CPI) | 1376 |
 | deposit (SPL transfer CPI) | 1376 |
@@ -15,7 +15,7 @@
 | taker IOC: match 1 level | 2739 |
 | withdraw (margin check + PDA-signed SPL CPI) | 2045 |
 | batch replace + claim maker fills (3 shards w/ ledgers) | 11255 |
-| update_oracle + premium/mark from full shard set (5 shards) | 3141 |
+| update_oracle + premium/mark from full shard set (5 shards) | 3181 |
 | liquidate (takeover at mark: health x2, transfer, fees) | 3088 |
 | deposit (SPL transfer CPI) | 1376 |
 | adl_rank (permissionless re-score) | 2026 |

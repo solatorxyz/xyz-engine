@@ -87,3 +87,25 @@ fn upd(e: &mut Env, ms: &[Address]) -> Option<u32> {
     assert_eq!(upd(&mut e, &ms), None);
     assert_eq!(e.market_state().oracle_px, 100_010);
 }
+fn post_ext(px: i64, ts: i64, ext: i64) -> Vec<u8> { let mut d = post(px, ts); d.extend_from_slice(&ext.to_le_bytes()); d.extend_from_slice(&ts.to_le_bytes()); d }
+#[test] fn external_price_is_the_members_median() {
+    let (mut e, ks, ms) = set_env(); let ts = e.ts;
+    for (i, x) in [1001_00000000i64, 1009_00000000, 1003_00000000].iter().enumerate() {
+        let (k, a) = (&ks[i], ms[i]);
+        assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post_ext(1000_00000000, ts, *x), &[k]), None);
+    }
+    assert_eq!(upd(&mut e, &ms), None);
+    let s = e.market_state();
+    assert_eq!((s.oracle_px, s.ext_px), (100_000, 100_300), "ext = median of the members' external perp prices");
+}
+#[test] fn non_primary_account_is_a_no_op() {
+    // a client still passing a former single AGG (now just a member) changes nothing and does not fail its transaction
+    let (mut e, ks, ms) = set_env(); let ts = e.ts;
+    for i in 0..3 { let (k, a) = (&ks[i], ms[i]); assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000, ts), &[k]), None); }
+    let before = e.market_state().oracle_px;
+    let m = e.market;
+    assert_eq!(try_send(&mut e, vec![w(&m), r(&ms[0])], vec![4], &[]), None);
+    assert_eq!(e.market_state().oracle_px, before, "no price taken from a single member");
+    assert_eq!(upd(&mut e, &ms), None);
+    assert_eq!(e.market_state().oracle_px, 100_000);
+}

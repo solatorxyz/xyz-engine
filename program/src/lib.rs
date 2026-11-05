@@ -1194,7 +1194,12 @@ fn update_oracle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if a.len() < 2 { return Err(err(E::BadData)); }
     let m: &mut Market = load(&a[0], pid, DISC_MARKET, MARKET_SIZE)?;
     let clk = clock()?;
-    let r1 = if m.oracle == key(&a[1]) { read_primary(pid, &a[1], &a[2..], &m.feed_id, m, clk.unix_timestamp) } else { Err(E::Oracle) };
+    let prim = m.oracle == key(&a[1]);
+    // Not the market's primary oracle and no fallback configured: nothing to read, so nothing changes (no-op, not an error).
+    // Clients built against an earlier single-AGG oracle keep working after a timelocked switch to an OracleSet; the price
+    // itself is only ever taken from the primary (every member of a set) or oracle2.
+    if !prim && m.oracle2 == [0; 32] { return Ok(()); }
+    let r1 = if prim { read_primary(pid, &a[1], &a[2..], &m.feed_id, m, clk.unix_timestamp) } else { Err(E::Oracle) };
     // oracle2 configured but not passed counts as unusable (the crank can't dodge the cross-check by omitting it)
     let r2 = if m.oracle2 != [0; 32] { Some(a[2..].iter().find(|x| key(x) == m.oracle2).map_or(Err(E::Oracle), |x| read_pyth(pid, x, &m.feed_id2, m, clk.unix_timestamp, m.oracle_ts))) } else { None };
     // oracle2: fallback when the primary is unusable; circuit breaker when both are valid but diverge
@@ -1281,7 +1286,7 @@ fn update_oracle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     let (ib, ia, sb, sa) = book.unwrap_or((None, None, None, None));
     let best_b = match (sb, fb) { (Some(x), Some(y)) => Some(x.max(y)), (x, y) => x.or(y) };
     let best_a = match (sa, fa) { (Some(x), Some(y)) => Some(x.min(y)), (x, y) => x.or(y) };
-    let ext = read_ext(&a[1], pid, m, clk.unix_timestamp);
+    let ext = if prim { read_ext_primary(&a[1], &a[2..], pid, m, clk.unix_timestamp) } else { None };
     if ext.is_some() { m.ext_px = ext.unwrap_or(0); m.ext_ts = clk.unix_timestamp; }
     if book.is_some() || fb.is_some() || fa.is_some() {
         m.prem_last = premium_ppb(ib.or(fb), ia.or(fa), px);
@@ -1354,6 +1359,21 @@ fn scan_book(sh: &[AccountView], pid: &Address, mk: &Key, n: u64, oracle: u64, s
     Ok(Some((imp(&bufs[0][..ns[0]]), imp(&bufs[1][..ns[1]]), bb[0], bb[1])))
 }
 /// External perp consensus from our own oracle account, in market price units. None when old, absent or from Pyth.
+/// External perp consensus of the primary oracle: the AGG's own value, or for an OracleSet the median of its members' fresh values
+/// (members are already required among `rest` by read_primary).
+fn read_ext_primary(x: &AccountView, rest: &[AccountView], pid: &Address, m: &Market, now: i64) -> Option<u64> {
+    if !(x.owned_by(pid) && x.data_len() >= OSET_SIZE && unsafe { x.borrow_unchecked() }[0..8] == OSET_DISC) { return read_ext(x, pid, m, now); }
+    let s = unsafe { x.borrow_unchecked() };
+    let n = (s[8] as usize).min(OSET_MAX);
+    let mut v = [0u64; OSET_MAX]; let mut k = 0;
+    for i in 0..n {
+        let mk = &s[16 + 32 * i..48 + 32 * i];
+        if let Some(acc) = rest.iter().find(|r| r.address().as_ref() == mk) { if let Some(q) = read_ext(acc, pid, m, now) { v[k] = q; k += 1; } }
+    }
+    if k == 0 { return None; }
+    for i in 1..k { let y = v[i]; let mut j = i; while j > 0 && v[j - 1] > y { v[j] = v[j - 1]; j -= 1; } v[j] = y; }
+    Some(if k % 2 == 1 { v[k / 2] } else { v[k / 2 - 1] / 2 + v[k / 2] / 2 + (v[k / 2 - 1] % 2 + v[k / 2] % 2) / 2 })
+}
 fn read_ext(x: &AccountView, pid: &Address, m: &Market, now: i64) -> Option<u64> {
     if !x.owned_by(pid) || x.data_len() < AGG_SIZE { return None; }
     let p = unsafe { x.borrow_unchecked() };
