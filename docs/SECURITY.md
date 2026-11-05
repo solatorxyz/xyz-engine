@@ -62,6 +62,9 @@ refused). Comments in `lib.rs` may lag behind; this file and the tests are autho
   OracleSet, whose median is its own guard; the deploy scripts create one per market.
 - Pool and vault admins can be a Multisig account (named at creation); the creating key alone then has no power.
 - The external perp price needs the set's quorum and bounded publish times.
+- `agg_post` (IX 41) with a publish time no newer than the stored one lands as a no-op (nothing applied): the same replay
+  protection, but an overtaken post (transactions land out of order across leaders) no longer fails the other posts and
+  pushes bundled in its transaction. A future publish time (> clock + 5 s) is still an error.
 - `update_oracle_soft` (IX 78) is `update_oracle` with an exact revert instead of an error: the market is the only account
   the update writes, a byte snapshot is restored on any failure (including a partially advanced fallback replay floor), so
   a publisher can bundle it with its price post without an unusable oracle sinking the post. Same accounts, same checks,

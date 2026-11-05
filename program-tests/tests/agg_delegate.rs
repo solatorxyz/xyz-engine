@@ -28,7 +28,11 @@ fn agg_env(keeper: &Keypair) -> Env {
     assert_eq!(e.market_state().oracle_px, 100_000);
     let evil = Keypair::new();
     assert_eq!(try_send(&mut e, vec![AccountMeta::new(evil.pubkey(), true), w(&o)], post(1_00000000, 1, ts + 1), &[&evil]), Some(BAD_ACCOUNT), "unauthorised updater");
-    assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&o)], post(1000_00000000, 1, ts), &[&k]), Some(E_ORACLE), "replay / non-increasing ts");
+    // replay / overtaken post (ts not newer): lands as a no-op, nothing applied (an out-of-order post must not sink its tx)
+    assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&o)], post(1234_00000000, 1, ts), &[&k]), None, "non-increasing ts is a no-op");
+    assert_eq!(try_send(&mut e, vec![w(&m), r(&o)], vec![4], &[]), None); assert_eq!(e.market_state().oracle_px, 100_000, "old post not applied");
+    assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&o)], post(1234_00000000, 1, ts - 5), &[&k]), None, "older ts is a no-op");
+    assert_eq!(try_send(&mut e, vec![w(&m), r(&o)], vec![4], &[]), None); assert_eq!(e.market_state().oracle_px, 100_000);
     assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&o)], post(1000_00000000, 1, ts + 60), &[&k]), Some(E_ORACLE), "future ts");
     assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&o)], post(1300_00000000, 1, ts + 1), &[&k]), Some(BREAKER), "30% jump > 20% cap");
     assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&o)], post(-5, 1, ts + 1), &[&k]), Some(E_ORACLE), "non-positive");

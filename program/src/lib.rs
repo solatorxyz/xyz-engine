@@ -151,7 +151,11 @@ fn agg_post(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let (px, conf, pt, ns) = (r(d, 1), r(d, 9), r(d, 17), r(d, 25));
     let (last, last_pt, jump) = (r(p, 73), r(p, 93), r(p, 109) as u64);
     let now = clock()?.unix_timestamp;
-    if px <= 0 || conf < 0 || ns <= 0 || pt <= last_pt || pt > now + 5 { return Err(err(E::Oracle)); }
+    if px <= 0 || conf < 0 || ns <= 0 || pt > now + 5 { return Err(err(E::Oracle)); }
+    // A post no newer than the stored one is a no-op, not an error: publishers send ~1 tx/s per feed and transactions land
+    // out of order across leaders, so an overtaken post must not sink the other posts (and pushes) bundled in its tx.
+    // Nothing is applied, so this is the same replay protection with a different return code.
+    if pt <= last_pt { return Ok(()); }
     if jump != 0 && last > 0 && ((px - last).unsigned_abs() as u128) * 10000 > (last as u128) * jump as u128 { return Err(err(E::Breaker)); }
     p[101..109].copy_from_slice(&last_pt.to_le_bytes()); p[73..81].copy_from_slice(&px.to_le_bytes()); p[81..89].copy_from_slice(&conf.to_le_bytes());
     p[93..101].copy_from_slice(&pt.to_le_bytes()); p[117..125].copy_from_slice(&ns.to_le_bytes());
