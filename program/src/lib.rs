@@ -1342,9 +1342,11 @@ fn liq_cancel(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     claim_all(pid, t, &tk, &a[2..])?;
     settle_funding_all(pid, t, &a[1..])?;
     let pi = t.pos.iter().position(|p| p.market == mk).ok_or(err(E::NotLiquidatable))?;
-    // the whole market is seen (every shard, so all of its fills here are claimed) and no maker margin sits outside equity
-    complete_view(pid, t, &tk, &a[1..], Some(&mk))?;
-    if t.pos[pi].flags & POS_ISO == 0 { maker_clear(pid, t, &tk, m, &a[1..])?; }
+    // the judged account is seen whole: every shard of each market where it has orders (all of its fills claimed), and no maker
+    // margin outside its equity; for an isolated position only that market. A hidden fill elsewhere can't make it look weak.
+    let iso = t.pos[pi].flags & POS_ISO != 0;
+    complete_view(pid, t, &tk, &a[1..], if iso { Some(&mk) } else { None })?;
+    if !iso { maker_clear(pid, t, &tk, m, &a[1..])?; }
     let (eq, _, mm) = phealth(pid, t, pi, &a[1..], nw, true)?;
     if eq >= mm { return Err(err(E::NotLiquidatable)); }
     cancel_all_of(&a[2..], pid, &mk, &tk, t, pi);
