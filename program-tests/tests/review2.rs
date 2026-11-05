@@ -201,7 +201,7 @@ const ASK: u16 = 8; const BID: u16 = 0;
     let mut d = vec![70u8, 1]; d.extend_from_slice(&u64::MAX.to_le_bytes());
     let r_fast = try_send(&mut e, vec![w(&tu), r(&m), w(&ins), w(&f), r(&slab), w(&b0), w(&bx), w(&a0)], d, &[]);
     println!("F-4: liquidate_book -> {:?}, liquidate_fast -> {:?}, eligible flag {}", r_book, r_fast, e.user_state(&tu).pos[0].flags & 2);
-    assert_eq!((r_book, r_fast), (Some(25), None), "fixed: an order that can never fill does not block the empty-book proof");
+    assert_eq!((r_book, r_fast), (Some(1), None), "fixed: an order that can never fill does not block the empty-book proof");
     // the sweep through the shards removed the dead order on the way (as a book liquidation would)
 }
 
@@ -298,6 +298,6 @@ fn f7_setup(rest_order: bool) -> (Option<u32>, Option<u32>) {
     (r_book, r_fast)
 }
 #[test] fn f7_one_resting_order_blocks_hybrid_liquidation() {
-    assert_eq!(f7_setup(false), (Some(25), None), "control: maker quotes absorb the liquidation");
-    assert_eq!(f7_setup(true), (Some(25), None), "fixed: liquidate_fast cancels the target's orders itself");
+    assert_eq!(f7_setup(false), (Some(1), None), "control: maker quotes absorb the liquidation");
+    assert_eq!(f7_setup(true), (Some(1), None), "fixed: liquidate_fast cancels the target's orders itself");
 }

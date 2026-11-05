@@ -1331,6 +1331,9 @@ fn liq_cancel(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     claim_all(pid, t, &tk, &a[2..])?;
     settle_funding_all(pid, t, &a[1..])?;
     let pi = t.pos.iter().position(|p| p.market == mk).ok_or(err(E::NotLiquidatable))?;
+    // the whole market is seen (every shard, so all of its fills here are claimed) and no maker margin sits outside equity
+    complete_view(pid, t, &tk, &a[1..], Some(&mk))?;
+    if t.pos[pi].flags & POS_ISO == 0 { maker_clear(pid, t, &tk, m, &a[1..])?; }
     let (eq, _, mm) = phealth(pid, t, pi, &a[1..], nw, true)?;
     if eq >= mm { return Err(err(E::NotLiquidatable)); }
     cancel_all_of(&a[2..], pid, &mk, &tk, t, pi);
@@ -1861,6 +1864,8 @@ fn liquidate_book(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let q = ab.min(max_qty).min(liq_chunk(ab)).min(liq_needed(eq, mm, ab, px, m.mmr_bps));
     if q == 0 { return Err(err(E::BadData)); }
     let taker_bps = TIERS[(t.tier as usize).min(TIERS.len() - 1)].0;
+    // maker quotes on that side are book too: such a market is liquidated by liquidate_fast, which takes both
+    if m.fast_book[if bid { 1 } else { 0 }] != [0; 32] { return Err(err(E::BadAccount)); }
     // the permissionless caller can't hide the better bids: every opposite shard is passed, each once
     all_shards(pid, &a[3..], &mk, m, if bid { SIDE_ASK } else { SIDE_BID })?;
     // AUDIT V6-1: escalate the band (5% -> 10% -> 20%); each wider step doubles the liquidation fee (penalty to insurance)
@@ -2032,13 +2037,15 @@ fn adl(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     // AUDIT N-4: every candidate passed by the caller is re-scored now (fresh ranking at use time)
     // Entries that can't be used (the target itself, non-user / foreign accounts) are evicted here too, so after
     // this loop every passed account is freshly scored and the walk needs no second health pass (CU).
+    let mut unev = [[0u8; 32]; 8]; let mut nu = 0usize;
     for ca in a[4..].iter() {
         let ck = key(ca);
-        rank_remove(r, side, &ck);
-        if ck == tk { continue; }
+        if ck == tk { rank_remove(r, side, &ck); continue; }
         let Ok(c) = load::<User>(ca, pid, DISC_USER, USER_SIZE) else { continue };
-        if home(c, m).is_err() { continue; }
-        if settle_funding_all(pid, c, mkts).is_err() { continue; } // its other markets not passed: not a candidate here
+        if home(c, m).is_err() { rank_remove(r, side, &ck); continue; }
+        // its other markets not passed: it can't be re-scored here, so it keeps its place (refused below if it is the top)
+        if settle_funding_all(pid, c, mkts).is_err() { if nu < 8 { unev[nu] = ck; nu += 1; } continue; }
+        rank_remove(r, side, &ck);
         if let Some(ci) = c.pos.iter().position(|p| p.market == mk && ((p.base > 0) == (side == 0)) && p.base != 0) {
             let (ce, _, _) = phealth(pid, c, ci, mkts, nw, false)?;
             if let Some(s) = adl_score(c, ci, px, ce) { rank_insert(r, side, &ck, s); }
@@ -2046,6 +2053,7 @@ fn adl(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     }
     if rank_n(r, side) == 0 { return Err(err(E::Rank)); }
     let ck = r.entries[side * RANK_N].user;
+    if unev[..nu].contains(&ck) { return Err(err(E::Rank)); } // the top counterparty must be evaluated, never skipped
     let ca = a[4..].iter().find(|x| key(x) == ck).ok_or(err(E::Rank))?; // top entry must be passed (and was just re-scored)
     let c: &mut User = load(ca, pid, DISC_USER, USER_SIZE)?;
     let ci = c.pos.iter().position(|p| p.market == mk).ok_or(err(E::Rank))?;
@@ -2837,14 +2845,14 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
         // a market with shards too (all opposite shards were passed above): none may hold a live order a book liquidation could
         // still reach (its widest band, any better price; expired / off-band orders can never fill and don't count)
         if m.n_side[sside as usize] != 0 {
-            let wide = px / 10000 * (LIQ_BOOK_BAND_BPS << (LIQ_BOOK_BAND_STEPS - 1));
+            let wide = (px as u128 * (LIQ_BOOK_BAND_BPS << (LIQ_BOOK_BAND_STEPS - 1)) as u128 / 10000) as u64;
             for x in a[4 + ns..].iter() {
                 if disc_of(x) != DISC_SHARD || !x.owned_by(pid) { continue; }
                 let s: &Shard = unsafe { &*(x.borrow_unchecked().as_ptr() as *const Shard) };
                 if s.market != mk || s.side != sside { continue; }
                 let live = s.orders[..s.n as usize].iter().any(|o| {
                     let p = eff(o, sside == SIDE_BID, m.oracle_px);
-                    let gone = (o.expiry_slot != 0 && slot > o.expiry_slot) || (o.band_bps != 0 && off_band(p, m.oracle_px, o.band_bps));
+                    let gone = (o.expiry_slot != 0 && slot > o.expiry_slot) || (o.band_bps != 0 && off_band(p, m.oracle_px, o.band_bps)) || p < blo || p > bhi;
                     !gone && o.owner != tk && if sside == SIDE_BID { p >= px.saturating_sub(wide) } else { p <= px + wide } });
                 if live { return Err(err(E::NoFill)); }
             }

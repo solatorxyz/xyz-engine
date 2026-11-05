@@ -25,5 +25,5 @@
 | admin pause | 152 |
 | paused: reduce-only allowed | 1062 |
 | deposit under TVL cap (cap check + CPI) | 1388 |
-| liquidate (cancel target resting orders + close) | 5211 |
+| liquidate (cancel target resting orders + close) | 5202 |
 | crank_claim (1 shard -> 1 maker) | 128 |

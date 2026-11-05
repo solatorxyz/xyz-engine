@@ -290,7 +290,7 @@ fn member(e: &mut Env, k: &Keypair) -> Address {
     let r1 = try_send(&mut e, vec![w(&tu), r(&m), w(&ins), w(&b0), w(&a0)], amt(34, u64::MAX), &[]);
     let mut d = vec![70u8, 1]; d.extend_from_slice(&u64::MAX.to_le_bytes());
     let r2 = try_send(&mut e, vec![w(&tu), r(&m), w(&ins), w(&f), r(&slab)], d.clone(), &[]);
-    assert_eq!((r1, r2), (Some(25), Some(19)), "without the opposite shards nothing is proven (fast: every opposite shard is required)");
+    assert_eq!((r1, r2), (Some(1), Some(19)), "book path refused with maker quotes on the side; fast path needs every opposite shard");
     let r3 = try_send(&mut e, vec![w(&tu), r(&m), w(&ins), w(&f), r(&slab), r(&b0)], d, &[]);
     assert_eq!(r3, None, "fixed: every maker and every opposite shard passed, all empty in the band");
     assert_ne!(e.user_state(&tu).pos[0].flags & 2, 0, "ADL-eligible");

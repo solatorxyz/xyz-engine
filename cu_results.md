@@ -16,11 +16,11 @@
 | withdraw (margin check + PDA-signed SPL CPI) | 2131 |
 | batch replace + claim maker fills (3 shards w/ ledgers) | 11337 |
 | update_oracle + premium/mark from full shard set (5 shards) | 3795 |
-| liquidate (takeover at mark: health x2, transfer, fees) | 4581 |
+| liquidate (takeover at mark: health x2, transfer, fees) | 4579 |
 | deposit (SPL transfer CPI) | 1383 |
 | adl_rank (permissionless re-score) | 2026 |
-| ADL (bankrupt -> on-chain ranked counterparty -> insurance) | 6749 |
+| ADL (bankrupt -> on-chain ranked counterparty -> insurance) | 6764 |
 | settle_funding (permissionless, 1 position) | 199 |
 | aggregate OI/fees from 9 shards (crank) | 733 |
-| liquidate_book (permissionless, 1 chunk into the book, no liquidator capital) | 5609 |
+| liquidate_book (permissionless, 1 chunk into the book, no liquidator capital) | 5620 |
 | exec SL trigger on mark (keeper crank, IOC reduce-only) | 3525 |
