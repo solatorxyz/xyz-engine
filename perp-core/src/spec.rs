@@ -324,6 +324,19 @@ pub const QUOTE_BAND_BPS: u64 = 500;
 pub const QUOTE_ITEM_SIZE: usize = 10;
 /// Grow a slab / fast book made before the ladder settings to the current size.
 pub const IX_SLAB_GROW: u64 = 73;
+pub const IX_FAST_SIGNER: u64 = 74;
+pub const IX_FAST_PX: u64 = 75;
+/// Signed price: a 64-byte message signed by the book's price signer and checked by the Ed25519 program in the instruction
+/// right before the take: FAST_PX_MAGIC, market key, px u64 (price units), slot u64, ts_ms u64. The newest one (by ts_ms)
+/// a book has seen stands in for the oracle in pegged ladders and tolerance checks while it is at most FAST_PX_MAX_SLOTS old.
+pub const FAST_PX_MAGIC: [u8; 8] = *b"etfastpx";
+pub const FAST_PX_MSG: usize = 64;
+pub const FAST_PX_MAX_SLOTS: u64 = 8;
+/// A signed price further than this from the oracle is ignored.
+pub const FAST_PX_MAX_DEV_BPS: u64 = 200;
+/// Ladder flags bits 8-15: the ladder fills only while the book's signed price is at most that many slots old (0 = no need;
+/// at most FAST_PX_MAX_SLOTS counts).
+pub const LADDER_FRESH_SHIFT: u16 = 8;
 /// In a pegged ladder (LADDER_PEG) a level's price is oracle + px - QUOTE_PEG_BIAS (price units).
 pub const QUOTE_PEG_BIAS: u32 = 1 << 31;
 pub const LADDER_PEG: u16 = 1;

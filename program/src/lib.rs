@@ -12,6 +12,7 @@ use pinocchio::{error::ProgramError, sysvars::clock::Clock, AccountView, Address
 use pinocchio::sysvars::Sysvar;
 use pinocchio::cpi::{Seed, Signer};
 use pinocchio::Resize;
+use pinocchio::sysvars::instructions::{Instructions, INSTRUCTIONS_ID};
 use spec::{IX_PLACE, IX_BATCH, IX_CANCEL, IX_SET_ORACLE, IX_LIQUIDATE, IX_BACKSTOP, IMR_BPS, MMR_BPS, SIDE_BID, SIDE_ASK, TIERS,
     BATCH_HEADER_SIZE, BATCH_HEADER_N_CANCEL_OFF, BATCH_HEADER_N_PLACE_OFF, CANCEL_ITEM_SIZE, PLACE_ITEM_SIZE,
     FLAG_REDUCE_ONLY, FLAG_IOC, FLAG_POST_ONLY, LIQ_FEE_BPS, LIQ_BOOK_CHUNK_BPS, LIQ_BOOK_BAND_BPS, LIQ_BOOK_BAND_STEPS, LIQ_ADL_WINDOW_SLOTS,
@@ -183,6 +184,8 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
         spec::IX_TAKE_FAST => take_fast(pid, accs, data),
         spec::IX_TAKE_FAST_BATCH => take_fast_batch(pid, accs, data),
         spec::IX_SLAB_GROW => slab_grow(pid, accs),
+        spec::IX_FAST_SIGNER => fast_signer(pid, accs, data),
+        spec::IX_FAST_PX => fast_px_push(pid, accs),
         IX_PLACE => batch(pid, accs, data, true),
         IX_BATCH => batch(pid, accs, data, false),
         IX_CANCEL => batch(pid, accs, data, false),
@@ -1367,7 +1370,7 @@ fn fast_bbo(sh: &[AccountView], pid: &Address, mk: &Key, slot: u64, px: u64) -> 
                 if f.side != 0 && f.side != sd as u64 + 1 { continue; }
                 let base = (f.idx as usize) << 4 | sd << 3;
                 let lad = &s.lad[base >> 3];
-                if ladder_room(f, lad, mi, sd == 1, px) == 0 { continue; }
+                if ladder_room(f, lad, mi, sd == 1, px, slot) == 0 { continue; }
                 for l in 0..SLAB_LEVELS {
                     let q = &s.quotes[base + l]; let p = qpx(q.px, px, lad.flags & spec::LADDER_PEG != 0);
                     if q.qty == 0 || p < lo || p > hi || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
@@ -1886,9 +1889,12 @@ fn qpx(px: u32, oracle: u64, peg: bool) -> u64 {
 }
 /// Lots maker `mi` may still fill on ladder `lad` (market idx << 1 | side): 0 once the oracle is further than the maker's
 /// tolerance from the price it quoted against, else what its inventory cap leaves (u64::MAX without one). Inventory = its
-/// position at the last settle + fast fills since. `bid`: the taker buys (hits the ask ladder, the maker sells).
+/// position at the last settle + fast fills since. `bid`: the taker buys (hits the ask ladder, the maker sells). A ladder that
+/// asks for a fresh price (flags bits 8-15) gives 0 while the book's signed price is older than that many slots.
 #[inline(always)]
-fn ladder_room(f: &FastBook, l: &Ladder, mi: usize, bid: bool, oracle: u64) -> u64 {
+fn ladder_room(f: &FastBook, l: &Ladder, mi: usize, bid: bool, oracle: u64, slot: u64) -> u64 {
+    let fr = (l.flags >> spec::LADDER_FRESH_SHIFT) as u64;
+    if fr != 0 && (f.fast_px == 0 || slot > f.fast_slot + fr.min(spec::FAST_PX_MAX_SLOTS)) { return 0; }
     if l.tol_bps != 0 {
         let r = l.ref_px as u64; // < 2^32; the difference is clamped so the product stays native
         if oracle.abs_diff(r).min(1 << 40).wrapping_mul(10000) > r.wrapping_mul(l.tol_bps as u64) { return 0; }
@@ -1906,6 +1912,63 @@ fn slab_grow(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     let want = match disc_of(&a[0]) { DISC_SLAB => SLAB_SIZE, DISC_FAST => FAST_SIZE, _ => return Err(err(E::BadAccount)) };
     if a[0].data_len() >= want { return Ok(()); }
     a[0].resize(want)
+}
+/// Ed25519SigVerify111111111111111111111111111
+const ED25519_ID: Key = [3, 125, 70, 214, 124, 147, 251, 190, 18, 249, 66, 143, 131, 141, 64, 255, 5, 112, 116, 73, 39, 244, 138, 100, 252, 202, 112, 68, 128, 0, 0, 0];
+/// Take the newest signed price for book `f` from the Ed25519 instruction right before this one, when the Instructions
+/// sysvar is among `xs`. A signature counts only when its key, signature and message all sit in that instruction's own data
+/// (instruction index u16::MAX), the key is the book's signer, the message names this market, its price is within
+/// FAST_PX_MAX_DEV_BPS of the oracle and its ms clock is newer than the stored one; others are skipped. The signer's slot is
+/// clamped to now, so a signer clock running ahead can't stretch a price's life.
+fn fresh_px(f: &mut FastBook, mk: &Key, oracle: u64, slot: u64, xs: &[AccountView]) -> ProgramResult {
+    if f.px_signer == [0; 32] || oracle == 0 { return Ok(()); }
+    let Some(x) = xs.iter().find(|x| x.address() == &INSTRUCTIONS_ID) else { return Ok(()) };
+    let ins = Instructions::try_from(x)?;
+    let cur = ins.load_current_index() as usize;
+    if cur == 0 { return Ok(()); }
+    let e = ins.load_instruction_at(cur - 1)?;
+    if e.get_program_id().to_bytes() != ED25519_ID { return Ok(()); }
+    let d = e.get_instruction_data();
+    if d.is_empty() { return Ok(()); }
+    for i in 0..d[0] as usize {
+        let o = 2 + 14 * i;
+        if d.len() < o + 14 { break; }
+        let h = |k: usize| u16::from_le_bytes([d[o + 2 * k], d[o + 2 * k + 1]]) as usize;
+        // signature offset, its ix, key offset, its ix, message offset, size, its ix
+        if h(1) != 0xffff || h(3) != 0xffff || h(6) != 0xffff || h(5) != spec::FAST_PX_MSG { continue; }
+        let (pk, mo) = (h(2), h(4));
+        if d.len() < pk + 32 || d.len() < mo + spec::FAST_PX_MSG { continue; }
+        if d[pk..pk + 32] != f.px_signer || d[mo..mo + 8] != spec::FAST_PX_MAGIC || d[mo + 8..mo + 40] != *mk { continue; }
+        let (px, sl, ts) = (rd64(d, mo + 40)?, rd64(d, mo + 48)?, rd64(d, mo + 56)?);
+        if ts <= f.fast_ts || px == 0 || px >> 32 != 0 || moved(px, oracle, spec::FAST_PX_MAX_DEV_BPS) { continue; }
+        f.fast_px = px; f.fast_slot = sl.min(slot); f.fast_ts = ts;
+    }
+    Ok(())
+}
+/// Price pegged ladders and tolerance checks use: the book's signed price while fresh, else the oracle.
+#[inline(always)]
+fn book_px(f: &FastBook, m: &Market, slot: u64) -> u64 {
+    if f.fast_px != 0 && slot <= f.fast_slot + spec::FAST_PX_MAX_SLOTS { f.fast_px } else { m.oracle_px }
+}
+/// Admin sets the key whose signed prices a book takes (zero = none); the stored price is cleared.
+/// accs: admin(s), market(r), fast(w). data: tag, key [32]
+fn fast_signer(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 3 || d.len() != 33 { return Err(err(E::BadData)); }
+    let m: &Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+    let f: &mut FastBook = load(&a[2], pid, DISC_FAST, FAST_SIZE)?;
+    if !auth(pid, &m.admin, a) || f.market != key(&a[1]) { return Err(err(E::BadAccount)); }
+    f.px_signer.copy_from_slice(&d[1..33]); f.fast_px = 0; f.fast_slot = 0; f.fast_ts = 0;
+    Ok(())
+}
+/// Anyone may hand a book a newer signed price without trading (a maker or the signer keeping it fresh).
+/// accs: fast(w), market(r), Instructions sysvar
+fn fast_px_push(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
+    if a.len() < 3 { return Err(err(E::BadData)); }
+    let f: &mut FastBook = load(&a[0], pid, DISC_FAST, FAST_SIZE)?;
+    let m: &Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+    let mk = key(&a[1]);
+    if f.market != mk { return Err(err(E::BadAccount)); }
+    fresh_px(f, &mk, m.oracle_px, clock()?.slot, &a[2..])
 }
 /// Emergency stop for all quotes of a maker. accs: authority(s), slab(w). data: tag, on u8
 fn slab_kill(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
@@ -2010,6 +2073,7 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     cp!(2);
     let clk = clock()?; let slot = clk.slot; let nw: Now = (slot, clk.unix_timestamp);
     let rest = &a[4 + ns..];
+    fresh_px(f, &mk, m.oracle_px, slot, rest)?;
     let dmax = if a[0].is_signer() && u.authority == key(&a[0]) { u64::MAX } else if a[0].is_signer() {
         delegate_max_qty(pid, rest, &key(&a[0]), &uk, slot).ok_or(err(E::BadAccount))? } else { return Err(err(E::BadAccount)); };
     if left > dmax { return Err(err(E::Cap)); }
@@ -2089,6 +2153,7 @@ fn take_fast_batch(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramRes
     let mk = key(&a[0]);
     if f.market != mk || m.strict_take != 0 { return Err(err(E::BadAccount)); }
     let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
+    fresh_px(f, &mk, m.oracle_px, clk.slot, &a[ti + 3 * n..])?;
     let px0 = mark(m);
     let band = (px0 / 10000).wrapping_mul(spec::QUOTE_BAND_BPS);
     let (blo, bhi) = bound_range(m);
@@ -2170,7 +2235,7 @@ fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base
     let (want, base0) = (left, long(u.pos[pi].base));
     // only the first sl.len() entries are ever read, and each is written first
     let mut cand: [core::mem::MaybeUninit<Cand>; FAST_MAKERS] = [core::mem::MaybeUninit::uninit(); FAST_MAKERS];
-    let oracle = m.oracle_px;
+    let oracle = book_px(f, m, slot);
     for (k, &(sp, mi)) in sl.iter().enumerate() { cand[k].write(slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0, oracle)); }
     let (mut acc, mut fees) = (Acc { q: 0, nt: 0, fee: 0 }, 0u64);
     while left > 0 {
@@ -2259,7 +2324,7 @@ fn slab_first(f: &FastBook, sp: *const Slab, mi: usize, base_ix: usize, opp: usi
     let e = &f.makers[mi];
     if e.budget <= 0 { return (0, 0, 0, 0, 0); }
     let lad = unsafe { s.lad.get_unchecked(base_ix >> 3) };
-    let (room, peg) = (ladder_room(f, lad, mi, bid, oracle), lad.flags & spec::LADDER_PEG != 0);
+    let (room, peg) = (ladder_room(f, lad, mi, bid, oracle, slot), lad.flags & spec::LADDER_PEG != 0);
     if room == 0 { return (0, 0, 0, 0, 0); }
     let mut best: Cand = (0, 0, 0, 0, 0);
     for l in from..SLAB_LEVELS {
@@ -2357,7 +2422,7 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let (mut filled, mut notional) = (0u64, 0i128);
     let mut ev = FastEv::new(&tk, bid);
     while left > 0 {
-        let Some((bk, bl, bp, ba)) = best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi, m.oracle_px) else { break };
+        let Some((bk, bl, bp, ba)) = best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi, book_px(f, m, slot)) else { break };
         let (sp, mi) = sl[bk];
         let q = unsafe { &(*sp).quotes[base_ix + bl] };
         let fq = ba.min(left);

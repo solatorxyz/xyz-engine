@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-litesvm = "0.18"
+litesvm = { version = "0.18", features = ["precompiles"] }
 solana-account = "4.3"
 solana-address = "~2.7"
 solana-instruction = "~3.5"

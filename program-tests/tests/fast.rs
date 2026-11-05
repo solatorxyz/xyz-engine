@@ -1031,3 +1031,128 @@ fn later(e: &mut Env, slots: u64) { let s = e.slot + slots; e.set_time(s); }
     let x = Address::new_unique(); e.prog_acct(x, 100);
     e.send("", vec![w(&x)], vec![73], &[], false);
 }
+
+// ---------- signed prices (IX 74 / 75) ----------
+const ED_ID: Address = Address::new_from_array([3, 125, 70, 214, 124, 147, 251, 190, 18, 249, 66, 143, 131, 141, 64, 255, 5, 112, 116, 73, 39, 244, 138, 100, 252, 202, 112, 68, 128, 0, 0, 0]);
+const IXS_ID: Address = Address::new_from_array([6, 167, 213, 23, 24, 123, 209, 102, 53, 218, 212, 4, 85, 253, 194, 192, 193, 36, 198, 143, 33, 86, 117, 165, 219, 186, 203, 95, 8, 0, 0, 0]);
+fn px_msg(m: &Address, px: u64, slot: u64, ts: u64) -> Vec<u8> {
+    let mut v = b"etfastpx".to_vec(); v.extend_from_slice(m.as_ref());
+    for x in [px, slot, ts] { v.extend_from_slice(&x.to_le_bytes()); } v
+}
+/// Ed25519 program instruction over `sigs`; `ix` = instruction index written in the offsets (u16::MAX = this instruction).
+fn ed_ix_at(sigs: &[(&Keypair, Vec<u8>)], ix: u16) -> Instruction {
+    let n = sigs.len(); let base = 2 + 14 * n;
+    let (mut d, mut body) = (vec![n as u8, 0], vec![]);
+    for (kp, msg) in sigs {
+        let pk = base + body.len(); body.extend_from_slice(kp.pubkey().as_ref());
+        let so = base + body.len(); body.extend_from_slice(kp.sign_message(msg).as_ref());
+        let mo = base + body.len(); body.extend_from_slice(msg);
+        for x in [so as u16, ix, pk as u16, ix, mo as u16, msg.len() as u16, ix] { d.extend_from_slice(&x.to_le_bytes()); }
+    }
+    d.extend(body); Instruction { program_id: ED_ID, accounts: vec![], data: d }
+}
+fn ed_ix(sigs: &[(&Keypair, Vec<u8>)]) -> Instruction { ed_ix_at(sigs, u16::MAX) }
+fn send_ixs(e: &mut Env, ixs: Vec<Instruction>, signers: &[&Keypair], ok: bool) -> Option<u64> {
+    let mut s: Vec<&Keypair> = vec![&e.admin]; s.extend_from_slice(signers);
+    let tx = Transaction::new_signed_with_payer(&ixs, Some(&e.admin.pubkey()), &s, e.svm.latest_blockhash());
+    let res = e.svm.send_transaction(tx); e.svm.expire_blockhash();
+    match (res, ok) {
+        (Ok(m), true) => Some(m.compute_units_consumed),
+        (Err(_), false) => None,
+        (Ok(_), false) => panic!("expected failure"),
+        (Err(f), true) => panic!("{:?}\n{}", f.err, f.meta.logs.join("\n")),
+    }
+}
+fn set_signer(e: &mut Env, f: &Address, k: &Address) { let (a, m) = (e.admin.pubkey(), e.market); let mut d = vec![74u8]; d.extend_from_slice(k.as_ref()); e.send("", vec![AccountMeta::new(a, true), r(&m), w(f)], d, &[], true); }
+/// take_fast with the Instructions sysvar passed, after an Ed25519 instruction when `sig` is given
+fn tk_px(e: &mut Env, kp: &Keypair, u: &Address, f: &Address, slabs: &[Address], side: u8, limit: u64, qty: u64, sig: Option<Instruction>) -> Option<u64> {
+    let m = e.market;
+    let mut a = vec![AccountMeta::new(kp.pubkey(), true), w(u), r(&m), w(f)]; a.extend(slabs.iter().map(r)); a.push(r(&IXS_ID));
+    let mut ixs: Vec<Instruction> = sig.into_iter().collect();
+    ixs.push(Instruction { program_id: e.pid, accounts: a, data: take_ix(side, 0, slabs.len() as u8, limit, qty) });
+    send_ixs(e, ixs, &[kp], true)
+}
+fn push_px(e: &mut Env, f: &Address, sig: Instruction) -> Option<u64> {
+    let (m, pid) = (e.market, e.pid);
+    send_ixs(e, vec![sig, Instruction { program_id: pid, accounts: vec![w(f), r(&m), r(&IXS_ID)], data: vec![75] }], &[], true)
+}
+
+#[test] fn a_signed_price_moves_pegged_quotes_before_the_oracle() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000);
+    let sg = Keypair::new(); set_signer(&mut e, &f, &sg.pubkey());
+    quote(&mut e, &k, &[(0xC000 | ASK_LAD, 0, 1), (ASK, peg(10), 100)], true);
+    let m = e.market;
+    // the oracle still says 100_000; the signed price already says 101_000
+    let s = e.slot;
+    let cu = tk_px(&mut e, &tp, &tu, &f, &[k.slab], 0, PX + 2000, 40, Some(ed_ix(&[(&sg, px_msg(&m, 101_000, s, 1))]))).unwrap();
+    assert_eq!(fb(&e, &f).makers[0].quote, 101_010 * 40);
+    let b = fb(&e, &f); assert_eq!((b.fast_px, b.fast_slot, b.fast_ts), (101_000, s, 1));
+    // a later take without a signature still uses the book's signed price while it is fresh
+    let cu0 = tk_px(&mut e, &tp, &tu, &f, &[k.slab], 0, PX + 2000, 10, None).unwrap();
+    assert_eq!(fb(&e, &f).makers[0].quote, 101_010 * 50);
+    println!("take 1 fill with a signed price: {cu} CU (sysvar only: {cu0})");
+    // once it is older than FAST_PX_MAX_SLOTS the oracle is back
+    later(&mut e, 9); e.oracle_update("", 1000_00000000, None);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 2000, 10, true);
+    assert_eq!(fb(&e, &f).makers[0].quote, 101_010 * 50 + 100_010 * 10);
+    // only the admin sets the signer
+    let x = Keypair::new(); let mut d = vec![74u8]; d.extend_from_slice(x.pubkey().as_ref());
+    e.send("", vec![AccountMeta::new(x.pubkey(), true), r(&m), w(&f)], d, &[&x], false);
+}
+#[test] fn a_fresh_ladder_fills_only_against_a_recent_signed_price() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000);
+    let sg = Keypair::new(); set_signer(&mut e, &f, &sg.pubkey());
+    // pegged ask, fills only while the book's signed price is at most 2 slots old
+    quote(&mut e, &k, &[(0xC000 | ASK_LAD, 0, 1 | 2 << 8), (ASK, peg(10), 100)], true);
+    let m = e.market;
+    tk_px(&mut e, &tp, &tu, &f, &[k.slab], 0, PX + 2000, 10, None);
+    assert_eq!(e.user_state(&tu).pos.get(0).map_or(0, |p| p.base), 0, "no signed price yet: nothing");
+    let s = e.slot;
+    tk_px(&mut e, &tp, &tu, &f, &[k.slab], 0, PX + 2000, 10, Some(ed_ix(&[(&sg, px_msg(&m, 100_500, s, 1))])));
+    assert_eq!(e.user_state(&tu).pos[0].base, 10);
+    assert_eq!(fb(&e, &f).makers[0].quote, 100_510 * 10);
+    later(&mut e, 3); e.oracle_update("", 1000_00000000, None);
+    tk_px(&mut e, &tp, &tu, &f, &[k.slab], 0, PX + 2000, 10, None);
+    assert_eq!(e.user_state(&tu).pos[0].base, 10, "3 slots old: the ladder waits");
+    // a newer signature made 3 slots ago doesn't help either
+    tk_px(&mut e, &tp, &tu, &f, &[k.slab], 0, PX + 2000, 10, Some(ed_ix(&[(&sg, px_msg(&m, 100_500, s, 2))])));
+    assert_eq!(e.user_state(&tu).pos[0].base, 10);
+    let s = e.slot;
+    tk_px(&mut e, &tp, &tu, &f, &[k.slab], 0, PX + 2000, 10, Some(ed_ix(&[(&sg, px_msg(&m, 100_700, s, 3))])));
+    assert_eq!(e.user_state(&tu).pos[0].base, 20);
+    assert_eq!(fb(&e, &f).makers[0].quote, 100_510 * 10 + 100_710 * 10);
+}
+#[test] fn an_older_or_foreign_signed_price_never_replaces_the_newest() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000);
+    let sg = Keypair::new(); set_signer(&mut e, &f, &sg.pubkey());
+    quote(&mut e, &k, &[(0xC000 | ASK_LAD, 0, 1), (ASK, peg(10), 1000)], true);
+    let (m, s) = (e.market, e.slot);
+    // the signer (or a maker) pushes the newest price without trading
+    push_px(&mut e, &f, ed_ix(&[(&sg, px_msg(&m, 100_800, s, 10))]));
+    assert_eq!(fb(&e, &f).fast_px, 100_800);
+    let other = Keypair::new();
+    let cases: Vec<Instruction> = vec![
+        ed_ix(&[(&sg, px_msg(&m, 100_100, s, 9))]),                        // older: a taker cherry-picking a stale signature
+        ed_ix(&[(&other, px_msg(&m, 100_100, s, 20))]),                    // not the book's signer
+        ed_ix(&[(&sg, px_msg(&Address::new_unique(), 100_100, s, 20))]),   // another market
+        ed_ix(&[(&sg, px_msg(&m, 103_000, s, 20))]),                       // 3% off the oracle
+        ed_ix_at(&[(&sg, px_msg(&m, 100_100, s, 20))], 0),                 // key, signature and message read from another instruction
+    ];
+    let mut q = 0;
+    for c in cases {
+        tk_px(&mut e, &tp, &tu, &f, &[k.slab], 0, PX + 2000, 1, Some(c));
+        q += 100_810; assert_eq!(fb(&e, &f).makers[0].quote, q);
+        assert_eq!(fb(&e, &f).fast_ts, 10);
+    }
+    // one Ed25519 instruction can carry prices for several markets; this book picks its own
+    tk_px(&mut e, &tp, &tu, &f, &[k.slab], 0, PX + 2000, 1, Some(ed_ix(&[(&sg, px_msg(&Address::new_unique(), 90_000, s, 30)), (&sg, px_msg(&m, 100_300, s, 31))])));
+    q += 100_310; assert_eq!(fb(&e, &f).makers[0].quote, q);
+    // a bad signature fails the whole transaction in the Ed25519 program
+    let mut bad = ed_ix(&[(&sg, px_msg(&m, 100_100, s, 40))]); let n = bad.data.len(); bad.data[n - 1] ^= 1;
+    let mut a = vec![AccountMeta::new(tp.pubkey(), true), w(&tu), r(&m), w(&f), r(&k.slab), r(&IXS_ID)]; a.truncate(6);
+    let pid = e.pid;
+    send_ixs(&mut e, vec![bad, Instruction { program_id: pid, accounts: a, data: take_ix(0, 0, 1, PX + 2000, 1) }], &[&tp], false);
+}

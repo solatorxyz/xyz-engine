@@ -195,7 +195,9 @@ pub struct FastBook { pub disc: u64, pub market: Key, pub idx: u64, pub n: u64, 
     /// 0 = both sides; 1 = makers' bids only (sellers write here); 2 = makers' asks only (buyers write here).
     /// A split market has one book per side, so buys and sells never contend for the same write lock.
     pub side: u64,
-    pub ext: [MakerExt; FAST_MAKERS] }
+    pub ext: [MakerExt; FAST_MAKERS],
+    /// key whose signed prices this book takes (zero = none) and the newest one seen: price, signer's slot, signer's ms clock
+    pub px_signer: Key, pub fast_px: u64, pub fast_slot: u64, pub fast_ts: u64 }
 pub const SLAB_SIZE: usize = core::mem::size_of::<Slab>();
 pub const FAST_SIZE: usize = core::mem::size_of::<FastBook>();
 
