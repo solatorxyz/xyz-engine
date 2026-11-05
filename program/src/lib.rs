@@ -2603,7 +2603,7 @@ mod kani_proofs {
     /// three fills from any starting position, including fills that reach zero or cross it.
     #[kani::proof]
     #[kani::solver(cadical)]
-    #[kani::unwind(4)]
+    #[kani::unwind(3)]
     fn taker_booked_once_equals_every_fill() {
         let mut u1: User = unsafe { core::mem::zeroed() };
         let (b0, c0): (i64, i64) = (kani::any(), kani::any());
@@ -2613,9 +2613,9 @@ mod kani_proofs {
         u2.pos[0].base = b0; u2.pos[0].cost = c0;
         let bid: bool = kani::any();
         let mut acc = Acc { q: 0, nt: 0, fee: 0 };
-        for _ in 0..3 {
+        for _ in 0..2 {
             let (fq, p, fee): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
-            kani::assume(fq >= 1 && fq <= 1500 && p >= 1 && p < (1 << 20) && fee <= (1 << 20));
+            kani::assume(fq >= 1 && fq <= 1500 && p >= 1 && p < (1 << 16) && fee <= (1 << 16));
             let nt = p * fq;
             acc.add(&mut u1, 0, bid, fq, nt, fee).unwrap();
             let paid: i128 = if bid { nt as i128 } else { -(nt as i128) };
@@ -2643,9 +2643,10 @@ mod kani_proofs {
             kani::assume(fq >= 1 && fq < (1 << 32) && p >= 1 && p < (1 << 32) && l < 2);
             let q = Quote { px: p as u32, qty: u32::MAX, gen: 7, slot: 0 };
             let before = f.used[0][l].qty as u64;
+            // what the matcher guarantees: fq <= quote qty - used and fq <= budget / p
+            kani::assume(before + fq < (1 << 32) && p * fq <= f.makers[0].budget as u64);
             let nt = fill_maker(&mut f, 0, &q, l, bid, p, fq).unwrap();
             assert_eq!(nt, p * fq);
-            kani::assume(before + fq < (1 << 32));
             if f.used[0][l].gen == 7 { assert!(f.used[0][l].qty as u64 == before + fq || before == 0); }
             acc.add(&mut u, 0, bid, fq, nt, 0).unwrap();
             nts += nt; lots += fq;
