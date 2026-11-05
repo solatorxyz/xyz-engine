@@ -351,7 +351,7 @@ pub const FAST_PX_MAGIC: [u8; 8] = *b"etfastpx";
 pub const FAST_PX_MSG: usize = 64;
 pub const FAST_PX_MAX_SLOTS: u64 = 8;
 /// A signed price further than this from the oracle is ignored.
-pub const FAST_PX_MAX_DEV_BPS: u64 = 200;
+pub const FAST_PX_MAX_DEV_BPS: u64 = 100;
 /// A take may hand over a signed price at most this many slots older than now (no picking the best of the last few).
 pub const FAST_PX_TAKE_SLOTS: u64 = 2;
 /// Quote levels one liquidate_fast call may sweep. Bounds a call to ~100k CU whatever the book looks like; the keeper calls again

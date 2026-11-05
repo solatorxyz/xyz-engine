@@ -26,7 +26,7 @@ refused). Comments in `lib.rs` may lag behind; this file and the tests are autho
 
 - Takes, triggers and liquidations use only the market's registered books (`Market.fast_book`), with every approved
   maker's slab passed where a third party chooses the accounts.
-- Signed prices are current (≤ 2 slots), within 200 bps of the oracle, newer than the stored one, and named for the market.
+- Signed prices are current (≤ 2 slots), within 100 bps of the oracle, newer than the stored one, and named for the market.
 - A maker's market stays cross-margined. Its locked margin is mirrored on the position (`Pos.iso_margin` of a pinned cross
   position) so liquidation and ADL refuse while any is locked; a settle returns it whenever the account is below
   maintenance without it. The quoting budget refills only from margin that initial margin leaves free.
@@ -50,12 +50,17 @@ refused). Comments in `lib.rs` may lag behind; this file and the tests are autho
   lots' share of the target's deficit, paid from insurance, then from the counterparty up to its gain on those lots, the
   rest to `bad_debt`.
 - Keeper tips come from the position's own bucket and are judged there.
+- The protocol vault's takeover judges its inventory cap on the live NAV (every active sub passed), and halts on drawdown.
 
 ## Oracle, mark and funding
 
 - The primary oracle is an OracleSet: median of independent publishers with a quorum; every member must be passed, a
-  missing one is a hard error (no fallback by omission). With a fallback oracle configured, both must be passed; a single
-  source is never applied while the divergence breaker is tripped.
+  missing one is a hard error (no fallback by omission). With a fallback oracle configured, both must be passed (the
+  fallback keeps its own replay floor); a single source is never applied while the divergence breaker is tripped.
+- A market whose primary is a single AGG account has a single-key oracle: a jump over 5% is held until a later publish
+  confirms it (within 0.5%, or further the same way), but that publish comes from the same key. Production markets use an
+  OracleSet, whose median is its own guard; the deploy scripts create one per market.
+- Pool and vault admins can be a Multisig account (named at creation); the creating key alone then has no power.
 - The external perp price needs the set's quorum and bounded publish times.
 - Book-derived inputs (mid, premium) are taken only from the complete book: every shard and every registered FastBook with
   all slabs; otherwise the previous sample is held. Only orders that rested at least one slot count, as impact prices

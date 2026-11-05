@@ -19,7 +19,7 @@
 | FOK filled | 3120 |
 | STP decrement (no fill, both reduced) | 2245 |
 | STP cancel-newest (taker dropped) | 2108 |
-| set_trigger SL (reduce-only) | 321 |
+| set_trigger SL (reduce-only) | 337 |
 | exec SL trigger (keeper crank, IOC reduce-only) | 6555 |
 | exec TWAP slice (1/3, sell 10) | 4569 |
 | admin pause | 152 |

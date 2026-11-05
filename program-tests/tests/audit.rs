@@ -840,9 +840,9 @@ fn v7_setup() -> (Env, Address, Address, Address, Keypair, Address) {
     e.ts += 1; e.set_pyth(1100_00000000, 1); upd(&mut e);
     assert_eq!(e.market_state().paused, 3);
     e.ts += 1; e.set_pyth(1250_00000000, 1); upd(&mut e);
-    assert_eq!((e.market_state().paused, e.market_state().oracle_px), (3, 100_100), "different jump: new candidate");
+    assert_eq!((e.market_state().paused, e.market_state().oracle_px), (0, 125_000), "a move continued the same way confirms the candidate");
     e.ts += 1; e.set_pyth(1251_00000000, 1); upd(&mut e);
-    assert_eq!((e.market_state().paused, e.market_state().oracle_px), (0, 125_100), "confirmed by a newer publish");
+    assert_eq!((e.market_state().paused, e.market_state().oracle_px), (0, 125_100));
 }
 /// V5-4: a pooled market's admin is the pool admin; margin can only tighten, admin not transferable, OI cap only down.
 #[test] fn v54_pooled_market_admin_pinned_and_bounded() {

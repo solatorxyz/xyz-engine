@@ -296,6 +296,15 @@ fn init_market(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult 
 }
 /// Pooled collateral (cross-margin): one SPL vault owned by PDA ["vault", pool, bump] shared by every market
 /// the pool admin admits. accs: admin(s), pool(w), vault token acct. data: tag, bump
+/// The admin a pool / vault is created with: the creating signer, or (data) a Multisig account that is among the accounts.
+fn admin_key(pid: &Address, a: &[AccountView], signer: &Key, wanted: Option<&[u8]>) -> Result<Key, ProgramError> {
+    let Some(w) = wanted else { return Ok(*signer) };
+    let mut k = [0u8; 32]; k.copy_from_slice(w);
+    if k == *signer { return Ok(k); }
+    let x = a.iter().find(|x| key(x) == k).ok_or(err(E::BadAccount))?;
+    load::<Multisig>(x, pid, DISC_MULTISIG, MULTISIG_SIZE)?;
+    Ok(k)
+}
 fn init_pool(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if a.len() < 3 || !sg(pid, &a[0]) || d.len() < 2 { return Err(err(E::BadData)); }
     if !a[1].owned_by(pid) || a[1].data_len() < POOL_SIZE || disc_of(&a[1]) != 0 { return Err(err(E::BadAccount)); }
@@ -304,8 +313,9 @@ fn init_pool(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if !a[2].owned_by(&pinocchio_token::ID) || a[2].data_len() < 165 { return Err(err(E::BadAccount)); }
     let vd = unsafe { a[2].borrow_unchecked() };
     if vd[32..64] != pda.to_bytes() { return Err(err(E::BadAccount)); }
+    let admin = admin_key(pid, a, &key(&a[0]), if d.len() >= 42 { Some(&d[10..42]) } else { None })?;
     let p = unsafe { &mut *(a[1].borrow_unchecked().as_ptr() as *mut Pool) };
-    p.disc = DISC_POOL; p.admin = key(&a[0]); p.vault = key(&a[2]); p.vault_bump = d[1] as u64; p.mint.copy_from_slice(&vd[0..32]);
+    p.disc = DISC_POOL; p.admin = admin; p.vault = key(&a[2]); p.vault_bump = d[1] as u64; p.mint.copy_from_slice(&vd[0..32]);
     p.max_market_oi = if d.len() >= 10 { rd64(d, 2)? } else { 0 };
     Ok(())
 }
@@ -1122,8 +1132,9 @@ fn batch(pid: &Address, a: &mut [AccountView], d: &[u8], single: bool) -> Progra
 fn set_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if a.len() < 3 || d.len() < 4 + 6 * 8 { return Err(err(E::BadData)); }
     let u: &mut User = load(&a[1], pid, DISC_USER, USER_SIZE)?;
-    let _m: &Market = load(&a[2], pid, DISC_MARKET, MARKET_SIZE)?;
+    let m: &Market = load(&a[2], pid, DISC_MARKET, MARKET_SIZE)?;
     if !sg(pid, &a[0]) || u.authority != key(&a[0]) { return Err(err(E::BadAccount)); }
+    home(u, m)?;
     let (s, k, side) = (d[1] as usize, d[2] as u64, d[3] as u64);
     let v = |i: usize| rd64(d, 4 + 8 * i);
     // kind byte: low 6 bits = TP/SL/TWAP, bit 6 = FLAG_MARK (>>2 of 256), bit 7 = FLAG_CONFIRM_ORACLE (>>2 of 512)
@@ -1372,7 +1383,13 @@ fn update_oracle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     let r1 = if prim { read_primary(pid, &a[1], &a[2..], &m.feed_id, m, clk.unix_timestamp) } else { Err(E::Oracle) };
     if matches!(r1, Err(E::MissingShards)) { return Err(err(E::MissingShards)); } // every set member must be passed
     // oracle2 configured but not passed counts as unusable (the crank can't dodge the cross-check by omitting it)
-    let r2 = if m.oracle2 != [0; 32] { Some(a[2..].iter().find(|x| key(x) == m.oracle2).map_or(Err(E::Oracle), |x| read_pyth(pid, x, &m.feed_id2, m, clk.unix_timestamp, m.oracle_ts))) } else { None };
+    // oracle2 has its own replay floor (oracle2_px keeps its last applied publish time while oracle2 is configured): judged
+    // against the primary's stamp it would drop out of the cross-check whenever the primary stamps ahead of it
+    let r2 = if m.oracle2 != [0; 32] { Some(a[2..].iter().find(|x| key(x) == m.oracle2).map_or(Err(E::Oracle), |x| read_pyth(pid, x, &m.feed_id2, m, clk.unix_timestamp, m.oracle2_px as i64))) } else { None };
+    if let Some(Ok(p2)) = r2 { m.oracle2_px = p2.2 as u64; }
+    // B-2/B-3: an OracleSet primary (median of independent publishers with a quorum) is its own jump guard; the
+    // single-source hold-and-confirm below is for a lone AGG / Pyth primary
+    let is_set = prim && a[1].owned_by(pid) && a[1].data_len() >= OSET_SIZE && unsafe { a[1].borrow_unchecked() }[0..8] == OSET_DISC;
     // oracle2: fallback when the primary is unusable; circuit breaker when both are valid but diverge
     // AUDIT V5-5: hysteresis (trip > MAX_DIVERGENCE, auto-resume only <= RESUME) and a move check whenever
     // only one source is usable while oracle2 is configured. Manual resume: admin ADMIN_PAUSE 0 (re-trips if
@@ -1403,13 +1420,14 @@ fn update_oracle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
         // is held as a candidate (oracle2_px / feed_id2[0..8] are unused without oracle2) and pauses new risk; it is
         // accepted only when a LATER publish (newer publish_time) confirms it within RESUME_BPS.
         (Ok(p1), None) => {
-            let jump = m.oracle_px != 0 && moved(p1.0, m.oracle_px, spec::ORACLE_SINGLE_SOURCE_MAX_MOVE_BPS);
+            let jump = !is_set && m.oracle_px != 0 && moved(p1.0, m.oracle_px, spec::ORACLE_SINGLE_SOURCE_MAX_MOVE_BPS);
             // (while an oracle2 change is pending, feed_id2 holds the armed feed id: no candidate, jumps just pause)
             let slot_free = m.pending_op != spec::ADMIN_ORACLE2;
             if jump {
                 if !slot_free { if m.paused == 0 { m.paused = spec::PAUSED_SINGLE_SOURCE; } return Ok(()); }
                 let (c, cts) = (m.oracle2_px, i64::from_le_bytes(m.feed_id2[0..8].try_into().unwrap()));
-                let confirmed = c != 0 && p1.2 > cts && !moved(p1.0, c, spec::ORACLE_RESUME_BPS);
+                let same_way = c != 0 && ((p1.0 >= c) == (c >= m.oracle_px));
+                let confirmed = c != 0 && p1.2 > cts && (!moved(p1.0, c, spec::ORACLE_RESUME_BPS) || same_way);
                 if !confirmed {
                     m.oracle2_px = p1.0; m.feed_id2[0..8].copy_from_slice(&p1.2.to_le_bytes());
                     if m.paused == 0 { m.paused = spec::PAUSED_SINGLE_SOURCE; }
@@ -2983,13 +3001,14 @@ fn market_cfg(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
 // ---------- HLP-style vault ----------
 /// accs: admin(s), vault(w, zeroed), market(r). data: tag, lockup_slots, day_cap_bps, perf_bps, dd_bps
 fn vault_init(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
-    if a.len() < 3 || !sg(pid, &a[0]) || d.len() != 33 { return Err(err(E::BadData)); }
+    if a.len() < 3 || !sg(pid, &a[0]) || (d.len() != 33 && d.len() != 65) { return Err(err(E::BadData)); }
     if !a[1].owned_by(pid) || a[1].data_len() < VAULT_SIZE || disc_of(&a[1]) != 0 { return Err(err(E::BadAccount)); }
     let m: &Market = load(&a[2], pid, DISC_MARKET, MARKET_SIZE)?;
     let (cap, perf, dd) = (rd64(d, 9)?, rd64(d, 17)?, rd64(d, 25)?);
     if cap > 10000 || perf > 3000 || dd > 10000 { return Err(err(E::BadData)); }
+    let admin = admin_key(pid, a, &key(&a[0]), if d.len() == 65 { Some(&d[33..65]) } else { None })?;
     let v = unsafe { &mut *(a[1].borrow_unchecked().as_ptr() as *mut Vault) };
-    v.disc = DISC_VAULT; v.admin = key(&a[0]); v.token_vault = m.vault; v.lockup_slots = rd64(d, 1)?; v.day_cap_bps = cap; v.perf_bps = perf; v.dd_bps = dd;
+    v.disc = DISC_VAULT; v.admin = admin; v.token_vault = m.vault; v.lockup_slots = rd64(d, 1)?; v.day_cap_bps = cap; v.perf_bps = perf; v.dd_bps = dd;
     Ok(())
 }
 /// accs: admin(s), vault(w), user(w, zeroed). The sub-account answers only to the program, on the vault's behalf.
@@ -3113,11 +3132,16 @@ fn vault_takeover(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     if l.vault != vk || l.market != mk { return Err(err(E::BadAccount)); }
     let si = v.subs[..v.n_subs as usize].iter().position(|k| *k == sk).ok_or(err(E::BadAccount))?;
     liquidate_core(pid, a, d, true)?;
+    v.active |= 1 << si;
     let u: &User = load(&a[1], pid, DISC_USER, USER_SIZE)?;
     if let Some(p) = u.pos.iter().find(|p| p.market == mk) {
-        if mulf((p.base as i128).abs(), mark(m)) * 10000 > v.nav.max(0) as i128 * l.cap_bps as i128 { return Err(err(E::Cap)); }
+        // the inventory cap is judged on the live NAV (every active sub passed with its markets), never a stored one
+        let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
+        let nav = vault_nav(pid, v, &a[1..], nw)?;
+        if mulf((p.base as i128).abs(), mark(m)) * 10000 > nav.max(0) * l.cap_bps as i128 { return Err(err(E::Cap)); }
+        vault_mark(v, nav, clk.slot)?;
+        if v.halted != 0 { return Err(err(E::Halted)); }
     }
-    v.active |= 1 << si;
     Ok(())
 }
 /// Permissionless: refresh value, peak and the drawdown stop. accs: vault(w), [active subs, markets]

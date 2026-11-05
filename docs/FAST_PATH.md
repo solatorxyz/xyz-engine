@@ -150,7 +150,7 @@ off the newest signed price instead of the oracle.
   `px_signer` (IX 74, admin). Verified by the Ed25519 program in the instruction right before the take; the program reads the
   key, signature and message only from that instruction's own data (instruction index u16::MAX), so nothing can point it elsewhere.
 - **Book state:** FastBook keeps the newest price by ts_ms (`fast_px`, `fast_slot`, `fast_ts`). An older or foreign signature,
-  another market's price, or one more than 200 bps from the oracle is ignored. The signer's slot is clamped to now.
+  another market's price, or one more than 100 bps from the oracle is ignored. The signer's slot is clamped to now.
 - **Use:** while `fast_slot` is at most 8 slots old the signed price replaces the oracle for pegged ladders and tolerance checks.
   Anyone can push a newer price without trading (IX 75 fast_px_push).
 - **Fresh-only ladders:** ladder flags bits 8-15 = N: the ladder fills only while the book's signed price is at most N slots old
