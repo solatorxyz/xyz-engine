@@ -177,7 +177,14 @@ fn upd(e: &mut Env, ms: &[&Mkt], px: i64) { for m in ms { switch(e, m); e.oracle
     e.set_time(e.slot + 1); upd(&mut e, &[&ma, &mb], 920_00000000); switch(&mut e, &ma);
     // crank-shaped liquidate_book: user, market, insurance, the market's shards, other markets
     let crank = vec![w(&tu), r(&ma.market), w(&ma.ins), w(&a0), w(&b0), r(&mb.market)];
-    assert_eq!(try_send(&mut e, crank, amt(34, u64::MAX), &[]), None, "fixed: a liquidation needs only the liquidated market's shards");
+    // its order elsewhere is one more step, never a dead end: refused until IX_LIQ_CANCEL clears that market (permissionless,
+    // only for an account below maintenance), then the liquidation goes through with the liquidated market's shards only
+    assert_eq!(try_send(&mut e, crank.clone(), amt(34, u64::MAX), &[]), Some(MISSING_SHARDS));
+    switch(&mut e, &mb);
+    let mut lc = vec![w(&tu), r(&mb.market)]; lc.extend(sb.iter().map(w)); lc.push(r(&ma.market));
+    assert_eq!(try_send(&mut e, lc, vec![77], &[]), None, "liq_cancel in market B");
+    switch(&mut e, &ma);
+    assert_eq!(try_send(&mut e, crank, amt(34, u64::MAX), &[]), None, "fixed: liquidation after liq_cancel");
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -283,7 +290,7 @@ fn member(e: &mut Env, k: &Keypair) -> Address {
     let r1 = try_send(&mut e, vec![w(&tu), r(&m), w(&ins), w(&b0), w(&a0)], amt(34, u64::MAX), &[]);
     let mut d = vec![70u8, 1]; d.extend_from_slice(&u64::MAX.to_le_bytes());
     let r2 = try_send(&mut e, vec![w(&tu), r(&m), w(&ins), w(&f), r(&slab)], d.clone(), &[]);
-    assert_eq!((r1, r2), (Some(25), Some(25)), "without the opposite shards nothing is proven");
+    assert_eq!((r1, r2), (Some(25), Some(19)), "without the opposite shards nothing is proven (fast: every opposite shard is required)");
     let r3 = try_send(&mut e, vec![w(&tu), r(&m), w(&ins), w(&f), r(&slab), r(&b0)], d, &[]);
     assert_eq!(r3, None, "fixed: every maker and every opposite shard passed, all empty in the band");
     assert_ne!(e.user_state(&tu).pos[0].flags & 2, 0, "ADL-eligible");

@@ -166,7 +166,7 @@ fuzz_target!(|data: &[u8]| {
     for (a, u, _) in us.clone() { let mut d = vec![3u8]; d.extend_from_slice(&0u16.to_le_bytes()); d.push(0); d.push(0); w.call(&trade(a, u, &sh), &d); w.call(&[(u, false, true), (market, false, false)], &[15]); }
     let mut m = vec![(market, false, true), (ins, false, true)]; m.extend(sh.iter().map(|s| (*s, false, true))); w.call(&m, &[16]);
     let st: Vec<User> = us.iter().map(|x| w.st::<User>(&x.1)).collect();
-    let cash: i128 = st.iter().map(|s| s.cash as i128 + s.pos.iter().map(|p| p.iso_margin as i128).sum::<i128>()).sum();
+    let cash: i128 = st.iter().map(|s| s.cash as i128 + s.pos.iter().filter(|p| p.flags & 1 != 0).map(|p| p.iso_margin as i128).sum::<i128>()).sum();
     let base: i64 = st.iter().map(|s| s.pos.iter().map(|p| p.base).sum::<i64>()).sum();
     let longs: i64 = st.iter().map(|s| s.pos.iter().map(|p| p.base.max(0)).sum::<i64>()).sum();
     let ms: Market = w.st(&market); let ib: Insurance = w.st(&ins);

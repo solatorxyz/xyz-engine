@@ -337,6 +337,9 @@ pub const IX_FAST_SIGNER: u64 = 74;
 pub const IX_FAST_PX: u64 = 75;
 /// Admin registers an existing FastBook as its market's book for its side(s). accs: admin(s), market(w), fast(r)
 pub const IX_FAST_REGISTER: u64 = 76;
+/// Permissionless, for an account below maintenance in a market: claim its fills and cancel its resting orders in the passed
+/// shards of that market (as a liquidation would). Liquidations / ADL require no resting orders on the judged positions.
+pub const IX_LIQ_CANCEL: u64 = 77;
 /// Signed price: a 64-byte message signed by the book's price signer and checked by the Ed25519 program in the instruction
 /// right before the take: FAST_PX_MAGIC, market key, px u64 (price units), slot u64, ts_ms u64. The newest one (by ts_ms)
 /// a book has seen stands in for the oracle in pegged ladders and tolerance checks while it is at most FAST_PX_MAX_SLOTS old.
