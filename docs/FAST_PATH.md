@@ -141,3 +141,33 @@ field), so takes on 7AY437 failed with BadAccount until they were grown.
 Devnet latency through our own RPC node (Tokyo, non-voting agave 4.3.2; 60 samples each, all landed):
 requote processed p50 0.097 s / p95 0.46 s, confirmed p50 0.15 s / p95 0.87 s; take processed p50 0.073 s / p95 0.45 s,
 confirmed p50 0.087 s / p95 0.85 s.
+
+## Signed fresh prices (2026-11-05, on devnet 7AY437)
+Pegged quotes used to follow the posted oracle, which lands 0.5-1 s after the market moves; a taker who sees the move first
+hits quotes that are still on the old price. Now a take can carry a price signed off chain, and the book prices pegged quotes
+off the newest signed price instead of the oracle.
+- **Message:** 64 bytes `"etfastpx" | market key | px u64 (price units) | slot u64 | ts_ms u64`, signed by the book's
+  `px_signer` (IX 74, admin). Verified by the Ed25519 program in the instruction right before the take; the program reads the
+  key, signature and message only from that instruction's own data (instruction index u16::MAX), so nothing can point it elsewhere.
+- **Book state:** FastBook keeps the newest price by ts_ms (`fast_px`, `fast_slot`, `fast_ts`). An older or foreign signature,
+  another market's price, or one more than 200 bps from the oracle is ignored. The signer's slot is clamped to now.
+- **Use:** while `fast_slot` is at most 8 slots old the signed price replaces the oracle for pegged ladders and tolerance checks.
+  Anyone can push a newer price without trading (IX 75 fast_px_push).
+- **Fresh-only ladders:** ladder flags bits 8-15 = N: the ladder fills only while the book's signed price is at most N slots old
+  (N up to 8). A taker then has to bring a recent signature; the newest one any taker has used wins, so cherry-picking an
+  older signature is bounded to the last N slots and to signatures newer than the book's.
+- **Signer:** `aggregator/px_signer.py` signs the keeper's consensus (FAIR_OUT) every change / 200 ms and keeps the last 64 per
+  book in a tmpfs file. SDK: `fast_px_message`, `ed25519_ix`, `take_fast(..., signed=True)`, `fast_signer`, `fast_px_push`,
+  `ladder_items(..., fresh_slots=N)`; fast_mm config `fresh_slots N`.
+- FastBook 2,136 -> 2,192 bytes (slab_grow; devnet 50 books grown for 0.014 SOL). Program 352,264 B (md5 f06722f31f4a).
+
+| CU (LiteSVM) | before | now |
+|---|---|---|
+| take, 1 maker, 1 fill, no signed price | 2,315 | 2,355 |
+| take, 8 makers, 5 fills | 6,765 | 6,840 |
+| take with a signed price (Ed25519 parse + store) | - | +344 |
+
+Slot units: mainnet slots are 200 ms since 2026-10-09 (SIMD-0525), devnet still about 400 ms. Every *_SLOTS constant is half
+the wall time on mainnet (FAST_PX_MAX_SLOTS 8 = 1.6 s, QUOTE_MAX_AGE_SLOTS 30 = 6 s, TIMELOCK_SLOTS 216000 = 12 h,
+SLOTS_PER_DAY and the default funding period 9000 slots = 30 min). Before mainnet the long durations must move to the clock's
+unix time or be doubled (not done yet).
