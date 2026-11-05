@@ -186,6 +186,7 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
         spec::IX_SLAB_GROW => slab_grow(pid, accs),
         spec::IX_FAST_SIGNER => fast_signer(pid, accs, data),
         spec::IX_FAST_PX => fast_px_push(pid, accs),
+        spec::IX_FAST_REGISTER => fast_register(pid, accs),
         IX_PLACE => batch(pid, accs, data, true),
         IX_BATCH => batch(pid, accs, data, false),
         IX_CANCEL => batch(pid, accs, data, false),
@@ -1071,10 +1072,13 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
     if qty == 0 && !twap { t.triggers[si].kind = 0; gc_pos(t); return Ok(()); } // nothing to reduce: clear, no tip
     if qty == 0 { return Err(err(E::NotTriggered)); }
     // a FastBook among the accounts: fill against maker quotes and resting orders (best price first), same rules as take_fast
-    let filled = if let Some(fx) = rest.iter().find(|x| disc_of(x) == DISC_FAST) {
+    let opp = if bid { 1usize } else { 0usize };
+    let fast_acc = rest.iter().find(|x| disc_of(x) == DISC_FAST);
+    // a market with a registered book for this side always fills through it (the keeper can't route around the makers)
+    if m.fast_book[opp] != [0; 32] && fast_acc.is_none_or(|x| key(x) != m.fast_book[opp]) { return Err(err(E::MissingShards)); }
+    let filled = if let Some(fx) = fast_acc {
         let fb: &mut FastBook = load(fx, pid, DISC_FAST, FAST_SIZE)?;
-        let opp = if bid { 1usize } else { 0usize };
-        if fb.market != mk || (fb.side != 0 && fb.side != opp as u64 + 1) { return Err(err(E::BadAccount)); }
+        if fb.market != mk || (fb.side != 0 && fb.side != opp as u64 + 1) || !book_ok(m, &key(fx), opp) { return Err(err(E::BadAccount)); }
         let px0 = mark(m); let band = quote_band(px0); let (blo, bhi) = bound_range(m);
         let (lo, hi) = (px0.saturating_sub(band).max(blo), (px0 + band).min(bhi));
         let (sl, cnt, _) = collect_slabs(pid, fb, rest, &tk, None, true, true)?;
@@ -1087,7 +1091,12 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
         if w.slices_left == 0 { w.kind = 0; }
         let (eq, im, _) = health(pid, t, &a[3..], nw, true)?;
         if eq < im { return Err(err(E::Margin)); }
-    } else { w.kind = 0; }
+    } else {
+        w.kind = 0;
+        // TP/SL reduce: never leave bad debt (fills may include resting orders from shards the keeper passed)
+        let (eq, _, _) = phealth(pid, t, pi, &a[3..], nw, false)?;
+        if eq < 0 { return Err(err(E::Margin)); }
+    }
     let tip = core::cmp::min(tr.tip, MAX_KEEPER_TIP) as i64;
     t.cash = i64c(t.cash as i128 - tip as i128)?; kp.cash = i64c(kp.cash as i128 + tip as i128)?;
     emit(&[&[EVENTS_TRIGGER as u8, si as u8, tr.kind as u8], &tk, &filled.to_le_bytes()]);
@@ -1797,23 +1806,44 @@ fn slab_init(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
 /// accs: admin(s), market(r), fast(w, zeroed). data: tag, idx u64, [side u8: 0 both, 1 bids, 2 asks]
 fn fast_init(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if a.len() < 3 { return Err(err(E::BadData)); }
-    let m: &Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+    let m: &mut Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
     if !auth(pid, &m.admin, a) { return Err(err(E::BadAccount)); }
     if !a[2].owned_by(pid) || a[2].data_len() < FAST_SIZE || disc_of(&a[2]) != 0 { return Err(err(E::BadAccount)); }
     let idx = rd64(d, 1)?;
     let side = if d.len() > 9 { d[9] as u64 } else { 0 };
     if idx as usize >= SLAB_QUOTES / (2 * SLAB_LEVELS) || side > 2 { return Err(err(E::BadData)); }
+    register_book(m, &key(&a[2]), side)?;
     let f = unsafe { &mut *(a[2].borrow_unchecked().as_ptr() as *mut FastBook) };
     f.disc = DISC_FAST; f.market = key(&a[1]); f.idx = idx; f.side = side;
     Ok(())
 }
-/// Admin approves a maker for this market. accs: admin(s), market(r), fast(w), slab(w)
+/// One book per side: a both-sides book takes both slots, a side book its own. A slot already holding another book is refused.
+fn register_book(m: &mut Market, fk: &Key, side: u64) -> ProgramResult {
+    let slots: &[usize] = match side { 0 => &[0, 1], 1 => &[0], 2 => &[1], _ => return Err(err(E::BadData)) };
+    for &i in slots { if m.fast_book[i] != [0; 32] && m.fast_book[i] != *fk { return Err(err(E::BadAccount)); } }
+    for &i in slots { m.fast_book[i] = *fk; }
+    Ok(())
+}
+/// Admin registers an existing book (made before the registry) as its market's book. accs: admin(s), market(w), fast(r)
+fn fast_register(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
+    if a.len() < 3 { return Err(err(E::BadData)); }
+    let m: &mut Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+    let f: &FastBook = load(&a[2], pid, DISC_FAST, FAST_SIZE)?;
+    if !auth(pid, &m.admin, a) || f.market != key(&a[1]) { return Err(err(E::BadAccount)); }
+    register_book(m, &key(&a[2]), f.side)
+}
+/// The book a taker on `opp` (1 = takes asks / buys, 0 = takes bids / sells) must use: the market's registered one.
+#[inline(always)]
+fn book_ok(m: &Market, fk: &Key, opp: usize) -> bool { m.fast_book[opp] != [0; 32] && m.fast_book[opp] == *fk }
+/// Admin approves a maker for this market; the slab's quoting key co-signs (nobody can bind someone else's quote block).
+/// accs: admin(s), market(r), fast(w), slab(w), slab authority(s)
 fn fast_join(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if a.len() < 4 { return Err(err(E::BadData)); }
     let m: &Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
     let f: &mut FastBook = load(&a[2], pid, DISC_FAST, FAST_SIZE)?;
     let s: &mut Slab = load(&a[3], pid, DISC_SLAB, SLAB_SIZE)?;
     if !auth(pid, &m.admin, a) || f.market != key(&a[1]) { return Err(err(E::BadAccount)); }
+    if a.len() < 5 || !a[4].is_signer() || key(&a[4]) != s.authority { return Err(err(E::BadAccount)); }
     let (n, sk, mk) = (f.n as usize, key(&a[3]), key(&a[1]));
     let ix = (f.idx as usize).min(SLAB_IDX - 1);
     // the slab's quote block for this idx belongs to this market from now on (another market can't claim it)
@@ -1918,7 +1948,7 @@ fn ladder_room(f: &FastBook, l: &Ladder, mi: usize, bid: bool, oracle: u64, slot
 /// transaction). accs: target(w)
 fn slab_grow(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if a.is_empty() || !a[0].owned_by(pid) { return Err(err(E::BadAccount)); }
-    let want = match disc_of(&a[0]) { DISC_SLAB => SLAB_SIZE, DISC_FAST => FAST_SIZE, _ => return Err(err(E::BadAccount)) };
+    let want = match disc_of(&a[0]) { DISC_SLAB => SLAB_SIZE, DISC_FAST => FAST_SIZE, DISC_MARKET => MARKET_SIZE, _ => return Err(err(E::BadAccount)) };
     if a[0].data_len() >= want { return Ok(()); }
     a[0].resize(want)
 }
@@ -2019,7 +2049,8 @@ fn slab_fund(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     u.cash = i64c(u.cash as i128 - amt as i128)?; e.margin = nm;
     // only a settle refills the budget: with fills still unsettled, new margin adds its own budget and nothing more
     e.budget = if unsettled { e.budget.saturating_add(maker_budget(m, nm) - maker_budget(m, om)) } else { maker_budget(m, nm) };
-    if nm > 0 || unsettled { u.pos[pi].flags |= POS_PIN; } else { u.pos[pi].flags &= !POS_PIN; }
+    // set once a maker funds here and kept (another book of the market may still hold its fills): a maker account keeps the slot
+    if nm > 0 || unsettled { u.pos[pi].flags |= POS_PIN; }
     if amt > 0 { let (eq, im, _) = health(pid, u, &a[2..], nw, true)?; if u.cash < 0 || eq < im { return Err(err(E::Margin)); } }
     Ok(())
 }
@@ -2116,23 +2147,23 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let (blo, bhi) = bound_range(m);
     let (lo, hi) = (px0.saturating_sub(band).max(blo), (px0 + band).min(bhi));
     let opp = if bid { 1usize } else { 0usize };
-    if f.side != 0 && f.side != opp as u64 + 1 { return Err(err(E::BadAccount)); } // split market: buyers use the ask book, sellers the bid book
+    if (f.side != 0 && f.side != opp as u64 + 1) || !book_ok(m, &key(&a[3]), opp) { return Err(err(E::BadAccount)); } // the market's book for this side
     let base_ix = (f.idx as usize) << 4 | opp << 3;
     let signer = key(&a[0]);
     let (sl, cnt, _) = collect_slabs(pid, f, &a[4..4 + ns], &uk, Some(&signer), false, false)?; // no self-trade
     let tier = (u.tier as usize).min(TIERS.len() - 1);
     let taker_bps = TIERS[tier].0;
-    if reduce {
-        let (eq0, _, mm0) = phealth(pid, u, pi, &a[2..], nw, false)?;
-        let worst = if bid { limit.min(hi) } else { limit.max(lo) };
-        if !reduce_ok(eq0, mm0, px0, worst, left, taker_bps) { return Err(err(E::Margin)); }
-    }
+
     cp!(8);
     let mut ev = FastEv::new(&uk, bid);
     fast_match(pid, f, &sl[..cnt], base_ix, opp, bid, lo, hi, rest, &mk, m, u, &uk, pi, limit, left, slot, taker_bps, &mut ev, 0)?;
     ev.flush();
     cp!(9);
-    if !reduce {
+    if reduce {
+        // reduce-only never leaves bad debt, whatever it filled against (maker quotes or resting orders from passed shards)
+        let (eq, _, _) = phealth(pid, u, pi, &a[2..], nw, false)?;
+        if eq < 0 { return Err(err(E::Margin)); }
+    } else {
         if m.max_oi != 0 && m.oi_long as i128 + f.oi_long_delta as i128 > m.max_oi as i128 { return Err(err(E::Cap)); }
         let p = &u.pos[pi];
         if m.max_position != 0 && core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs()) > m.max_position as i128 { return Err(err(E::Cap)); }
@@ -2164,7 +2195,8 @@ fn take_fast_batch(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramRes
     let m: &Market = load(&a[0], pid, DISC_MARKET, MARKET_SIZE)?;
     let f: &mut FastBook = load(&a[fi], pid, DISC_FAST, FAST_SIZE)?;
     let mk = key(&a[0]);
-    if f.market != mk || m.strict_take != 0 { return Err(err(E::BadAccount)); }
+    let fk = key(&a[fi]);
+    if f.market != mk || m.strict_take != 0 || !(book_ok(m, &fk, 0) || book_ok(m, &fk, 1)) { return Err(err(E::BadAccount)); }
     let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
     fresh_px(f, &mk, m.oracle_px, clk.slot, &a[ti + 3 * n..])?;
     let px0 = mark(m);
@@ -2178,14 +2210,14 @@ fn take_fast_batch(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramRes
         let o = 4 + k * 18;
         let o_ = (d[o] as u64 == SIDE_BID, d[o + 1] as u64, rd64(d, o + 2)?, rd64(d, o + 10)?);
         let x = &a[ti + 3 * k..ti + 3 * k + 3];
-        batch_take(pid, f, m, &mk, mkts, rest, &sl[..cnt], &x[0], &x[1], &x[2], nw, lo, hi, o_, &mut ev, (k as u64) << 40)?;
+        batch_take(pid, f, &fk, m, &mk, mkts, rest, &sl[..cnt], &x[0], &x[1], &x[2], nw, lo, hi, o_, &mut ev, (k as u64) << 40)?;
     }
     ev.flush();
     Ok(())
 }
 /// One order of take_fast_batch. Ok(()) also when the order is skipped; an error (arithmetic) fails the whole batch.
 #[inline(always)]
-fn batch_take(pid: &Address, f: &mut FastBook, m: &Market, mk: &Key, mkts: &[AccountView], rest: &[AccountView], all: &[(*const Slab, usize)],
+fn batch_take(pid: &Address, f: &mut FastBook, fk: &Key, m: &Market, mk: &Key, mkts: &[AccountView], rest: &[AccountView], all: &[(*const Slab, usize)],
               ua: &AccountView, sa: &AccountView, ra: &AccountView, nw: Now, lo: u64, hi: u64, (bid, fl, limit, mut left): (bool, u64, u64, u64),
               ev: &mut FastEv, idt: u64) -> ProgramResult {
     if left == 0 || left > u32::MAX as u64 || !sa.is_signer() { return Ok(()); }
@@ -2193,7 +2225,7 @@ fn batch_take(pid: &Address, f: &mut FastBook, m: &Market, mk: &Key, mkts: &[Acc
     let uk = key(ua);
     let dmax = if u.authority == key(sa) { u64::MAX } else { match delegate_max_qty(pid, core::slice::from_ref(ra), &key(sa), &uk, nw.0) { Some(x) => x, None => return Ok(()) } };
     let opp = if bid { 1usize } else { 0usize };
-    if left > dmax || u.home_vault != m.vault || (f.side != 0 && f.side != opp as u64 + 1) { return Ok(()); }
+    if left > dmax || u.home_vault != m.vault || (f.side != 0 && f.side != opp as u64 + 1) || !book_ok(m, fk, opp) { return Ok(()); }
     claim_all(pid, u, &uk, rest)?;
     let Ok(pi) = pos_idx(u, mk, m.funding_index) else { return Ok(()) };
     if settle_funding_all(pid, u, mkts).is_err() { gc_pos(u); return Ok(()); }
@@ -2315,11 +2347,12 @@ impl Acc {
 /// Each maker may appear once: a repeat is refused (a duplicated slab would fill the same quote again, past its size, budget and
 /// inventory cap). The slab's quote block must be registered for this market (fast_join). Killed slabs and the taker's own
 /// (`skip_user`, or quotes signed by `skip_auth`) are left out. With `all`, every approved maker must be present, so a
-/// liquidator or trigger keeper can't choose whose quotes fill. Returns the slabs, their count and the bitmask of makers seen.
+/// liquidator or trigger keeper can't choose whose quotes fill. Returns the slabs, their count and the makers whose quote block is
+/// not registered for this market (skipped).
 fn collect_slabs(pid: &Address, f: &FastBook, xs: &[AccountView], skip_user: &Key, skip_auth: Option<&Key>, all: bool, filter: bool)
     -> Result<([(*const Slab, usize); FAST_MAKERS], usize, u64), ProgramError> {
     let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
-    let (mut cnt, mut seen) = (0usize, 0u64);
+    let (mut cnt, mut seen, mut unreg) = (0usize, 0u64, 0u64);
     let n = (f.n as usize).min(FAST_MAKERS);
     for (j, x) in xs.iter().enumerate() {
         if filter && disc_of(x) != DISC_SLAB { continue; }
@@ -2328,17 +2361,17 @@ fn collect_slabs(pid: &Address, f: &FastBook, xs: &[AccountView], skip_user: &Ke
         let mi = if j < n && f.makers[j].slab == k { j } else { f.makers[..n].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))? };
         if seen >> mi & 1 != 0 { return Err(err(E::BadAccount)); }
         seen |= 1 << mi;
-        if s.idx_market[(f.idx as usize).min(SLAB_IDX - 1)] != f.market { return Err(err(E::BadAccount)); }
+        // a block not registered for this market never fills here (and makes the book unprovable for ADL)
+        if s.idx_market[(f.idx as usize).min(SLAB_IDX - 1)] != f.market { unreg |= 1 << mi; continue; }
         if s.kill != 0 || s.user == *skip_user || skip_auth.is_some_and(|a| s.authority == *a) { continue; }
         sl[cnt] = (s as *const Slab, mi); cnt += 1;
     }
     if all && seen != (1u64 << n) - 1 { return Err(err(E::MissingShards)); }
-    Ok((sl, cnt, seen))
+    Ok((sl, cnt, unreg))
 }
-/// Reduce-only fills must not leave bad debt: refused when the position is already liquidatable (that is liquidation's job),
-/// and the worst case of `qty` lots at `worst` (taker fee included) must keep equity at or above zero.
-fn reduce_ok(eq: i128, mm: i128, px0: u64, worst: u64, qty: u64, taker_bps: u64) -> bool {
-    if eq < mm { return false; }
+/// Batch reduce-only orders (maker quotes only, no shards): the worst case of `qty` lots at `worst` (taker fee included) must keep
+/// equity at or above zero, so a reduce-only fill can never leave bad debt. take_fast and triggers check equity after matching.
+fn reduce_ok(eq: i128, _mm: i128, px0: u64, worst: u64, qty: u64, taker_bps: u64) -> bool {
     let slip = qty as i128 * (px0 as i128 - worst as i128).abs();
     let fee = qty as i128 * worst as i128 * taker_bps as i128 / 10000 + 1;
     eq - slip - fee >= 0
@@ -2437,10 +2470,11 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let (blo, bhi) = bound_range(m);
     let (lo, hi) = (px.saturating_sub(band).max(blo).max(1), (px + band).min(bhi));
     let opp = if bid { 1usize } else { 0usize };
-    if f.side != 0 && f.side != opp as u64 + 1 { return Err(err(E::BadAccount)); }
+    if (f.side != 0 && f.side != opp as u64 + 1) || !book_ok(m, &key(&a[3]), opp) { return Err(err(E::BadAccount)); }
     let base_ix = (f.idx as usize) << 4 | opp << 3;
     // every approved maker must be passed: the liquidator can't steer the fill to its own quotes
-    let (sl, cnt, _seen) = collect_slabs(pid, f, &a[4..4 + ns], &tk, None, true, false)?;
+    let (sl, cnt, unreg) = collect_slabs(pid, f, &a[4..4 + ns], &tk, None, true, false)?;
+    let unregistered = unreg != 0;
     let base0 = long(t.pos[pi].base);
     let (mut filled, mut notional) = (0u64, 0i128);
     let mut ev = FastEv::new(&tk, bid);
@@ -2462,7 +2496,13 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
         // no fill opens ADL only when the book really is empty: it has makers (a spare empty book proves nothing), all were
         // passed (checked above), and fresh-only ladders are not merely switched off for want of a current signed price
         let px_fresh = f.fast_px != 0 && slot <= f.fast_slot + spec::FAST_PX_MAX_SLOTS;
-        if m.n_shards != 0 || f.n == 0 || (f.px_signer != [0; 32] && !px_fresh) { return Err(err(E::NoFill)); }
+        if m.n_shards != 0 || f.n == 0 || unregistered || (f.px_signer != [0; 32] && !px_fresh) { return Err(err(E::NoFill)); }
+        // a fresh-only ladder switched off only because the stored signed price is older than its own window is not "empty"
+        let lad = ((f.idx as usize) << 1 | opp).min(SLAB_LADDERS - 1);
+        for &(sp, _) in &sl[..cnt] {
+            let fr = (unsafe { (*sp).lad[lad].flags } >> spec::LADDER_FRESH_SHIFT) as u64;
+            if fr != 0 && (f.fast_px == 0 || slot > f.fast_slot + fr.min(spec::FAST_PX_MAX_SLOTS)) { return Err(err(E::NoFill)); }
+        }
         t.pos[pi].flags = (t.pos[pi].flags & (POS_ISO | POS_PIN)) | spec::POS_FLAG_ADL_ELIGIBLE | (slot << 8);
         emit(&[&[spec::EVENTS_LIQ_NOFILL as u8], &tk, &slot.to_le_bytes()]);
         return Ok(());

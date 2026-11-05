@@ -9,14 +9,14 @@ fn fast_new(e: &mut Env, idx: u64) -> Address {
     let k = Address::new_unique(); e.prog_acct(k, FAST_SIZE);
     let mut d = vec![61u8]; d.extend_from_slice(&idx.to_le_bytes());
     let (a, m) = (e.admin.pubkey(), e.market);
-    e.send("", vec![AccountMeta::new(a, true), r(&m), w(&k)], d, &[], true); k
+    e.send("", vec![AccountMeta::new(a, true), w(&m), w(&k)], d, &[], true); k
 }
 fn maker(e: &mut Env, f: &Address, dep: u64, fund: i64) -> Mk {
     let (kp, u) = e.user(dep);
     let slab = Address::new_unique(); e.prog_acct(slab, SLAB_SIZE);
     e.send("", vec![AccountMeta::new(kp.pubkey(), true), r(&u), w(&slab)], vec![60], &[&kp], true);
     let (a, m) = (e.admin.pubkey(), e.market);
-    e.send("", vec![AccountMeta::new(a, true), r(&m), w(f), w(&slab)], vec![62], &[], true);
+    e.send("", vec![AccountMeta::new(a, true), r(&m), w(f), w(&slab), AccountMeta::new_readonly(kp.pubkey(), true)], vec![62], &[&kp], true);
     let mk = Mk { kp, u, slab };
     if fund != 0 { fund_m(e, f, &mk, fund, true); }
     mk
@@ -88,11 +88,11 @@ fn setup(e: &mut Env) -> (Address, Mk) { e.oracle_update("", 1000_00000000, None
     // can't reuse a fresh account twice
     let (ap, m2) = (e.admin.pubkey(), e.market);
     let mut d = vec![61u8]; d.extend_from_slice(&0u64.to_le_bytes());
-    e.send("", vec![AccountMeta::new(ap, true), r(&m2), w(&f)], d, &[], false);
+    e.send("", vec![AccountMeta::new(ap, true), w(&m2), w(&f)], d, &[], false);
     // idx out of range
     let k3 = Address::new_unique(); e.prog_acct(k3, FAST_SIZE);
     let mut d = vec![61u8]; d.extend_from_slice(&128u64.to_le_bytes());
-    e.send("", vec![AccountMeta::new(ap, true), r(&m2), w(&k3)], d, &[], false);
+    e.send("", vec![AccountMeta::new(ap, true), w(&m2), w(&k3)], d, &[], false);
     // can't lock more margin than cash, can't pull margin with unsettled fills
     fund_m(&mut e, &f, &k, 100_000_000_000, false);
     tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 10, true);
@@ -528,7 +528,7 @@ fn fast_new_side(e: &mut Env, idx: u64, side: u8) -> Address {
     let k = Address::new_unique(); e.prog_acct(k, FAST_SIZE);
     let mut d = vec![61u8]; d.extend_from_slice(&idx.to_le_bytes()); d.push(side);
     let (a, m) = (e.admin.pubkey(), e.market);
-    e.send("", vec![AccountMeta::new(a, true), r(&m), w(&k)], d, &[], true); k
+    e.send("", vec![AccountMeta::new(a, true), w(&m), w(&k)], d, &[], true); k
 }
 /// Split market: buyers fill against the ask book, sellers against the bid book. The two take transactions write disjoint
 /// accounts (their own User and their side's book), so the runtime can run them in parallel; the maker's fills from both
@@ -538,7 +538,7 @@ fn fast_new_side(e: &mut Env, idx: u64, side: u8) -> Address {
     let (fbid, fask) = (fast_new_side(&mut e, 0, 1), fast_new_side(&mut e, 0, 2));
     let k = maker(&mut e, &fbid, 10_000_000_000, 1_000_000_000);
     let (a, m) = (e.admin.pubkey(), e.market); let _ = a;
-    e.send("", vec![AccountMeta::new(e.admin.pubkey(), true), r(&m), w(&fask), w(&k.slab)], vec![62], &[], true);
+    e.send("", vec![AccountMeta::new(e.admin.pubkey(), true), r(&m), w(&fask), w(&k.slab), AccountMeta::new_readonly(k.kp.pubkey(), true)], vec![62], &[&k.kp], true);
     fund_m(&mut e, &fask, &k, 1_000_000_000, true);
     quote(&mut e, &k, &[(ASK, 100_010, 500), (0, 99_990, 500)], true);
     let (bp, bu) = e.user(10_000_000_000); let (sp, su) = e.user(10_000_000_000);
@@ -664,7 +664,7 @@ fn exec_fast(e: &mut Env, kp: &Keypair, ku: &Address, tu: &Address, f: &Address,
     let mut e = Env::new(); e.oracle_update("", 1000_00000000, None);
     let (fbid, fask) = (fast_new_side(&mut e, 0, 1), fast_new_side(&mut e, 0, 2));
     let k = maker(&mut e, &fask, 10_000_000_000, 1_000_000_000);
-    let m = e.market; e.send("", vec![AccountMeta::new(e.admin.pubkey(), true), r(&m), w(&fbid), w(&k.slab)], vec![62], &[], true);
+    let m = e.market; e.send("", vec![AccountMeta::new(e.admin.pubkey(), true), r(&m), w(&fbid), w(&k.slab), AccountMeta::new_readonly(k.kp.pubkey(), true)], vec![62], &[&k.kp], true);
     quote(&mut e, &k, &[(ASK, 100_010, 5_000)], true);
     let (tp, tu) = e.user(10_000_000_000); let (kp, ku) = e.user(1);
     set_trig(&mut e, &tp, &tu, 0, 3, 0, [0, PX + 100, 300, 0, 5, 1]); // buy: needs the ask book
@@ -790,27 +790,18 @@ fn exec_fast(e: &mut Env, kp: &Keypair, ku: &Address, tu: &Address, f: &Address,
     let c = tk(&mut e, &tp, &tu, &f, &all, &[], 0, PX + 1000, 4500, true); show(&e, &format!("8 slabs 5 fills total={c:?}"));
 }
 
-/// Several fill books for one side of one market: each holds its own used tables and maker budgets over the same maker quotes,
-/// so takers on different books write disjoint accounts (their User and their book) and run in parallel. Each book fills a
-/// quote up to its size, so a maker on N books offers N times the size, capped by each book's budget.
-#[test] fn several_books_per_side_fill_in_parallel_and_conserve() {
+/// One book per side per market: a second book for the same side is refused, so a quote can't be filled once per book.
+#[test] fn second_book_for_a_side_is_refused() {
     let mut e = Env::new(); e.oracle_update("", 1000_00000000, None);
-    let (a1, a2) = (fast_new_side(&mut e, 0, 2), fast_new_side(&mut e, 0, 2));
-    let k = maker(&mut e, &a1, 10_000_000_000, 1_000_000_000);
-    let (adm, m) = (e.admin.pubkey(), e.market);
-    e.send("", vec![AccountMeta::new(adm, true), r(&m), w(&a2), w(&k.slab)], vec![62], &[], true);
-    fund_m(&mut e, &a2, &k, 1_000_000_000, true);
-    quote(&mut e, &k, &[(ASK, 100_010, 100)], true);
-    let (t1, u1) = e.user(10_000_000_000); let (t2, u2) = e.user(10_000_000_000);
-    tk(&mut e, &t1, &u1, &a1, &[k.slab], &[], 0, PX + 100, 80, true);
-    tk(&mut e, &t2, &u2, &a2, &[k.slab], &[], 0, PX + 100, 80, true);
-    assert_eq!((e.user_state(&u1).pos[0].base, e.user_state(&u2).pos[0].base), (80, 80));
-    tk(&mut e, &t1, &u1, &a1, &[k.slab], &[], 0, PX + 100, 80, true);
-    assert_eq!(e.user_state(&u1).pos[0].base, 100, "each book fills the quote up to its size once");
-    settle(&mut e, &a1, &k); settle(&mut e, &a2, &k);
-    assert_eq!(e.user_state(&k.u).pos[0].base, -180);
-    let (b1, b2) = (fb(&e, &a1), fb(&e, &a2));
-    assert_eq!((b1.makers[0].base, b2.makers[0].base), (0, 0), "settled into the maker's position");
+    let _a1 = fast_new_side(&mut e, 0, 2);
+    let k = Address::new_unique(); e.prog_acct(k, FAST_SIZE);
+    let mut d = vec![61u8]; d.extend_from_slice(&1u64.to_le_bytes()); d.push(2);
+    let (a, m) = (e.admin.pubkey(), e.market);
+    e.send("", vec![AccountMeta::new(a, true), w(&m), w(&k)], d.clone(), &[], false);
+    let k0 = Address::new_unique(); e.prog_acct(k0, FAST_SIZE); d[9] = 0;
+    e.send("", vec![AccountMeta::new(a, true), w(&m), w(&k0)], d.clone(), &[], false);
+    let kb = Address::new_unique(); e.prog_acct(kb, FAST_SIZE); d[9] = 1;
+    e.send("", vec![AccountMeta::new(a, true), w(&m), w(&kb)], d, &[], true);
 }
 
 fn set_delegate(e: &mut Env, owner: &Keypair, u: &Address, rec: &Address, delegate: &Address, expiry: u64, max_qty: u64) {
@@ -1026,10 +1017,11 @@ fn later(e: &mut Env, slots: u64) { let s = e.slot + slots; e.set_time(s); }
     assert_eq!((e.data(&k.slab).len(), e.data(&f).len()), (SLAB_SIZE, FAST_SIZE));
     assert_eq!(fb(&e, &f).makers[0].margin, 1_000_000_000, "contents kept");
     quote(&mut e, &k, &[(ASK, 100_010, 100)], true);
-    // a grown slab has no market registered for its quote block yet: takes refuse it until the admin re-joins it
-    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 10, false);
+    // a grown slab has no market registered for its quote block yet: takes skip it until the admin re-joins it
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 10, true);
+    assert_eq!(e.user_state(&tu).pos[0].market, [0u8; 32], "nothing filled from an unregistered block");
     let (a, m) = (e.admin.pubkey(), e.market);
-    e.send("rejoin", vec![AccountMeta::new(a, true), r(&m), w(&f), w(&k.slab)], vec![62], &[], true);
+    e.send("rejoin", vec![AccountMeta::new(a, true), r(&m), w(&f), w(&k.slab), AccountMeta::new_readonly(k.kp.pubkey(), true)], vec![62], &[&k.kp], true);
     assert_eq!(fb(&e, &f).n, 1, "re-join registers the block, no second maker entry");
     tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 10, true);
     assert_eq!(e.user_state(&tu).pos[0].base, 10);
@@ -1217,8 +1209,12 @@ fn tk_try(e: &mut Env, kp: &Keypair, u: &Address, f: &Address, slabs: &[Address]
     tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 90_000, true);
     let s = e.slot + 1; e.set_time(s); e.oracle_update("", 910_00000000, None);
     quote(&mut e, &k, &[(0, 90_990, 100_000)], true);
-    let f2 = fast_new(&mut e, 0);
-    assert!(!liq_fast_try(&mut e, &f2, &tu, &[]));
+    // a spare book can't even be registered for the market (one book per side) ...
+    let f2 = Address::new_unique(); e.prog_acct(f2, FAST_SIZE);
+    let mut d = vec![61u8]; d.extend_from_slice(&1u64.to_le_bytes()); let (a, m) = (e.admin.pubkey(), e.market);
+    e.send("", vec![AccountMeta::new(a, true), w(&m), w(&f2)], d, &[], false);
+    // ... and the real book with live bids never opens ADL without the makers
+    assert!(!liq_fast_try(&mut e, &f, &tu, &[]));
     assert_eq!(e.user_state(&tu).pos[0].flags & 2, 0, "not ADL-eligible");
 }
 /// H3: a liquidation must pass every approved maker (no steering the fill to the liquidator's own quotes).
@@ -1239,4 +1235,66 @@ fn tk_try(e: &mut Env, kp: &Keypair, u: &Address, f: &Address, slabs: &[Address]
     let mut e = Env::new(); let (f, k) = setup(&mut e);
     let d = e.data(&k.slab); let o = SLAB_SIZE - 32 * SLAB_IDX;
     assert_eq!(&d[o..o + 32], e.market.as_ref(), "join registered idx 0 for this market");
+}
+
+// ---------- second review round regressions ----------
+fn ro_take(e: &mut Env, kp: &Keypair, u: &Address, f: &Address, slabs: &[Address], rest: &[Address], side: u8, limit: u64, qty: u64) -> bool {
+    let m = e.market;
+    let mut a = vec![AccountMeta::new(kp.pubkey(), true), w(u), r(&m), w(f)]; a.extend(slabs.iter().map(r)); a.extend(rest.iter().map(w));
+    try_send(e, a, take_ix(side, 2, slabs.len() as u8, limit, qty), &[kp])
+}
+fn place_bid(e: &mut Env, kp: &Keypair, u: &Address, shards: &[Address], px: u64, q: u64) {
+    let m = e.market; let mut d = vec![1u8]; d.extend_from_slice(&place_item(0, 1, px, q, 0, 0));
+    e.send("place", trade_accts(kp, u, &m, shards), d, &[kp], true);
+}
+/// Reduce-only into one's own resting bid far below the mark: refused (equity after matching would be negative).
+#[test] fn reg2_reduce_only_resting_bid_no_bad_debt() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let sh = e.shard(0, 50_000);
+    let (ap, au) = e.user(1_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_000, 100_000)], true);
+    tk(&mut e, &ap, &au, &f, &[k.slab], &[], 0, PX, 90_000, true);
+    let (bp, bu) = e.user(10_000_000_000);
+    place_bid(&mut e, &bp, &bu, &[sh], 50_000, 90_000);
+    assert!(!ro_take(&mut e, &ap, &au, &f, &[k.slab], &[sh], 1, 50_000, 90_000));
+    assert!(e.user_state(&au).cash >= 0 || e.user_state(&au).pos[0].base == 90_000);
+}
+/// A stop-loss routed by the keeper into a resting bid far below the mark: refused for the same reason, and the keeper must
+/// bring the market's registered book.
+#[test] fn reg2_trigger_no_bad_debt_and_book_required() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let sh = e.shard(0, 50_000);
+    let (ap, au) = e.user(1_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_000, 100_000)], true);
+    tk(&mut e, &ap, &au, &f, &[k.slab], &[], 0, PX, 90_000, true);
+    let (bp, bu) = e.user(10_000_000_000);
+    place_bid(&mut e, &bp, &bu, &[sh], 50_000, 90_000);
+    set_trig(&mut e, &ap, &au, 0, 2, 1, [u64::MAX, 50_000, 90_000, 0, 0, 0]);
+    let (kp, ku) = e.user(1); let m = e.market;
+    let kpc = kp.insecure_clone();
+    assert!(!try_send(&mut e, vec![AccountMeta::new(kp.pubkey(), true), w(&ku), w(&au), r(&m), w(&sh)], vec![21u8, 0], &[&kpc]), "book left out");
+    assert!(!try_send(&mut e, vec![AccountMeta::new(kp.pubkey(), true), w(&ku), w(&au), r(&m), w(&f), r(&k.slab), w(&sh)], vec![21u8, 0], &[&kpc]), "bad debt");
+}
+/// A fresh-only ladder off only because the stored signed price is older than its own window does not open ADL.
+#[test] fn reg2_adl_not_opened_by_fresh_ladder_window() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(1_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 90_000, true);
+    let sg = Keypair::new(); set_signer(&mut e, &f, &sg.pubkey());
+    let s = e.slot + 1; e.set_time(s); e.oracle_update("", 910_00000000, None);
+    quote(&mut e, &k, &[(0xC000, 0, 1 << 8), (0, 90_990, 100_000)], true);
+    let m = e.market; let s = e.slot;
+    push_px(&mut e, &f, ed_ix(&[(&sg, px_msg(&m, 91_000, s, 1))]));
+    later(&mut e, 3); e.oracle_update("", 910_00000000, None);
+    liq_fast_try(&mut e, &f, &tu, &[k.slab]);
+    assert_eq!(e.user_state(&tu).pos[0].flags & 2, 0, "not ADL-eligible");
+}
+/// Nobody can bind another maker's quote block: joining needs the slab's quoting key.
+#[test] fn reg2_join_needs_slab_signature() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (a, m) = (e.admin.pubkey(), e.market);
+    let other = Keypair::new(); e.svm.airdrop(&other.pubkey(), 1_000_000_000).unwrap();
+    e.send("", vec![AccountMeta::new(a, true), r(&m), w(&f), w(&k.slab), AccountMeta::new_readonly(other.pubkey(), true)], vec![62], &[&other], false);
+    e.send("", vec![AccountMeta::new(a, true), r(&m), w(&f), w(&k.slab)], vec![62], &[], false);
 }

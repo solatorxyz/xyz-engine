@@ -261,7 +261,7 @@ pub const MARKET_PENDING_OP_OFF: u64 = 648;
 pub const MARKET_PENDING_VAL_OFF: u64 = 656;
 pub const MARKET_PENDING_ETA_OFF: u64 = 664;
 pub const MARKET_PENDING_KEY_OFF: u64 = 672;
-pub const MARKET_SIZE: u64 = 832;
+pub const MARKET_SIZE: u64 = 896;
 pub const TRIGGER_MARKET_OFF: u64 = 0;
 pub const TRIGGER_KIND_OFF: u64 = 32;
 pub const TRIGGER_SIDE_OFF: u64 = 40;
@@ -328,6 +328,8 @@ pub const QUOTE_ITEM_SIZE: usize = 10;
 pub const IX_SLAB_GROW: u64 = 73;
 pub const IX_FAST_SIGNER: u64 = 74;
 pub const IX_FAST_PX: u64 = 75;
+/// Admin registers an existing FastBook as its market's book for its side(s). accs: admin(s), market(w), fast(r)
+pub const IX_FAST_REGISTER: u64 = 76;
 /// Signed price: a 64-byte message signed by the book's price signer and checked by the Ed25519 program in the instruction
 /// right before the take: FAST_PX_MAGIC, market key, px u64 (price units), slot u64, ts_ms u64. The newest one (by ts_ms)
 /// a book has seen stands in for the oracle in pegged ladders and tolerance checks while it is at most FAST_PX_MAX_SLOTS old.

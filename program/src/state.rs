@@ -54,6 +54,9 @@ pub struct Market {
     pub ext_px: u64, pub ext_ts: i64,
     /// key allowed to flip `session` (the keeper), besides the admin
     pub session_auth: Key,
+    /// The market's FastBooks: [0] takes sells (makers' bids), [1] takes buys (makers' asks); a both-sides book sits in both.
+    /// One book per side, registered by the admin (fast_init / fast_register); every fast path uses exactly these.
+    pub fast_book: [Key; 2],
 }
 
 #[repr(C)]

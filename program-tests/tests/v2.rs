@@ -122,10 +122,10 @@ fn agg_oracle(e: &mut Env, px: i64, ext: i64, ext_ts: i64) {
     let mut e = Env::new(); e.oracle_update("", 1000_00000000, None);
     let f = Address::new_unique(); e.prog_acct(f, FAST_SIZE);
     let mut d = vec![61u8]; d.extend_from_slice(&0u64.to_le_bytes()); let (a, m) = (e.admin.pubkey(), e.market);
-    e.send("", vec![AccountMeta::new(a, true), r(&m), w(&f)], d, &[], true);
+    e.send("", vec![AccountMeta::new(a, true), w(&m), w(&f)], d, &[], true);
     let (kp, u) = e.user(10_000_000_000); let slab = Address::new_unique(); e.prog_acct(slab, SLAB_SIZE);
     e.send("", vec![AccountMeta::new(kp.pubkey(), true), r(&u), w(&slab)], vec![60], &[&kp], true);
-    e.send("", vec![AccountMeta::new(a, true), r(&m), w(&f), w(&slab)], vec![62], &[], true);
+    e.send("", vec![AccountMeta::new(a, true), r(&m), w(&f), w(&slab), AccountMeta::new_readonly(kp.pubkey(), true)], vec![62], &[&kp], true);
     let mut d = vec![64u8]; d.extend_from_slice(&1_000_000_000i64.to_le_bytes());
     e.send("", vec![AccountMeta::new(kp.pubkey(), true), w(&u), r(&m), w(&f)], d, &[&kp], true);
     let mut q = vec![63u8]; for (i, p) in [(0u16, 100_090u32), (ASK, 100_110)] { q.extend_from_slice(&i.to_le_bytes()); q.extend_from_slice(&p.to_le_bytes()); q.extend_from_slice(&100u32.to_le_bytes()); }
