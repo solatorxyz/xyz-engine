@@ -425,6 +425,10 @@ type Now = (u64, i64);
 fn stale(m: &Market, nw: Now) -> bool { m.oracle_px == 0 || nw.0 > m.oracle_slot + m.max_staleness_slots || nw.1.saturating_sub(m.oracle_ts) > m.max_age_secs as i64 }
 /// (equity, initial req (net-of-resting), maintenance req)
 const POS_ISO: u64 = 1;
+const POS_PIN: u64 = spec::POS_FLAG_MAKER_PIN;
+/// Price window of fast-path fills around the mark (no rounding to zero for low prices).
+#[inline(always)]
+fn quote_band(px: u64) -> u64 { (px as u128 * spec::QUOTE_BAND_BPS as u128 / 10000) as u64 }
 /// Isolated position: equity = iso_margin + base * mark (all of the position's cash flows are booked to iso_margin).
 fn iso_health(pid: &Address, u: &User, pi: usize, a: &[AccountView], nw: Now, need_fresh: bool) -> Result<(i128, i128, i128), ProgramError> {
     let p = &u.pos[pi]; let m = find_market(pid, &p.market, a)?;
@@ -509,7 +513,7 @@ fn gc_pos(u: &mut User) {
     for i in 0..MAX_POS {
         let p = &mut u.pos[i];
         if p.market == [0; 32] { break; }
-        if p.base == 0 { p.cost = 0; p.flags &= POS_ISO; if p.bid_open == 0 && p.ask_open == 0 && p.iso_margin == 0 && p.flags == 0 { p.market = [0; 32]; continue; } }
+        if p.base == 0 { p.cost = 0; p.flags &= POS_ISO | POS_PIN; if p.bid_open == 0 && p.ask_open == 0 && p.iso_margin == 0 && p.flags == 0 { p.market = [0; 32]; continue; } }
         if i != j { u.pos.swap(i, j); }
         j += 1;
     }
@@ -1071,9 +1075,9 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
         let fb: &mut FastBook = load(fx, pid, DISC_FAST, FAST_SIZE)?;
         let opp = if bid { 1usize } else { 0usize };
         if fb.market != mk || (fb.side != 0 && fb.side != opp as u64 + 1) { return Err(err(E::BadAccount)); }
-        let px0 = mark(m); let band = px0 / 10000 * spec::QUOTE_BAND_BPS; let (blo, bhi) = bound_range(m);
+        let px0 = mark(m); let band = quote_band(px0); let (blo, bhi) = bound_range(m);
         let (lo, hi) = (px0.saturating_sub(band).max(blo), (px0 + band).min(bhi));
-        let (sl, cnt) = fast_slabs(pid, fb, rest, &tk)?;
+        let (sl, cnt, _) = collect_slabs(pid, fb, rest, &tk, None, true, true)?;
         { let mut ev = FastEv::new(&tk, bid); let r = fast_match(pid, fb, &sl[..cnt], (fb.idx as usize) << 4 | opp << 3, opp, bid, lo, hi, rest, &mk, m, t, &tk, pi, tr.limit_px, qty, slot, taker_bps, &mut ev, 0)?; ev.flush(); r }
     } else { take(pid, rest, &mk, m, t, &tk, pi, bid, tr.limit_px, qty, slot, taker_bps, STP_CANCEL_OLDEST)?.filled };
     if filled == 0 { return Err(err(E::NotTriggered)); } // AUDIT M-1: no tip / no slice burn without a fill
@@ -1447,17 +1451,17 @@ fn aggregate(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
         if disc_of(x) == DISC_FAST {
             let f: &mut FastBook = load(x, pid, DISC_FAST, FAST_SIZE)?;
             if f.market != mk { return Err(err(E::BadAccount)); }
-            m.oi_long = (m.oi_long as i64 + f.oi_long_delta) as u64; f.oi_long_delta = 0;
+            m.oi_long = m.oi_long.wrapping_add_signed(f.oi_long_delta); f.oi_long_delta = 0; // partial sums may dip below zero; the total is exact
             m.fees += f.fee_accum; f.fee_accum = 0; continue;
         }
         if disc_of(x) == DISC_INS {
             let ins: &mut Insurance = load(x, pid, DISC_INS, INS_SIZE)?;
             if ins.market != mk { return Err(err(E::BadAccount)); }
-            m.oi_long = (m.oi_long as i64 + ins.oi_long_delta) as u64; ins.oi_long_delta = 0; continue;
+            m.oi_long = m.oi_long.wrapping_add_signed(ins.oi_long_delta); ins.oi_long_delta = 0; continue; // partial sums may dip below zero; the total is exact
         }
         let s: &mut Shard = load(x, pid, DISC_SHARD, SHARD_SIZE)?;
         if s.market != mk { return Err(err(E::BadAccount)); }
-        m.oi_long = (m.oi_long as i64 + s.oi_long_delta) as u64; s.oi_long_delta = 0;
+        m.oi_long = m.oi_long.wrapping_add_signed(s.oi_long_delta); s.oi_long_delta = 0; // partial sums may dip below zero; the total is exact
         m.fees += s.fee_accum; s.fee_accum = 0;
     }
     Ok(())
@@ -1587,7 +1591,7 @@ fn liquidate_book(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
         }
         let all = if m.n_shards == 64 { u64::MAX } else { (1u64 << m.n_shards) - 1 };
         if seen & all != all { return Err(err(E::NoFill)); }
-        t.pos[pi].flags = (t.pos[pi].flags & POS_ISO) | spec::POS_FLAG_ADL_ELIGIBLE | (clk.slot << 8);
+        t.pos[pi].flags = (t.pos[pi].flags & (POS_ISO | POS_PIN)) | spec::POS_FLAG_ADL_ELIGIBLE | (clk.slot << 8);
         emit(&[&[spec::EVENTS_LIQ_NOFILL as u8], &tk, &clk.slot.to_le_bytes()]);
         return Ok(());
     }
@@ -1803,16 +1807,21 @@ fn fast_init(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     f.disc = DISC_FAST; f.market = key(&a[1]); f.idx = idx; f.side = side;
     Ok(())
 }
-/// Admin approves a maker for this market. accs: admin(s), market(r), fast(w), slab(r)
+/// Admin approves a maker for this market. accs: admin(s), market(r), fast(w), slab(w)
 fn fast_join(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if a.len() < 4 { return Err(err(E::BadData)); }
     let m: &Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
     let f: &mut FastBook = load(&a[2], pid, DISC_FAST, FAST_SIZE)?;
     let s: &mut Slab = load(&a[3], pid, DISC_SLAB, SLAB_SIZE)?;
     if !auth(pid, &m.admin, a) || f.market != key(&a[1]) { return Err(err(E::BadAccount)); }
-    let (n, sk) = (f.n as usize, key(&a[3]));
+    let (n, sk, mk) = (f.n as usize, key(&a[3]), key(&a[1]));
+    let ix = (f.idx as usize).min(SLAB_IDX - 1);
+    // the slab's quote block for this idx belongs to this market from now on (another market can't claim it)
+    if s.idx_market[ix] != [0; 32] && s.idx_market[ix] != mk { return Err(err(E::BadAccount)); }
+    s.idx_market[ix] = mk;
+    if f.makers[..n].iter().any(|x| x.slab == sk) { return Ok(()); } // re-join only registers the block (migration)
     if n >= FAST_MAKERS { return Err(err(E::Cap)); }
-    if f.makers[..n].iter().any(|x| x.slab == sk) { return Err(err(E::BadAccount)); }
+    if f.makers[..n].iter().any(|x| x.user == s.user) { return Err(err(E::BadAccount)); } // one slab per maker account
     f.makers[n] = FastMaker { slab: sk, user: s.user, margin: 0, budget: 0, base: 0, quote: 0, volume: 0, target: 0 };
     f.n += 1;
     Ok(())
@@ -1940,7 +1949,7 @@ fn fresh_px(f: &mut FastBook, mk: &Key, oracle: u64, slot: u64, xs: &[AccountVie
         if d.len() < pk + 32 || d.len() < mo + spec::FAST_PX_MSG { continue; }
         if d[pk..pk + 32] != f.px_signer || d[mo..mo + 8] != spec::FAST_PX_MAGIC || d[mo + 8..mo + 40] != *mk { continue; }
         let (px, sl, ts) = (rd64(d, mo + 40)?, rd64(d, mo + 48)?, rd64(d, mo + 56)?);
-        if ts <= f.fast_ts || px == 0 || px >> 32 != 0 || moved(px, oracle, spec::FAST_PX_MAX_DEV_BPS) { continue; }
+        if ts <= f.fast_ts || px == 0 || px >> 32 != 0 || sl + spec::FAST_PX_TAKE_SLOTS < slot || moved(px, oracle, spec::FAST_PX_MAX_DEV_BPS) { continue; }
         f.fast_px = px; f.fast_slot = sl.min(slot); f.fast_ts = ts;
     }
     Ok(())
@@ -1997,14 +2006,20 @@ fn slab_fund(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let n = f.n as usize;
     let mi = f.makers[..n].iter().position(|x| x.user == uk).ok_or(err(E::BadAccount))?;
     f.ext[mi] = maker_ext(u, &mk);
+    // the maker always has a position slot here while quoting, so settles never run out of slots (pinned until released)
+    let pi = pos_idx(u, &mk, m.funding_index)?;
     let e = &mut f.makers[mi];
-    if amt < 0 && (e.base != 0 || e.quote != 0) { return Err(err(E::Ledger)); } // settle first
+    let unsettled = e.base != 0 || e.quote != 0;
+    if amt < 0 && unsettled { return Err(err(E::Ledger)); } // settle first
     if let Some(t) = tgt { e.target = t; }
-    let nm = i64c(e.margin as i128 + amt as i128)?;
+    let om = e.margin;
+    let nm = i64c(om as i128 + amt as i128)?;
     if nm < 0 { return Err(err(E::Margin)); }
     settle_funding_all(pid, u, &a[2..])?;
     u.cash = i64c(u.cash as i128 - amt as i128)?; e.margin = nm;
-    e.budget = maker_budget(m, nm);
+    // only a settle refills the budget: with fills still unsettled, new margin adds its own budget and nothing more
+    e.budget = if unsettled { e.budget.saturating_add(maker_budget(m, nm) - maker_budget(m, om)) } else { maker_budget(m, nm) };
+    if nm > 0 || unsettled { u.pos[pi].flags |= POS_PIN; } else { u.pos[pi].flags &= !POS_PIN; }
     if amt > 0 { let (eq, im, _) = health(pid, u, &a[2..], nw, true)?; if u.cash < 0 || eq < im { return Err(err(E::Margin)); } }
     Ok(())
 }
@@ -2097,30 +2112,28 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
         if stale(m, nw) { return Err(err(E::Stale)); }
     }
     let px0 = mark(m);
-    let band = (px0 / 10000).wrapping_mul(spec::QUOTE_BAND_BPS); // < 2^64: px0 / 10000 * 500
+    let band = quote_band(px0);
     let (blo, bhi) = bound_range(m);
     let (lo, hi) = (px0.saturating_sub(band).max(blo), (px0 + band).min(bhi));
     let opp = if bid { 1usize } else { 0usize };
     if f.side != 0 && f.side != opp as u64 + 1 { return Err(err(E::BadAccount)); } // split market: buyers use the ask book, sellers the bid book
     let base_ix = (f.idx as usize) << 4 | opp << 3;
-    let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
-    let mut cnt = 0;
-    for (j, x) in a[4..4 + ns].iter().enumerate() {
-        let s: &Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
-        let k = key(x);
-        let mi = if j < f.n as usize && f.makers[j].slab == k { j } else { f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))? };
-        if s.kill != 0 || s.user == uk { continue; } // no self-trade against own slab
-        sl[cnt] = (s as *const Slab, mi); cnt += 1;
-    }
+    let signer = key(&a[0]);
+    let (sl, cnt, _) = collect_slabs(pid, f, &a[4..4 + ns], &uk, Some(&signer), false, false)?; // no self-trade
     let tier = (u.tier as usize).min(TIERS.len() - 1);
     let taker_bps = TIERS[tier].0;
+    if reduce {
+        let (eq0, _, mm0) = phealth(pid, u, pi, &a[2..], nw, false)?;
+        let worst = if bid { limit.min(hi) } else { limit.max(lo) };
+        if !reduce_ok(eq0, mm0, px0, worst, left, taker_bps) { return Err(err(E::Margin)); }
+    }
     cp!(8);
     let mut ev = FastEv::new(&uk, bid);
     fast_match(pid, f, &sl[..cnt], base_ix, opp, bid, lo, hi, rest, &mk, m, u, &uk, pi, limit, left, slot, taker_bps, &mut ev, 0)?;
     ev.flush();
     cp!(9);
     if !reduce {
-        if m.max_oi != 0 && m.oi_long > m.max_oi { return Err(err(E::Cap)); }
+        if m.max_oi != 0 && m.oi_long as i128 + f.oi_long_delta as i128 > m.max_oi as i128 { return Err(err(E::Cap)); }
         let p = &u.pos[pi];
         if m.max_position != 0 && core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs()) > m.max_position as i128 { return Err(err(E::Cap)); }
         cp!(10);
@@ -2155,18 +2168,10 @@ fn take_fast_batch(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramRes
     let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
     fresh_px(f, &mk, m.oracle_px, clk.slot, &a[ti + 3 * n..])?;
     let px0 = mark(m);
-    let band = (px0 / 10000).wrapping_mul(spec::QUOTE_BAND_BPS);
+    let band = quote_band(px0);
     let (blo, bhi) = bound_range(m);
     let (lo, hi) = (px0.saturating_sub(band).max(blo), (px0 + band).min(bhi));
-    let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
-    let mut cnt = 0;
-    for (j, x) in a[fi + 1..fi + 1 + ns].iter().enumerate() {
-        let s: &Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
-        let k = key(x);
-        let mi = if j < f.n as usize && f.makers[j].slab == k { j } else { f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))? };
-        if s.kill != 0 { continue; }
-        sl[cnt] = (s as *const Slab, mi); cnt += 1;
-    }
+    let (sl, cnt, _) = collect_slabs(pid, f, &a[fi + 1..fi + 1 + ns], &[0; 32], None, false, false)?;
     let (mkts, rest) = (&a[..1 + nm], &a[ti + 3 * n..]);
     let mut ev = FastEv::with(spec::EVENTS_FAST_BATCH as u8, 0, &key(&a[fi]));
     for k in 0..n {
@@ -2196,12 +2201,19 @@ fn batch_take(pid: &Address, f: &mut FastBook, m: &Market, mk: &Key, mkts: &[Acc
     if fl & FLAG_REDUCE_ONLY != 0 {
         let b = u.pos[pi].base;
         left = left.min(if bid && b < 0 { (-b) as u64 } else if !bid && b > 0 { b as u64 } else { 0 });
-    } else if m.paused != 0 || stale(m, nw) || u.pos[pi].flags & POS_ISO != 0 || (m.max_oi != 0 && m.oi_long > m.max_oi)
+        if left > 0 {
+            let ok = match phealth(pid, u, pi, mkts, nw, false) {
+                Ok((eq0, _, mm0)) => reduce_ok(eq0, mm0, mark(m), if bid { limit.min(hi) } else { limit.max(lo) }, left, taker_bps),
+                Err(_) => false };
+            if !ok { left = 0; }
+        }
+    } else if m.paused != 0 || stale(m, nw) || u.pos[pi].flags & POS_ISO != 0 || (m.max_oi != 0 && m.oi_long as i128 + f.oi_long_delta as i128 > m.max_oi as i128)
         || !worst_ok(pid, u, pi, mkts, nw, m, bid, left, if bid { limit.min(hi) } else { limit.max(lo) }, taker_bps) { left = 0; }
     if left > 0 {
         let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
         let mut cnt = 0;
-        for &(sp, mi) in all { if unsafe { (*sp).user } != uk { sl[cnt] = (sp, mi); cnt += 1; } } // no self-trade
+        let sk = key(sa);
+        for &(sp, mi) in all { let (su, sa_) = unsafe { ((*sp).user, (*sp).authority) }; if su != uk && sa_ != sk { sl[cnt] = (sp, mi); cnt += 1; } } // no self-trade
         fast_match(pid, f, &sl[..cnt], (f.idx as usize) << 4 | opp << 3, opp, bid, lo, hi, &[], mk, m, u, &uk, pi, limit, left, nw.0, taker_bps, ev, idt | (opp as u64 ^ 1) << 39)?;
     }
     gc_pos(u);
@@ -2299,18 +2311,37 @@ impl Acc {
         Ok(())
     }
 }
-/// Approved makers' slabs found in `xs`, skipping killed ones and the taker's own. Every slab must belong to this book.
-fn fast_slabs(pid: &Address, f: &FastBook, xs: &[AccountView], uk: &Key) -> Result<([(*const Slab, usize); FAST_MAKERS], usize), ProgramError> {
+/// Approved slabs of book `f` among `xs` (only slab accounts are looked at when `filter`; otherwise every account must be one).
+/// Each maker may appear once: a repeat is refused (a duplicated slab would fill the same quote again, past its size, budget and
+/// inventory cap). The slab's quote block must be registered for this market (fast_join). Killed slabs and the taker's own
+/// (`skip_user`, or quotes signed by `skip_auth`) are left out. With `all`, every approved maker must be present, so a
+/// liquidator or trigger keeper can't choose whose quotes fill. Returns the slabs, their count and the bitmask of makers seen.
+fn collect_slabs(pid: &Address, f: &FastBook, xs: &[AccountView], skip_user: &Key, skip_auth: Option<&Key>, all: bool, filter: bool)
+    -> Result<([(*const Slab, usize); FAST_MAKERS], usize, u64), ProgramError> {
     let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
-    let mut cnt = 0;
-    for x in xs.iter().filter(|x| disc_of(x) == DISC_SLAB) {
+    let (mut cnt, mut seen) = (0usize, 0u64);
+    let n = (f.n as usize).min(FAST_MAKERS);
+    for (j, x) in xs.iter().enumerate() {
+        if filter && disc_of(x) != DISC_SLAB { continue; }
         let s: &Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
         let k = key(x);
-        let mi = f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))?;
-        if s.kill != 0 || s.user == *uk || cnt == FAST_MAKERS { continue; }
+        let mi = if j < n && f.makers[j].slab == k { j } else { f.makers[..n].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))? };
+        if seen >> mi & 1 != 0 { return Err(err(E::BadAccount)); }
+        seen |= 1 << mi;
+        if s.idx_market[(f.idx as usize).min(SLAB_IDX - 1)] != f.market { return Err(err(E::BadAccount)); }
+        if s.kill != 0 || s.user == *skip_user || skip_auth.is_some_and(|a| s.authority == *a) { continue; }
         sl[cnt] = (s as *const Slab, mi); cnt += 1;
     }
-    Ok((sl, cnt))
+    if all && seen != (1u64 << n) - 1 { return Err(err(E::MissingShards)); }
+    Ok((sl, cnt, seen))
+}
+/// Reduce-only fills must not leave bad debt: refused when the position is already liquidatable (that is liquidation's job),
+/// and the worst case of `qty` lots at `worst` (taker fee included) must keep equity at or above zero.
+fn reduce_ok(eq: i128, mm: i128, px0: u64, worst: u64, qty: u64, taker_bps: u64) -> bool {
+    if eq < mm { return false; }
+    let slip = qty as i128 * (px0 as i128 - worst as i128).abs();
+    let fee = qty as i128 * worst as i128 * taker_bps as i128 / 10000 + 1;
+    eq - slip - fee >= 0
 }
 /// One level a taker could hit: price (0 = none), lots, quote slot, level, and the first usable level at that price (a fill
 /// leaves every level above that one unusable, so the slab is looked at again from there).
@@ -2402,22 +2433,14 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let mut left = ab.min(max_qty).min(liq_chunk(ab)).min(liq_needed(eq, mm, ab, px, m.mmr_bps));
     if left == 0 { return Err(err(E::BadData)); }
     // same price window as an ordinary take: a liquidation never reaches quotes a taker couldn't
-    let band = px / 10000 * spec::QUOTE_BAND_BPS;
+    let band = quote_band(px);
     let (blo, bhi) = bound_range(m);
     let (lo, hi) = (px.saturating_sub(band).max(blo).max(1), (px + band).min(bhi));
     let opp = if bid { 1usize } else { 0usize };
     if f.side != 0 && f.side != opp as u64 + 1 { return Err(err(E::BadAccount)); }
     let base_ix = (f.idx as usize) << 4 | opp << 3;
-    let mut sl: [(*const Slab, usize); FAST_MAKERS] = [(core::ptr::null(), 0); FAST_MAKERS];
-    let (mut cnt, mut seen) = (0usize, 0u64);
-    for (j, x) in a[4..4 + ns].iter().enumerate() {
-        let s: &Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
-        let k = key(x);
-        let mi = if j < f.n as usize && f.makers[j].slab == k { j } else { f.makers[..f.n as usize].iter().position(|e| e.slab == k).ok_or(err(E::BadAccount))? };
-        seen |= 1 << mi;
-        if s.kill != 0 || s.user == tk { continue; }
-        sl[cnt] = (s as *const Slab, mi); cnt += 1;
-    }
+    // every approved maker must be passed: the liquidator can't steer the fill to its own quotes
+    let (sl, cnt, _seen) = collect_slabs(pid, f, &a[4..4 + ns], &tk, None, true, false)?;
     let base0 = long(t.pos[pi].base);
     let (mut filled, mut notional) = (0u64, 0i128);
     let mut ev = FastEv::new(&tk, bid);
@@ -2436,9 +2459,11 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     }
     ev.flush();
     if filled == 0 {
-        let all = if f.n >= 64 { u64::MAX } else { (1u64 << f.n) - 1 };
-        if m.n_shards != 0 || seen & all != all { return Err(err(E::NoFill)); }
-        t.pos[pi].flags = (t.pos[pi].flags & POS_ISO) | spec::POS_FLAG_ADL_ELIGIBLE | (slot << 8);
+        // no fill opens ADL only when the book really is empty: it has makers (a spare empty book proves nothing), all were
+        // passed (checked above), and fresh-only ladders are not merely switched off for want of a current signed price
+        let px_fresh = f.fast_px != 0 && slot <= f.fast_slot + spec::FAST_PX_MAX_SLOTS;
+        if m.n_shards != 0 || f.n == 0 || (f.px_signer != [0; 32] && !px_fresh) { return Err(err(E::NoFill)); }
+        t.pos[pi].flags = (t.pos[pi].flags & (POS_ISO | POS_PIN)) | spec::POS_FLAG_ADL_ELIGIBLE | (slot << 8);
         emit(&[&[spec::EVENTS_LIQ_NOFILL as u8], &tk, &slot.to_le_bytes()]);
         return Ok(());
     }

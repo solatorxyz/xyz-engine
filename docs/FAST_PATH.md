@@ -171,3 +171,22 @@ Slot units: mainnet slots are 200 ms since 2026-10-09 (SIMD-0525), devnet still 
 the wall time on mainnet (FAST_PX_MAX_SLOTS 8 = 1.6 s, QUOTE_MAX_AGE_SLOTS 30 = 6 s, TIMELOCK_SLOTS 216000 = 12 h,
 SLOTS_PER_DAY and the default funding period 9000 slots = 30 min). Before mainnet the long durations must move to the clock's
 unix time or be doubled (not done yet).
+
+## Review fixes (hl-fix)
+
+Each item below was a reproduced exploit on 6c48710 and now has a regression test (`program-tests/tests/fast.rs`, `reg_*`).
+
+- **Budget only refills on settle.** `slab_fund` while fills are unsettled adds the new margin's budget to what is left instead of resetting it (an amount-0 fund used to refill the whole budget, so unsettled exposure grew without margin).
+- **Each maker once per take.** `collect_slabs` (take_fast, take_fast_batch, triggers, liquidate_fast) refuses a slab that appears twice; a repeat used to fill the same quote again past its size, budget and inventory cap.
+- **Reduce-only cannot create bad debt.** Refused when the position is already below maintenance (liquidation's job), and the worst case (limit inside the band, taker fee) must keep equity ≥ 0. Same rule in batches (the order is skipped).
+- **ADL needs a provably empty book.** liquidate_fast needs every approved maker (no steering to the liquidator's own quotes), a book with makers (a spare empty book proves nothing), and, when the book takes signed prices, a current one (fresh-only ladders are not "empty" just because no price was attached). Triggers also need every maker.
+- **Quote blocks are bound to their market.** `fast_join` writes `Slab.idx_market[idx] = market`; takes refuse a slab whose block belongs to another market. Slabs grow by 4,096 B (`SLAB_SIZE` 41,056). Migration: upgrade → `grow_all.py --go` → `rejoin_all.py` (a re-join of an approved slab only registers the block).
+- **Signed prices are current.** A take accepts a signed price at most `FAST_PX_TAKE_SLOTS` (2) slots old, so a taker can't pick the best of the last few. `px_signer.py` signs nothing when the keeper's fair price is older than `FAIR_MAX_AGE_MS` (400 ms) and carries the slot forward at the measured slot time (200 ms ready).
+- **Maker settles always have a position slot.** `slab_fund` pins the maker's position in the market (`POS_FLAG_MAKER_PIN`) while margin is locked or fills are unsettled; `gc_pos` keeps pinned slots.
+- **OI cap counts the book's pending fills** (`oi_long + oi_long_delta`).
+- **No self-trade by quoting key**: a taker signing with the slab's quoting key never fills its own quotes.
+- **Price band without rounding to zero** for prices below 10,000 units.
+- **One slab per maker account per book.**
+- `fast_mm`: compute limit sized to each quote chunk (a flat 4,000 CU failed chunks with ladder settings).
+
+Operational constraints (admin): one FastBook per side per market (the inventory cap is per book), at most 8 makers per book.

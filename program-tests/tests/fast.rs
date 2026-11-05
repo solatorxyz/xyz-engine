@@ -16,7 +16,7 @@ fn maker(e: &mut Env, f: &Address, dep: u64, fund: i64) -> Mk {
     let slab = Address::new_unique(); e.prog_acct(slab, SLAB_SIZE);
     e.send("", vec![AccountMeta::new(kp.pubkey(), true), r(&u), w(&slab)], vec![60], &[&kp], true);
     let (a, m) = (e.admin.pubkey(), e.market);
-    e.send("", vec![AccountMeta::new(a, true), r(&m), w(f), r(&slab)], vec![62], &[], true);
+    e.send("", vec![AccountMeta::new(a, true), r(&m), w(f), w(&slab)], vec![62], &[], true);
     let mk = Mk { kp, u, slab };
     if fund != 0 { fund_m(e, f, &mk, fund, true); }
     mk
@@ -538,7 +538,7 @@ fn fast_new_side(e: &mut Env, idx: u64, side: u8) -> Address {
     let (fbid, fask) = (fast_new_side(&mut e, 0, 1), fast_new_side(&mut e, 0, 2));
     let k = maker(&mut e, &fbid, 10_000_000_000, 1_000_000_000);
     let (a, m) = (e.admin.pubkey(), e.market); let _ = a;
-    e.send("", vec![AccountMeta::new(e.admin.pubkey(), true), r(&m), w(&fask), r(&k.slab)], vec![62], &[], true);
+    e.send("", vec![AccountMeta::new(e.admin.pubkey(), true), r(&m), w(&fask), w(&k.slab)], vec![62], &[], true);
     fund_m(&mut e, &fask, &k, 1_000_000_000, true);
     quote(&mut e, &k, &[(ASK, 100_010, 500), (0, 99_990, 500)], true);
     let (bp, bu) = e.user(10_000_000_000); let (sp, su) = e.user(10_000_000_000);
@@ -664,7 +664,7 @@ fn exec_fast(e: &mut Env, kp: &Keypair, ku: &Address, tu: &Address, f: &Address,
     let mut e = Env::new(); e.oracle_update("", 1000_00000000, None);
     let (fbid, fask) = (fast_new_side(&mut e, 0, 1), fast_new_side(&mut e, 0, 2));
     let k = maker(&mut e, &fask, 10_000_000_000, 1_000_000_000);
-    let m = e.market; e.send("", vec![AccountMeta::new(e.admin.pubkey(), true), r(&m), w(&fbid), r(&k.slab)], vec![62], &[], true);
+    let m = e.market; e.send("", vec![AccountMeta::new(e.admin.pubkey(), true), r(&m), w(&fbid), w(&k.slab)], vec![62], &[], true);
     quote(&mut e, &k, &[(ASK, 100_010, 5_000)], true);
     let (tp, tu) = e.user(10_000_000_000); let (kp, ku) = e.user(1);
     set_trig(&mut e, &tp, &tu, 0, 3, 0, [0, PX + 100, 300, 0, 5, 1]); // buy: needs the ask book
@@ -798,7 +798,7 @@ fn exec_fast(e: &mut Env, kp: &Keypair, ku: &Address, tu: &Address, f: &Address,
     let (a1, a2) = (fast_new_side(&mut e, 0, 2), fast_new_side(&mut e, 0, 2));
     let k = maker(&mut e, &a1, 10_000_000_000, 1_000_000_000);
     let (adm, m) = (e.admin.pubkey(), e.market);
-    e.send("", vec![AccountMeta::new(adm, true), r(&m), w(&a2), r(&k.slab)], vec![62], &[], true);
+    e.send("", vec![AccountMeta::new(adm, true), r(&m), w(&a2), w(&k.slab)], vec![62], &[], true);
     fund_m(&mut e, &a2, &k, 1_000_000_000, true);
     quote(&mut e, &k, &[(ASK, 100_010, 100)], true);
     let (t1, u1) = e.user(10_000_000_000); let (t2, u2) = e.user(10_000_000_000);
@@ -1015,7 +1015,7 @@ fn later(e: &mut Env, slots: u64) { let s = e.slot + slots; e.set_time(s); }
 #[test] fn old_slabs_and_books_grow_in_place() {
     let mut e = Env::new(); let (f, k) = setup(&mut e);
     // cut both back to the sizes the earlier program made, keeping their contents
-    for (key, old) in [(k.slab, SLAB_SIZE - 16 * SLAB_LADDERS), (f, FAST_SIZE - 16 * FAST_MAKERS)] {
+    for (key, old) in [(k.slab, SLAB_SIZE - 32 * SLAB_IDX - 16 * SLAB_LADDERS), (f, FAST_SIZE - 16 * FAST_MAKERS)] {
         let mut acc = e.svm.get_account(&key).unwrap(); acc.data.truncate(old); e.svm.set_account(key, acc).unwrap();
     }
     let (tp, tu) = e.user(10_000_000_000);
@@ -1026,6 +1026,11 @@ fn later(e: &mut Env, slots: u64) { let s = e.slot + slots; e.set_time(s); }
     assert_eq!((e.data(&k.slab).len(), e.data(&f).len()), (SLAB_SIZE, FAST_SIZE));
     assert_eq!(fb(&e, &f).makers[0].margin, 1_000_000_000, "contents kept");
     quote(&mut e, &k, &[(ASK, 100_010, 100)], true);
+    // a grown slab has no market registered for its quote block yet: takes refuse it until the admin re-joins it
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 10, false);
+    let (a, m) = (e.admin.pubkey(), e.market);
+    e.send("rejoin", vec![AccountMeta::new(a, true), r(&m), w(&f), w(&k.slab)], vec![62], &[], true);
+    assert_eq!(fb(&e, &f).n, 1, "re-join registers the block, no second maker entry");
     tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 10, true);
     assert_eq!(e.user_state(&tu).pos[0].base, 10);
     let x = Address::new_unique(); e.prog_acct(x, 100);
@@ -1155,4 +1160,83 @@ fn push_px(e: &mut Env, f: &Address, sig: Instruction) -> Option<u64> {
     let mut a = vec![AccountMeta::new(tp.pubkey(), true), w(&tu), r(&m), w(&f), r(&k.slab), r(&IXS_ID)]; a.truncate(6);
     let pid = e.pid;
     send_ixs(&mut e, vec![bad, Instruction { program_id: pid, accounts: a, data: take_ix(0, 0, 1, PX + 2000, 1) }], &[&tp], false);
+}
+
+// ---------- review regressions (each was an exploit on 6c48710) ----------
+fn tk_try(e: &mut Env, kp: &Keypair, u: &Address, f: &Address, slabs: &[Address], side: u8, fl: u8, limit: u64, qty: u64) -> bool {
+    let m = e.market;
+    let mut a = vec![AccountMeta::new(kp.pubkey(), true), w(u), r(&m), w(f)]; a.extend(slabs.iter().map(r));
+    try_send(e, a, take_ix(side, fl, slabs.len() as u8, limit, qty), &[kp])
+}
+/// C1: funding 0 (or more) never refills the budget while fills are unsettled.
+#[test] fn reg_fund_does_not_refill_budget_before_settle() {
+    let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let f = fast_new(&mut e, 0);
+    let k = maker(&mut e, &f, 10_000_000_000, 10_001_000); // budget ~1000 lots
+    let (tp, tu) = e.user(100_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100_000)], true);
+    for _ in 0..5 { tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 1000, true); fund_m(&mut e, &f, &k, 0, true); }
+    let b = fb(&e, &f);
+    assert!(b.makers[0].base >= -1000, "unsettled exposure stays within margin / IMR: {}", b.makers[0].base);
+    settle(&mut e, &f, &k);
+    assert!(fb(&e, &f).makers[0].budget > 0, "a settle still refills it");
+}
+/// C2: a slab passed twice is refused (it would fill the same quote again).
+#[test] fn reg_duplicate_slab_refused() {
+    let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let f = fast_new(&mut e, 0);
+    let k = maker(&mut e, &f, 10_000_000_000, 1_000_000_000);
+    let (tp, tu) = e.user(100_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100), (ASK + 1, 100_020, 100)], true);
+    assert!(!tk_try(&mut e, &tp, &tu, &f, &[k.slab; 8], 0, 0, PX + 100, 10_000));
+    assert!(!tk_try(&mut e, &tp, &tu, &f, &[k.slab, k.slab], 0, 0, PX + 100, 10_000));
+    assert!(tk_try(&mut e, &tp, &tu, &f, &[k.slab], 0, 0, PX + 100, 10_000));
+    assert_eq!(e.user_state(&tu).pos[0].base, 200, "only what was quoted");
+}
+/// H1: a reduce-only sale that would leave bad debt is refused; a healthy account can still reduce.
+#[test] fn reg_reduce_only_cannot_create_bad_debt() {
+    let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let f = fast_new(&mut e, 0);
+    let k = maker(&mut e, &f, 10_000_000_000, 1_000_000_000);
+    let (ap, au) = e.user(1_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_000, 100_000)], true);
+    tk(&mut e, &ap, &au, &f, &[k.slab], &[], 0, PX, 90_000, true);
+    settle(&mut e, &f, &k);
+    // healthy: reducing a little at the mark works
+    quote(&mut e, &k, &[(0, 100_000, 1_000)], true);
+    assert!(tk_try(&mut e, &ap, &au, &f, &[k.slab], 1, 2, 100_000, 1_000));
+    let s = e.slot + 1; e.set_time(s); e.oracle_update("", 900_00000000, None); // under maintenance now
+    let px = e.market_state(); let mk = if px.mark_px != 0 { px.mark_px } else { px.oracle_px };
+    let lo = mk - mk * 500 / 10000;
+    quote(&mut e, &k, &[(0, lo as u32, 100_000)], true);
+    assert!(!tk_try(&mut e, &ap, &au, &f, &[k.slab], 1, 2, lo, 89_000), "liquidatable account: liquidation's job, not a self-deal");
+    assert!(e.user_state(&au).cash >= 0 || e.user_state(&au).pos[0].base != 0);
+}
+/// H2: an empty spare book can't open ADL while real liquidity exists.
+#[test] fn reg_empty_book_cannot_open_adl() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(1_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 90_000, true);
+    let s = e.slot + 1; e.set_time(s); e.oracle_update("", 910_00000000, None);
+    quote(&mut e, &k, &[(0, 90_990, 100_000)], true);
+    let f2 = fast_new(&mut e, 0);
+    assert!(!liq_fast_try(&mut e, &f2, &tu, &[]));
+    assert_eq!(e.user_state(&tu).pos[0].flags & 2, 0, "not ADL-eligible");
+}
+/// H3: a liquidation must pass every approved maker (no steering the fill to the liquidator's own quotes).
+#[test] fn reg_liquidation_needs_every_maker() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let k2 = maker(&mut e, &f, 10_000_000_000, 1_000_000_000);
+    let (tp, tu) = e.user(1_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 90_000, true);
+    let s = e.slot + 1; e.set_time(s); e.oracle_update("", 910_00000000, None);
+    quote(&mut e, &k, &[(0, 90_990, 100_000)], true);
+    quote(&mut e, &k2, &[(0, 90_990, 100_000)], true);
+    assert!(!liq_fast_try(&mut e, &f, &tu, &[k2.slab]), "one maker left out");
+    assert!(liq_fast_try(&mut e, &f, &tu, &[k.slab, k2.slab]));
+}
+/// A quote block registered for one market never fills on another market's book with the same idx.
+#[test] fn reg_quote_block_bound_to_its_market() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let d = e.data(&k.slab); let o = SLAB_SIZE - 32 * SLAB_IDX;
+    assert_eq!(&d[o..o + 32], e.market.as_ref(), "join registered idx 0 for this market");
 }

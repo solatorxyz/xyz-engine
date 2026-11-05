@@ -174,7 +174,11 @@ pub struct Ladder { pub ref_px: u32, pub tol_bps: u16, pub flags: u16, pub inv_m
 /// A maker's quotes for every market: written by the maker alone, read by takers. Index = market idx << 4 | side << 3 | level.
 #[repr(C)]
 pub struct Slab { pub disc: u64, pub authority: Key, pub user: Key, pub gen: u64, pub count: u64, pub kill: u64, pub quotes: [Quote; SLAB_QUOTES],
-    pub lad: [Ladder; SLAB_LADDERS] }
+    pub lad: [Ladder; SLAB_LADDERS],
+    /// Market each quote block (FastBook idx) belongs to, written when the admin approves the slab on a book. Takes check it,
+    /// so a block quoted for one market can never fill on another market's book that happens to use the same idx.
+    pub idx_market: [Key; SLAB_IDX] }
+pub const SLAB_IDX: usize = SLAB_QUOTES / (2 * SLAB_LEVELS);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Used { pub gen: u32, pub qty: u32 }
