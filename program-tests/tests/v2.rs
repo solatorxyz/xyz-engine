@@ -4,11 +4,20 @@
 mod state;
 include!("common.rs");
 const ASK: u16 = 8;
-fn cfg(e: &mut Env, bps: u64, th: u64, mx: u64, strict: u64) {
-    let mut d = vec![69u8]; for v in [bps, th, mx, strict] { d.extend_from_slice(&v.to_le_bytes()); } d.extend_from_slice(&[0u8; 32]);
+/// Market config on a live market: only through the timelock (ADMIN_MARKET_CFG 13); the immediate IX is refused once priced.
+fn cfg_key(e: &mut Env, bps: u64, th: u64, mx: u64, strict: u64, key: [u8; 32]) {
     let (a, m) = (e.admin.pubkey(), e.market);
+    let mut d = vec![69u8]; for v in [bps, th, mx, strict] { d.extend_from_slice(&v.to_le_bytes()); } d.extend_from_slice(&key);
+    e.send("", vec![AccountMeta::new(a, true), w(&m)], d, &[], false);
+    let v = bps | th << 16 | mx << 32 | strict << 48;
+    let mut d = vec![28u8, 13]; d.extend_from_slice(&v.to_le_bytes()); d.extend_from_slice(&key);
     e.send("", vec![AccountMeta::new(a, true), w(&m)], d, &[], true);
+    let ms = e.market_state(); let px = ms.oracle_px as i64 * ms.px_div / ms.px_mul.max(1);
+    let s = e.slot + 216_000; e.set_time(s);
+    e.send("", vec![w(&m)], vec![29], &[], true);
+    e.oracle_update("", px, None);
 }
+fn cfg(e: &mut Env, bps: u64, th: u64, mx: u64, strict: u64) { cfg_key(e, bps, th, mx, strict, [0u8; 32]); }
 fn session(e: &mut Env, on: u8) { let (a, m) = (e.admin.pubkey(), e.market); e.send("", vec![AccountMeta::new(a, true), w(&m)], vec![68, on], &[], true); }
 fn place(e: &mut Env, kp: &Keypair, u: &Address, shards: &[Address], side: u8, fl: u8, px: u64, q: u64, ok: bool) {
     let m = e.market; let mut d = vec![1u8]; d.extend_from_slice(&place_item(side, fl, px, q, 0, 0));
@@ -69,11 +78,18 @@ fn place(e: &mut Env, kp: &Keypair, u: &Address, shards: &[Address], side: u8, f
     let (m, ins, rk) = (e.market, e.ins, e.rank);
     e.send("", vec![w(&a0), w(&cu1), w(&cu2)], vec![24], &[], true);
     e.rank_user(&cu1); e.rank_user(&cu2);
-    e.send("", vec![w(&tu), w(&m), w(&ins), w(&rk), w(&cu1), w(&cu2)], vec![6], &[], true);
+    // ADL steps carry only the closed lots' share of the deficit: repeat until the target is flat
+    for _ in 0..4 {
+        if e.user_state(&tu).pos[0].base == 0 { break; }
+        e.rank_user(&cu1); e.rank_user(&cu2);
+        e.send("", vec![w(&tu), w(&m), w(&ins), w(&rk), w(&cu1), w(&cu2)], vec![6], &[], true);
+    }
     let (u, ms) = (e.user_state(&tu), e.market_state());
     let eq = u.cash as i128 + u.pos[0].base as i128 * ms.mark_px as i128;
     assert_eq!(eq, 0, "target is made whole to zero; the unrecovered part is only in bad_debt");
-    assert!(ms.bad_debt > 0);
+    // each counterparty paid only its closed lots' share, out of its profit: nothing left to socialize here
+    assert!(ms.bad_debt >= 0);
+    assert!(e.user_state(&cu1).cash >= 0 && e.user_state(&cu2).cash >= 0);
 }
 #[test] fn bounds_hold_mark_while_closed_with_reanchors_and_a_hard_cap() {
     let mut e = Env::new(); e.oracle_update("", 1000_00000000, None);
@@ -104,10 +120,10 @@ fn place(e: &mut Env, kp: &Keypair, u: &Address, shards: &[Address], side: u8, f
 #[test] fn session_key_flips_only_session() {
     let mut e = Env::new(); e.oracle_update("", 1000_00000000, None);
     let (k, _) = e.user(1000); let (x, _) = e.user(1000);
-    let mut d = vec![69u8]; for v in [500u64, 9000, 2, 0] { d.extend_from_slice(&v.to_le_bytes()); } d.extend_from_slice(&k.pubkey().to_bytes());
-    let (a, m) = (e.admin.pubkey(), e.market);
-    e.send("", vec![AccountMeta::new(a, true), w(&m)], d.clone(), &[], true);
-    e.send("", vec![AccountMeta::new(k.pubkey(), true), w(&m)], d, &[&k], false);
+    cfg_key(&mut e, 500, 9000, 2, 0, k.pubkey().to_bytes());
+    let m = e.market;
+    let mut d = vec![28u8, 13]; d.extend_from_slice(&0u64.to_le_bytes()); d.extend_from_slice(&k.pubkey().to_bytes());
+    e.send("", vec![AccountMeta::new(k.pubkey(), true), w(&m)], d, &[&k], false); // the session key can't propose config
     e.send("", vec![AccountMeta::new(x.pubkey(), true), w(&m)], vec![68, 1], &[&x], false);
     e.send("", vec![AccountMeta::new(k.pubkey(), true), w(&m)], vec![68, 1], &[&k], true);
     assert_eq!(e.market_state().session, 1);

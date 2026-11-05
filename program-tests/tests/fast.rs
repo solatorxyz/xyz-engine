@@ -176,8 +176,11 @@ fn setup(e: &mut Env) -> (Address, Mk) { e.oracle_update("", 1000_00000000, None
     let (lp, lu) = e.user(5_000_000_000_000);
     let (m, ins) = (e.market, e.ins);
     let mut d = vec![5u8]; d.extend_from_slice(&u64::MAX.to_le_bytes());
-    e.send("", vec![AccountMeta::new(lp.pubkey(), true), w(&lu), w(&k.u), r(&m), w(&ins)], d, &[&lp], true);
-    assert_eq!(e.user_state(&k.u).pos[0].base, 0);
+    // the settle handed the margin back (none locked): no book needed to judge the account
+    e.send("", vec![AccountMeta::new(lp.pubkey(), true), w(&lu), w(&k.u), r(&m), w(&ins), r(&f)], d, &[&lp], true);
+    // a takeover is one bounded chunk, like a book liquidation (no more than restores maintenance)
+    let b1 = e.user_state(&k.u).pos[0].base;
+    assert!(b1 > -190_000 && b1 < 0, "one chunk taken over: {b1}");
 }
 #[test] fn compute_units() {
     let mut e = Env::new(); let (f, k) = setup(&mut e); let k2 = maker(&mut e, &f, 10_000_000_000, 1_000_000_000);
@@ -1060,7 +1063,19 @@ fn send_ixs(e: &mut Env, ixs: Vec<Instruction>, signers: &[&Keypair], ok: bool) 
         (Err(f), true) => panic!("{:?}\n{}", f.err, f.meta.logs.join("\n")),
     }
 }
-fn set_signer(e: &mut Env, f: &Address, k: &Address) { let (a, m) = (e.admin.pubkey(), e.market); let mut d = vec![74u8]; d.extend_from_slice(k.as_ref()); e.send("", vec![AccountMeta::new(a, true), r(&m), w(f)], d, &[], true); }
+/// A live market's signer changes only through the timelock (ADMIN_FAST_SIGNER 12): propose, wait it out, execute with the
+/// market's registered book, then bring the oracle back to the price it had.
+fn set_signer(e: &mut Env, f: &Address, k: &Address) {
+    let (a, m) = (e.admin.pubkey(), e.market);
+    let mut d = vec![74u8]; d.extend_from_slice(k.as_ref());
+    e.send("", vec![AccountMeta::new(a, true), r(&m), w(f)], d, &[], false); // immediate: refused on a live market
+    let mut d = vec![28u8, 12]; d.extend_from_slice(&0u64.to_le_bytes()); d.extend_from_slice(k.as_ref());
+    e.send("", vec![AccountMeta::new(a, true), w(&m)], d, &[], true);
+    let ms = e.market_state(); let px = ms.oracle_px as i64 * ms.px_div / ms.px_mul.max(1);
+    let s = e.slot + 216_000; e.set_time(s);
+    e.send("", vec![w(&m), w(f)], vec![29], &[], true);
+    e.oracle_update("", px, None);
+}
 /// take_fast with the Instructions sysvar passed, after an Ed25519 instruction when `sig` is given
 fn tk_px(e: &mut Env, kp: &Keypair, u: &Address, f: &Address, slabs: &[Address], side: u8, limit: u64, qty: u64, sig: Option<Instruction>) -> Option<u64> {
     let m = e.market;
@@ -1320,4 +1335,23 @@ fn place_bid(e: &mut Env, kp: &Keypair, u: &Address, shards: &[Address], px: u64
     println!("bounded liquidation: {cu} CU, {} lots", b0 - b1);
     assert!(cu < 150_000, "one call stays bounded: {cu}");
     assert!(b0 - b1 <= 24 * 300, "at most 24 levels per call");
+}
+
+#[test] fn maker_with_locked_margin_is_settled_before_liquidation() {
+    let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let f = fast_new(&mut e, 0);
+    let k = maker(&mut e, &f, 2_100_000_000, 2_000_000_000);
+    let (tp, tu) = e.user(5_000_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 190_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 190_000, true);
+    e.oracle_update("", 1049_00000000, None); e.oracle_update("", 1060_00000000, None);
+    let (lp, lu) = e.user(5_000_000_000_000);
+    let (m, ins) = (e.market, e.ins);
+    let mut d = vec![5u8]; d.extend_from_slice(&u64::MAX.to_le_bytes());
+    // margin still locked in the book (and fills unsettled): refused with or without the book
+    e.send("", vec![AccountMeta::new(lp.pubkey(), true), w(&lu), w(&k.u), r(&m), w(&ins)], d.clone(), &[&lp], false);
+    e.send("", vec![AccountMeta::new(lp.pubkey(), true), w(&lu), w(&k.u), r(&m), w(&ins), r(&f)], d.clone(), &[&lp], false);
+    assert_eq!(e.user_state(&k.u).pos[0].iso_margin, 2_000_000_000, "locked margin mirrored on the position");
+    settle(&mut e, &f, &k); // below maintenance without it: the margin comes back to cash
+    assert_eq!(e.user_state(&k.u).pos[0].iso_margin, 0);
+    e.send("", vec![AccountMeta::new(lp.pubkey(), true), w(&lu), w(&k.u), r(&m), w(&ins), r(&f)], d, &[&lp], true);
 }

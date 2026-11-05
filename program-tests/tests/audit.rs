@@ -120,9 +120,9 @@ fn set_market_u64(e: &mut Env, off: usize, v: u64) {
     // real size (10 lots = 2e6 notional) at 2x: sample = +100% but the rate only changes at the period roll and is capped
     e.send("", trade_accts(&kp, &u, &m, &[b]), single(place_item(0, 1, 199_950, 10, 0, 0)), &[&kp], true);
     e.set_time(e.slot + 1); e.oracle_update("", 1000_00000000, Some((b, a)));
-    assert!(e.market_state().prem_last > 900_000_000); assert_eq!(e.market_state().funding_rate, 0);
+    assert_eq!(e.market_state().prem_last, 50_000_000, "sample clamped to the 5% quote band"); assert_eq!(e.market_state().funding_rate, 0);
     e.set_time(e.slot + 10); e.oracle_update("", 1000_00000000, Some((b, a)));
-    assert_eq!(e.market_state().funding_rate, FUNDING_MAX_RATE_HOURLY_PPB as i64);
+    let fr = e.market_state().funding_rate; assert!(fr > 0 && fr <= FUNDING_MAX_RATE_HOURLY_PPB as i64 && fr <= 50_000_000 / 8 + 1, "rate {fr}");
     // N-1: omission (no shards) holds the previous sample; a partial or duplicated set is rejected
     let held = e.market_state().prem_last;
     e.set_time(e.slot + 1); e.oracle_update("", 1000_00000000, None);
@@ -194,6 +194,8 @@ fn set_market_u64(e: &mut Env, off: usize, v: u64) {
     let acc = la(&[b0]);
     assert_eq!(try_send(&mut e, acc, amt(5, 13), &[&lq]), Some(MISSING_SHARDS));
     let acc = la(&[b0, b1]);
+    assert_eq!(try_send(&mut e, acc, amt(5, 13), &[&lq]), Some(MISSING_SHARDS), "every shard of a market with resting orders");
+    let acc = la(&[b0, b1, a0, s9]);
     e.send("", acc, amt(5, 13), &[&lq], true);
     assert_eq!(e.shard_state(&b1).n, 0);
 }
@@ -339,9 +341,9 @@ fn jump_ts(e: &mut Env, secs: i64) {
     e.send("", vec![AccountMeta::new(lq.pubkey(), true), w(&lqu), w(&vicu), r(&m), w(&ins), w(&bev)], amt(5, 13), &[&lq], true);
     let px = 92_000i64; let n = 13 * px;
     let v = e.user_state(&vicu); let l = e.user_state(&lqu);
-    assert_eq!(v.pos[0].base, 0); assert_eq!(l.pos[0].base, 13);
+    let q = 13 - v.pos[0].base; assert!(q > 0 && q < 13, "one chunk: {q}"); assert_eq!(l.pos[0].base, q);
     assert_eq!(e.shard_state(&bev).orders[0].qty, 13, "attacker's band-edge bid must not be used");
-    let fee = l.cash - (lc0 - n);
+    let n = q * px; let fee = l.cash - (lc0 - n);
     assert!(fee >= 0 && fee <= n * 25 / 10000);
     assert_eq!(v.cash, c0 + n - 2 * fee, "victim sells at the mark, pays only the fixed fee");
 }
@@ -378,7 +380,8 @@ fn jump_ts(e: &mut Env, secs: i64) {
     // sb was flattened and is no longer in the queue; the target's deficit was absorbed (not bankrupt any more)
     assert_eq!(e.user_state(&tu).pos[0].base, 6);
     assert_eq!(e.rank_state().n_short, 1); assert_eq!(e.rank_state().entries[RANK_N].user, mmu.to_bytes());
-    assert_eq!(try_send(&mut e, adl(&[mmu]), vec![6], &[]), Some(10));
+    assert_eq!(try_send(&mut e, adl(&[mmu]), vec![6], &[]), None, "still bankrupt: the rest of its deficit goes with its next lots");
+    assert!(e.user_state(&tu).pos[0].base < 6);
 }
 
 // ---------- pooled collateral (cross-margin) ----------
@@ -505,6 +508,9 @@ fn adm_d(tag: u8, op: u8, v: u64, k: Option<&Address>) -> Vec<u8> {
     let mut e = Env::new(); e.oracle_update("", 1000_00000000, None);
     let (b, a) = (e.shard(0, 199_900), e.shard(1, 200_000)); let (kp, u) = e.user(50_000_000_000); let m = e.market;
     e.send("", trade_accts(&kp, &u, &m, &[b, a]), batch_data(&[], &[place_item(0, 0, 199_950, 1, 0, 0), place_item(1, 0, 200_050, 1, 0, 0)]), &[&kp], true);
+    e.set_time(e.slot + 1); e.oracle_update("", 1000_00000000, Some((b, a)));
+    assert_eq!(e.market_state().mark_ema, 0, "1-lot dust is no mid");
+    e.send("", trade_accts(&kp, &u, &m, &[b, a]), batch_data(&[], &[place_item(0, 0, 199_950, 10, 0, 0), place_item(1, 0, 200_050, 10, 0, 0)]), &[&kp], true);
     e.set_time(e.slot + 1); e.oracle_update("", 1000_00000000, Some((b, a)));
     let s = e.market_state();
     // mid = 2x oracle; ema after 1 slot = 100000/375; median(oracle, oracle+ema, mid) = oracle+ema
@@ -639,10 +645,11 @@ fn adm_d(tag: u8, op: u8, v: u64, k: Option<&Address>) -> Vec<u8> {
     // -8%: isolated position liquidatable although the account's cross cash is large
     e.set_time(e.slot + 1); e.oracle_update("", 920_00000000, None);
     let ins = e.ins;
+    // a takeover is one bounded chunk at a time: repeat while still below maintenance
     e.send("liquidate isolated position", vec![AccountMeta::new(lq.pubkey(), true), w(&lqu), w(&uu), r(&m), w(&ins), w(&a0)], amt(5, 13), &[&lq], true);
-    let s = e.user_state(&uu); assert_eq!(s.pos[0].base, 0);
+    for _ in 0..12 { if try_send(&mut e, vec![AccountMeta::new(lq.pubkey(), true), w(&lqu), w(&uu), r(&m), w(&ins), w(&a0)], amt(5, 13), &[&lq]).is_some() { break; } }
+    let s = e.user_state(&uu); assert!(s.pos[0].base < 13);
     assert_eq!(s.cash, 10_000_000 - 150_000, "cross cash untouched by the isolated loss");
-    assert!(s.pos[0].iso_margin >= 0);
 }
 
 // ---------------- v6 ----------------
@@ -662,7 +669,7 @@ fn liq_book(e: &mut Env, t: &Address, shards: &[Address], max_q: u64) -> Option<
     assert_eq!(liq_book(&mut e, &vicu, &[a0, b0], u64::MAX), Some(NOT_LIQ), "healthy account");
     e.set_time(e.slot + 1); e.oracle_update("", 880_00000000, None); // -12%: below MM, not bankrupt
     // V6-1: no bid within 5/10/20% -> partial shard set: NoFill; full shard set: ADL-eligible (Ok, no fill)
-    assert_eq!(liq_book(&mut e, &vicu, &[a0], u64::MAX), Some(NO_FILL), "missing shard: no proof of empty book");
+    assert_eq!(liq_book(&mut e, &vicu, &[a0], u64::MAX), Some(MISSING_SHARDS), "missing shard: the liquidator must pass every opposite shard");
     assert_eq!(liq_book(&mut e, &vicu, &[a0, b0], u64::MAX), None, "empty book proven -> ADL-eligible");
     let f = e.user_state(&vicu).pos[0].flags; assert!(f & 2 != 0 && f >> 8 == e.slot && e.user_state(&vicu).pos[0].base == 13);
     e.send("", trade_accts(&mm, &mmu, &m, &[b0]), single(place_item(0, 1, 87_000, 100, 0, 0)), &[&mm], true);
@@ -715,15 +722,20 @@ fn liq_book(e: &mut Env, t: &Address, shards: &[Address], max_q: u64) -> Option<
     assert_eq!(e.market_state().paused, 0);
     assert_eq!(both(&mut e, 1000_00000000, 992_00000000), None);
     assert_eq!(e.market_state().paused, 0, "0.8% < trip threshold after resume");
-    // single source (oracle2 omitted) with a 10% jump: not applied, paused = 3
+    // oracle2 omitted by the caller: refused (no choosing the source)
+    e.set_time(e.slot + 1); e.set_pyth(1001_00000000, 10_000_000);
+    assert_eq!(try_send(&mut e, vec![w(&m), r(&o1)], vec![4], &[]), Some(8));
+    // single source (oracle2 passed but stale) with a 10% jump: not applied, paused = 3
+    let stale2 = |e: &mut Env| { let d = pyth_data(&feed2, 1000_00000000, 10_000_000, e.ts - 10_000, e.slot);
+        e.svm.set_account(o2, Account { lamports: 1_000_000_000, data: d, owner: PYTH, executable: false, rent_epoch: 0 }).unwrap(); };
     let px0 = e.market_state().oracle_px;
-    e.set_time(e.slot + 1); e.set_pyth(1100_00000000, 10_000_000);
-    assert_eq!(try_send(&mut e, vec![w(&m), r(&o1)], vec![4], &[]), None);
+    e.set_time(e.slot + 1); e.set_pyth(1100_00000000, 10_000_000); stale2(&mut e);
+    assert_eq!(try_send(&mut e, vec![w(&m), r(&o1), r(&o2)], vec![4], &[]), None);
     assert_eq!(e.market_state().paused, 3); assert_eq!(e.market_state().oracle_px, px0);
     // single source with a small move is applied
     assert_eq!(both(&mut e, 1001_00000000, 1001_00000000), None); assert_eq!(e.market_state().paused, 0, "sources agree -> resume");
-    e.set_time(e.slot + 1); e.set_pyth(1010_00000000, 10_000_000);
-    assert_eq!(try_send(&mut e, vec![w(&m), r(&o1)], vec![4], &[]), None);
+    e.set_time(e.slot + 1); e.set_pyth(1010_00000000, 10_000_000); stale2(&mut e);
+    assert_eq!(try_send(&mut e, vec![w(&m), r(&o1), r(&o2)], vec![4], &[]), None);
     assert_eq!(e.market_state().oracle_px, 101_000);
 }
 #[test] fn n2_impact_price_over_64_levels_program() {

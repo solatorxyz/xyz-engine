@@ -3,6 +3,14 @@
 mod state;
 // CU measurement + invariant scenarios on the built SBF program.
 include!("common.rs");
+fn try_send(e: &mut Env, accounts: Vec<AccountMeta>, data: Vec<u8>, signers: &[&Keypair]) -> Option<u32> {
+    let ix = Instruction { program_id: e.pid, accounts, data };
+    let mut s: Vec<&Keypair> = vec![&e.admin]; s.extend_from_slice(signers);
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&e.admin.pubkey()), &s, e.svm.latest_blockhash());
+    let r = e.svm.send_transaction(tx); e.svm.expire_blockhash();
+    match r { Ok(_) => None, Err(f) => { let s = format!("{:?}", f.err);
+        Some(s.split("Custom(").nth(1).and_then(|x| x.split(')').next()).and_then(|x| x.parse().ok()).unwrap_or(u32::MAX)) } }
+}
 
 #[test]
 fn compute_units_and_invariants() {
@@ -85,8 +93,9 @@ fn compute_units_and_invariants() {
     let mut la = vec![AccountMeta::new(lq.pubkey(), true), w(&lqu), w(&vicu), r(&m), w(&e.ins)];
     la.extend(bshards.iter().map(w));
     e.send("liquidate (takeover at mark: health x2, transfer, fees)", la.clone(), { let mut d = vec![5u8]; d.extend_from_slice(&200u64.to_le_bytes()); d }, &[&lq], true);
+    // one bounded chunk per call: repeat until the account is healthy or flat, then it is refused
+    for _ in 0..16 { if try_send(&mut e, la.clone(), { let mut d = vec![5u8]; d.extend_from_slice(&200u64.to_le_bytes()); d }, &[&lq]).is_some() { break; } }
     e.send("liquidate healthy/flat account (rejected)", la, { let mut d = vec![5u8]; d.extend_from_slice(&200u64.to_le_bytes()); d }, &[&lq], false);
-    assert_eq!(e.user_state(&vicu).pos[0].base, 0);
     assert!(e.ins_bal() > 0);
 
     // ADL: a second victim long; oracle crashes 20% with no bids in band -> bankrupt, ADL vs short taker
@@ -241,7 +250,7 @@ fn order_types_cu_and_invariants() {
     e.send("", trade_accts(&mm, &mmu, &m, &all), batch_data(&[], &mmq), &[&mm], true);
     let tb = e.user_state(&tku).pos[0].base as u64;
     e.send("set_trigger SL (reduce-only)", vec![AccountMeta::new(tk.pubkey(), true), w(&tku), r(&m)], trig(0, 2, 1, [100_010, 99_000, tb, 500, 0, 0]), &[&tk], true);
-    let ex = |e: &mut Env, label: &str, s: u8, ok: bool| { let acc = { let mut v = vec![AccountMeta::new(kp.pubkey(), true), w(&kpu), w(&tku), r(&m)]; v.extend([b0, b1].iter().map(w)); v }; e.send(label, acc, vec![21, s], &[&kp], ok); };
+    let ex = |e: &mut Env, label: &str, s: u8, ok: bool| { let acc = { let mut v = vec![AccountMeta::new(kp.pubkey(), true), w(&kpu), w(&tku), r(&m)]; v.extend(all.iter().map(w)); v.push(w(&bshard)); v.push(w(&bl)); v.push(w(&bl2)); v }; e.send(label, acc, vec![21, s], &[&kp], ok); }; // every opposite shard
     ex(&mut e, "exec SL before trigger (rejected)", 0, false);
     e.set_time(e.slot + 1); e.oracle_update("", 1000_00000000, None);
     let k0 = e.user_state(&kpu).cash;
@@ -278,9 +287,9 @@ fn order_types_cu_and_invariants() {
     e.set_time(e.slot + 1); e.oracle_update("", 920_00000000, None);
     e.send("", trade_accts(&mm, &mmu, &m, &all), batch_data(&[], &[]), &[&mm], true); // MM claims
     e.send("", trade_accts(&mm, &mmu, &m, &[bl2]), batch_data(&[], &[place_item(0, ALO, 91_890, 100, 0, 0)]), &[&mm], true);
-    let mut la = vec![AccountMeta::new(kp.pubkey(), true), w(&kpu), w(&vicu), r(&m), w(&e.ins)]; la.extend([bl, bl2].iter().map(w));
+    let mut la = vec![AccountMeta::new(kp.pubkey(), true), w(&kpu), w(&vicu), r(&m), w(&e.ins)]; la.extend([bl, bl2, bshard].iter().chain(all.iter()).map(w)); // resting orders: every shard of the market
     e.send("liquidate (cancel target resting orders + close)", la, { let mut d = vec![5u8]; d.extend_from_slice(&100u64.to_le_bytes()); d }, &[&kp], true);
-    let v = e.user_state(&vicu); assert_eq!((v.pos[0].base, v.pos[0].bid_open), (0, 0)); assert_eq!(e.shard_state(&bl).n, 0);
+    let v = e.user_state(&vicu); assert!(v.pos[0].base < 12 && v.pos[0].bid_open == 0, "orders cancelled, one chunk taken over"); assert_eq!(e.shard_state(&bl).n, 0);
 
     // ---- crank_claim: permissionless ledger drain ----
     e.send("crank_claim (1 shard -> 1 maker)", vec![w(&bl2), w(&mmu)], vec![24], &[], true);
