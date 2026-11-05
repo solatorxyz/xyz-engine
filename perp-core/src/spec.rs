@@ -340,6 +340,9 @@ pub const FAST_PX_MAX_SLOTS: u64 = 8;
 pub const FAST_PX_MAX_DEV_BPS: u64 = 200;
 /// A take may hand over a signed price at most this many slots older than now (no picking the best of the last few).
 pub const FAST_PX_TAKE_SLOTS: u64 = 2;
+/// Quote levels one liquidate_fast call may sweep. Bounds a call to ~100k CU whatever the book looks like; the keeper calls again
+/// (the chunk rule still caps each call's size), like Hyperliquid's repeated partial liquidations.
+pub const LIQ_FAST_MAX_LEVELS: u32 = 24;
 /// Ladder flags bits 8-15: the ladder fills only while the book's signed price is at most that many slots old (0 = no need;
 /// at most FAST_PX_MAX_SLOTS counts).
 pub const LADDER_FRESH_SHIFT: u16 = 8;

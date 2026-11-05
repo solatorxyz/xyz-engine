@@ -1,8 +1,8 @@
 | order-type instruction (LiteSVM, Agave 4.3 SBF runtime, perp_program.so) | CU |
 |---|---|
-| init_market | 2001 |
-| init_rank (admin) | 179 |
-| set_tier (admin: MM tier 1 = rebate) | 178 |
+| init_market | 2005 |
+| init_rank (admin) | 180 |
+| set_tier (admin: MM tier 1 = rebate) | 182 |
 | discrete: place 10 orders (5 bid + 5 ask levels) | 9162 |
 | discrete: replace by cid (cancel 10 + place 10) | 11875 |
 | discrete: cancel 10 by cid | 3585 |
@@ -19,11 +19,11 @@
 | FOK filled | 2989 |
 | STP decrement (no fill, both reduced) | 2135 |
 | STP cancel-newest (taker dropped) | 1996 |
-| set_trigger SL (reduce-only) | 311 |
-| exec SL trigger (keeper crank, IOC reduce-only) | 4419 |
-| exec TWAP slice (1/3, sell 10) | 3200 |
-| admin pause | 142 |
+| set_trigger SL (reduce-only) | 315 |
+| exec SL trigger (keeper crank, IOC reduce-only) | 4778 |
+| exec TWAP slice (1/3, sell 10) | 3216 |
+| admin pause | 139 |
 | paused: reduce-only allowed | 1057 |
-| deposit under TVL cap (cap check + CPI) | 1381 |
-| liquidate (cancel target resting orders + close) | 3099 |
+| deposit under TVL cap (cap check + CPI) | 1384 |
+| liquidate (cancel target resting orders + close) | 3102 |
 | crank_claim (1 shard -> 1 maker) | 128 |

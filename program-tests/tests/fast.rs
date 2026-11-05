@@ -1298,3 +1298,26 @@ fn place_bid(e: &mut Env, kp: &Keypair, u: &Address, shards: &[Address], px: u64
     e.send("", vec![AccountMeta::new(a, true), r(&m), w(&f), w(&k.slab), AccountMeta::new_readonly(other.pubkey(), true)], vec![62], &[&other], false);
     e.send("", vec![AccountMeta::new(a, true), r(&m), w(&f), w(&k.slab)], vec![62], &[], false);
 }
+/// One liquidate_fast call sweeps at most LIQ_FAST_MAX_LEVELS levels (bounded CU); repeated calls finish the chunk.
+#[test] fn reg3_liquidation_work_is_bounded() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let mut ks = vec![k]; for _ in 0..7 { ks.push(maker(&mut e, &f, 10_000_000_000, 1_000_000_000)); }
+    let (tp, tu) = e.user(1_000_000_000);
+    quote(&mut e, &ks[0], &[(ASK, 100_010, 100_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[ks[0].slab], &[], 0, PX + 100, 90_000, true);
+    let s = e.slot + 1; e.set_time(s); e.oracle_update("", 910_00000000, None);
+    for (i, x) in ks.iter().enumerate() { let v: Vec<(u16, u32, u32)> = (0..8).map(|l| (l as u16, 90_990 - (i as u32) * 10 - l as u32 * 5, 300)).collect(); quote(&mut e, x, &v, true); }
+    let slabs: Vec<Address> = ks.iter().map(|x| x.slab).collect();
+    let (m, ins) = (e.market, e.ins);
+    let mut a = vec![w(&tu), r(&m), w(&ins), w(&f)]; a.extend(slabs.iter().map(r));
+    let cb = Address::from_str_const("ComputeBudget111111111111111111111111111111");
+    let lim = |n: u32| { let mut v = vec![2u8]; v.extend_from_slice(&n.to_le_bytes()); Instruction { program_id: cb, accounts: vec![], data: v } };
+    let mut d = vec![70u8, 8]; d.extend_from_slice(&u64::MAX.to_le_bytes());
+    let pid = e.pid;
+    let b0 = e.user_state(&tu).pos[0].base;
+    let cu = send_ixs(&mut e, vec![lim(1_400_000), Instruction { program_id: pid, accounts: a.clone(), data: d.clone() }], &[], true).unwrap();
+    let b1 = e.user_state(&tu).pos[0].base;
+    println!("bounded liquidation: {cu} CU, {} lots", b0 - b1);
+    assert!(cu < 150_000, "one call stays bounded: {cu}");
+    assert!(b0 - b1 <= 24 * 300, "at most 24 levels per call");
+}

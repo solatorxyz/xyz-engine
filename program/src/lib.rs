@@ -2478,8 +2478,10 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let base0 = long(t.pos[pi].base);
     let (mut filled, mut notional) = (0u64, 0i128);
     let mut ev = FastEv::new(&tk, bid);
-    while left > 0 {
+    let mut levels = 0u32;
+    while left > 0 && levels < spec::LIQ_FAST_MAX_LEVELS {
         let Some((bk, bl, bp, ba)) = best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi, book_px(f, m, slot)) else { break };
+        levels += 1;
         let (sp, mi) = sl[bk];
         let q = unsafe { &(*sp).quotes[base_ix + bl] };
         let fq = ba.min(left);
