@@ -62,6 +62,10 @@ refused). Comments in `lib.rs` may lag behind; this file and the tests are autho
   OracleSet, whose median is its own guard; the deploy scripts create one per market.
 - Pool and vault admins can be a Multisig account (named at creation); the creating key alone then has no power.
 - The external perp price needs the set's quorum and bounded publish times.
+- `update_oracle_soft` (IX 78) is `update_oracle` with an exact revert instead of an error: the market is the only account
+  the update writes, a byte snapshot is restored on any failure (including a partially advanced fallback replay floor), so
+  a publisher can bundle it with its price post without an unusable oracle sinking the post. Same accounts, same checks,
+  no new authority; a non-market first account is a no-op.
 - Book-derived inputs (mid, premium) are taken only from the complete book: every shard and every registered FastBook with
   all slabs; otherwise the previous sample is held. Only orders that rested at least one slot count, as impact prices
   (size behind them), never a dust best price; a crossed book is no price.

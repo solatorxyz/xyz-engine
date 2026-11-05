@@ -192,6 +192,7 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
         spec::IX_FAST_PX => fast_px_push(pid, accs),
         spec::IX_FAST_REGISTER => fast_register(pid, accs),
         spec::IX_LIQ_CANCEL => liq_cancel(pid, accs),
+        spec::IX_UPDATE_ORACLE_SOFT => update_oracle_soft(pid, accs),
         IX_PLACE => batch(pid, accs, data, true),
         IX_BATCH => batch(pid, accs, data, false),
         IX_CANCEL => batch(pid, accs, data, false),
@@ -1372,6 +1373,16 @@ fn no_resting(u: &User, pi: usize) -> ProgramResult {
 #[inline(always)]
 fn moved(a: u64, b: u64, bps: u64) -> bool { a.abs_diff(b).saturating_mul(10000) > b.saturating_mul(bps) }
 /// accs: market(w), pyth PriceUpdateV2, [best bid shard, best ask shard] (optional, for premium)
+/// IX_UPDATE_ORACLE_SOFT: update_oracle whose failure leaves the market untouched instead of failing the transaction, so a
+/// publisher can apply its price in the same transaction as its price post (post-and-push). The market is the only account
+/// update_oracle writes, so restoring a byte snapshot of it on error is an exact revert (including oracle2_px / paused).
+fn update_oracle_soft(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
+    if a.is_empty() || !a[0].owned_by(pid) || a[0].data_len() < MARKET_SIZE { return Ok(()); }
+    let mut snap = [0u8; MARKET_SIZE];
+    snap.copy_from_slice(&unsafe { a[0].borrow_unchecked() }[..MARKET_SIZE]);
+    if update_oracle(pid, a).is_err() { let d = unsafe { a[0].borrow_unchecked_mut() }; d[..MARKET_SIZE].copy_from_slice(&snap); }
+    Ok(())
+}
 fn update_oracle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if a.len() < 2 { return Err(err(E::BadData)); }
     let m: &mut Market = load(&a[0], pid, DISC_MARKET, MARKET_SIZE)?;

@@ -344,6 +344,10 @@ pub const IX_FAST_REGISTER: u64 = 76;
 /// Permissionless, for an account below maintenance in a market: claim its fills and cancel its resting orders in the passed
 /// shards of that market (as a liquidation would). Liquidations / ADL require no resting orders on the judged positions.
 pub const IX_LIQ_CANCEL: u64 = 77;
+/// Post-and-push: update_oracle (same accounts as IX 4) that never fails the transaction. A publisher appends it to its own
+/// price post so the market applies the price the moment the post lands; when the oracle is unusable at that moment
+/// (quorum, stale, confidence, missing member) the market is left exactly as it was and the price post still lands.
+pub const IX_UPDATE_ORACLE_SOFT: u64 = 78;
 /// Signed price: a 64-byte message signed by the book's price signer and checked by the Ed25519 program in the instruction
 /// right before the take: FAST_PX_MAGIC, market key, px u64 (price units), slot u64, ts_ms u64. The newest one (by ts_ms)
 /// a book has seen stands in for the oracle in pegged ladders and tolerance checks while it is at most FAST_PX_MAX_SLOTS old.

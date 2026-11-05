@@ -193,3 +193,10 @@ Each item below was a reproduced exploit on 6c48710 and now has a regression tes
 - `fast_mm`: compute limit sized to each quote chunk (a flat 4,000 CU failed chunks with ladder settings).
 
 Limits: at most 8 makers per book. A liquidation sweeping a full 25% chunk through 63 levels of 8 makers costs ~219k CU: liquidators request a higher compute limit (or a smaller max_qty).
+
+## Post-and-push (2026-11-06, program v7)
+
+IX 78 `update_oracle_soft` (accounts as IX 4; never fails the transaction, exact revert of the market on error). The
+publishers (`aggregator/keeper_fast.py`, `PUSH_STATE`) bundle one per market with each price post, so a market re-prices
+when the first post that completes the quorum lands, instead of one pusher round (~1.6 s) later. 2.8k CU per 3-member
+update; per-publisher lookup table (own AGGs, markets, oracles, members). SDK: `update_oracle_soft` / `IX.UPDATE_ORACLE_SOFT`.
