@@ -98,7 +98,15 @@ fuzz_target!(|data: &[u8]| {
     let upd = |w: &mut World, px: i64, with_shards: bool, sh: &[K]| {
         let t = w.ts; w.accts.insert(oracle, Acct::new(&ad(&oracle), &PYTH, &pyth(&feed, px, (px / 10000) as u64, t)));
         let mut m = vec![(market, false, true), (oracle, false, false)]; if with_shards { m.extend(sh.iter().map(|s| (*s, false, false))); }
-        w.call(&m, &[4])
+        // half the updates go through IX 78 (soft): same effect when usable; when not, the market must be byte-identical
+        if with_shards && (px / 1_0000000) % 2 == 1 {
+            let before = w.accts.get(&market).map(|a| a.data().to_vec());
+            let r = w.call(&m, &[78]);
+            assert!(r, "IX 78 must never fail");
+            let strict = w.call(&m, &[4]);
+            if !strict { assert_eq!(w.accts.get(&market).map(|a| a.data().to_vec()), before, "soft update changed the market although the strict one fails"); }
+            r
+        } else { w.call(&m, &[4]) }
     };
     upd(&mut w, 1000_00000000, false, &sh);
     let mut us = vec![];
