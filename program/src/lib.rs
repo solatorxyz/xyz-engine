@@ -460,13 +460,17 @@ const POS_PIN: u64 = spec::POS_FLAG_MAKER_PIN;
 /// Price window of fast-path fills around the mark (no rounding to zero for low prices).
 #[inline(always)]
 fn quote_band(px: u64) -> u64 { (px as u128 * spec::QUOTE_BAND_BPS as u128 / 10000) as u64 }
+/// Oracle band in bps: the oracle's confidence as a share of its price (an OracleSet reports the publishers' dispersion),
+/// capped at spec::BAND_MAX_BPS. Added to the margin requirements, never taken from equity (see spec).
+#[inline(always)]
+fn band_bps(m: &Market) -> u64 { if m.oracle_px == 0 { 0 } else { ((m.oracle_conf as u128 * 10000 / m.oracle_px as u128) as u64).min(spec::BAND_MAX_BPS) } }
 /// Isolated position: equity = iso_margin + base * mark (all of the position's cash flows are booked to iso_margin).
 fn iso_health(pid: &Address, u: &User, pi: usize, a: &[AccountView], nw: Now, need_fresh: bool) -> Result<(i128, i128, i128), ProgramError> {
     let p = &u.pos[pi]; let m = find_market(pid, &p.market, a)?;
     if need_fresh && stale(m, nw) && (p.base != 0 || p.bid_open != 0 || p.ask_open != 0) { return Err(err(E::Stale)); }
-    let px = mark(m);
+    let (px, b) = (mark(m), band_bps(m));
     let gross = core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs());
-    Ok((p.iso_margin as i128 + mulf(p.base as i128, px), bps_up(mulf(gross, px), m.imr_bps), bps_up(mulf((p.base as i128).abs(), px), m.mmr_bps)))
+    Ok((p.iso_margin as i128 + mulf(p.base as i128, px), bps_up(mulf(gross, px), m.imr_bps + b), bps_up(mulf((p.base as i128).abs(), px), m.mmr_bps + b)))
 }
 /// Health that governs position `pi`: its own if isolated, else the cross account.
 fn phealth(pid: &Address, u: &User, pi: usize, a: &[AccountView], nw: Now, need_fresh: bool) -> Result<(i128, i128, i128), ProgramError> {
@@ -525,11 +529,11 @@ fn health(pid: &Address, u: &User, a: &[AccountView], nw: Now, need_fresh: bool)
         if p.flags & POS_ISO != 0 { continue; } // isolated positions are margined on their own
         let m = find_market(pid, &p.market, a)?;
         if need_fresh && stale(m, nw) && (p.base != 0 || p.bid_open != 0 || p.ask_open != 0) { return Err(err(E::Stale)); }
-        let px = mark(m);
+        let (px, b) = (mark(m), band_bps(m));
         eq += mulf(p.base as i128, px);
         let gross = core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs());
-        im += bps_up(mulf(gross, px), m.imr_bps);
-        mm += bps_up(mulf((p.base as i128).abs(), px), m.mmr_bps);
+        im += bps_up(mulf(gross, px), m.imr_bps + b);
+        mm += bps_up(mulf((p.base as i128).abs(), px), m.mmr_bps + b);
     }
     Ok((eq, im, mm))
 }
@@ -1840,7 +1844,7 @@ fn liquidate_core(pid: &Address, a: &mut [AccountView], d: &[u8], vlt: bool) -> 
     let ab = b.unsigned_abs();
     // a third-party takeover is one bounded chunk, never more than restores maintenance (its fee is on what it takes);
     // the protocol vault (HLP-style backstop, entered only below 2/3 of maintenance) takes the whole position
-    let q = if vlt { ab.min(max_qty) } else { ab.min(max_qty).min(liq_chunk(ab)).min(liq_needed(eq, mm, ab, px, m.mmr_bps)) };
+    let q = if vlt { ab.min(max_qty) } else { ab.min(max_qty).min(liq_chunk(ab)).min(liq_needed(eq, mm, ab, px, m.mmr_bps + band_bps(m))) };
     if q == 0 { return Err(err(E::BadData)); }
     let li = pos_idx(lq, &mk, m.funding_index)?;
     if lq.pos[li].flags & POS_ISO != 0 { return Err(err(E::Isolated)); } // takeover lands in the liquidator's cross account
@@ -1908,7 +1912,7 @@ fn liquidate_book(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     if b == 0 { return Err(err(E::NotLiquidatable)); }
     let ab = b.unsigned_abs();
     let px = mark(m); let bid = b < 0;
-    let q = ab.min(max_qty).min(liq_chunk(ab)).min(liq_needed(eq, mm, ab, px, m.mmr_bps));
+    let q = ab.min(max_qty).min(liq_chunk(ab)).min(liq_needed(eq, mm, ab, px, m.mmr_bps + band_bps(m)));
     if q == 0 { return Err(err(E::BadData)); }
     let taker_bps = TIERS[(t.tier as usize).min(TIERS.len() - 1)].0;
     // maker quotes on that side are book too: such a market is liquidated by liquidate_fast, which takes both
@@ -2642,7 +2646,8 @@ fn worst_ok(pid: &Address, u: &User, pi: usize, mkts: &[AccountView], nw: Now, m
     let gross = |b: i128| core::cmp::max((b + p.bid_open as i128).abs(), (b - p.ask_open as i128).abs());
     let (g0, g1) = (gross(p.base as i128), gross(if bid { p.base as i128 + q } else { p.base as i128 - q }));
     if m.max_position != 0 && g1 > m.max_position as i128 { return false; }
-    let im_w = if g1 > g0 { im - bps_up(mulf(g0, px), m.imr_bps) + bps_up(mulf(g1, px), m.imr_bps) } else { im };
+    let ib = m.imr_bps + band_bps(m);
+    let im_w = if g1 > g0 { im - bps_up(mulf(g0, px), ib) + bps_up(mulf(g1, px), ib) } else { im };
     eq_w >= im_w
 }
 #[inline(always)]
@@ -2847,7 +2852,7 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     if b == 0 { return Err(err(E::NotLiquidatable)); }
     let ab = b.unsigned_abs();
     let px = mark(m); let bid = b < 0;
-    let mut left = ab.min(max_qty).min(liq_chunk(ab)).min(liq_needed(eq, mm, ab, px, m.mmr_bps));
+    let mut left = ab.min(max_qty).min(liq_chunk(ab)).min(liq_needed(eq, mm, ab, px, m.mmr_bps + band_bps(m)));
     if left == 0 { return Err(err(E::BadData)); }
     // same price window as an ordinary take: a liquidation never reaches quotes a taker couldn't
     let band = quote_band(px);

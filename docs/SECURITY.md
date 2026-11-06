@@ -79,3 +79,12 @@ refused). Comments in `lib.rs` may lag behind; this file and the tests are autho
 
 Σ base = 0 per market; `oi_long` = Σ long base; insurance ≥ 0;
 vault + bad_debt = Σ cash + Σ iso_margin (isolated positions only) + insurance + fees.
+
+## Oracle band (2026-11-06)
+
+The oracle's confidence — for an OracleSet the publishers' dispersion (median conf vs median deviation) — is added, in bps of
+the price and capped at `BAND_MAX_BPS` = 50, to every initial and maintenance requirement (`health`, `iso_health`,
+`worst_ok`, `liq_needed`). Margin tightens by itself while sources disagree or a venue is thin, and relaxes when they agree.
+Equity is still valued at the mark, so bankruptcy, ADL ordering, deficits and vault NAV are unchanged; only the gates move:
+opening risk needs IM + band, liquidation starts at MM + band, and a liquidation restores MM + band. `update_oracle` already
+refuses a confidence above `max_conf_bps`, so the band is bounded twice. Tests: `band.rs`.
