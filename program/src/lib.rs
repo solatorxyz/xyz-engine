@@ -112,7 +112,7 @@ fn mulf(a: i128, b: u64) -> i128 {
     } else { a * b as i128 }
 }
 #[inline(always)]
-fn bps_up(x: i128, b: u64) -> i128 { if x >= 0 && x < FAST && b <= 65_535 { ((x as u64).wrapping_mul(b) + 9999) as i128 / 10000 } else { (x * b as i128 + 9999) / 10000 } }
+fn bps_up(x: i128, b: u64) -> i128 { if x >= 0 && x < FAST && b <= 65_535 { (((x as u64).wrapping_mul(b) + 9999) / 10000) as i128 } else { (x * b as i128 + 9999) / 10000 } }
 #[inline(always)]
 fn bps_dn(x: i128, b: u64) -> i128 { if x >= 0 && x < FAST && b <= 65_535 { ((x as u64).wrapping_mul(b) / 10000) as i128 } else { x * b as i128 / 10000 } }
 
@@ -419,10 +419,12 @@ fn withdraw(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     claim_all(pid, u, &uk, &a[7..])?;
     complete_view(pid, u, &uk, &a[2..], None)?;
     settle_funding_all(pid, u, &a[2..])?;
-    if (amt as i128) > u.cash as i128 { return Err(err(E::Margin)); }
-    u.cash -= amt as i64;
-    let (eq, im, _) = health(pid, u, &a[2..], nw, true)?;
-    if eq < im { return Err(err(E::Margin)); }
+    // Withdrawable = equity without positive unrealized PnL, minus the initial requirement (percolator Eq_withdraw).
+    // Cash may go negative (a long's cash already paid its cost): what matters is the lane below, which is the same for longs
+    // and shorts. Without positions it is exactly amt <= cash.
+    u.cash = i64c(u.cash as i128 - amt as i128)?;
+    let (eq, im) = health_np(pid, u, &a[2..], nw)?;
+    if eq < im || eq < 0 { return Err(err(E::Margin)); }
     let bump = [m.vault_bump as u8];
     let seeds = [Seed::from(b"vault".as_slice()), Seed::from(&m.vault_seed), Seed::from(&bump)];
     pinocchio_token::instructions::Transfer::new(&a[3], &a[4], &a[6], amt)
@@ -517,10 +519,39 @@ fn iso_transfer(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
     complete_view(pid, u, &uk, &a[2..], if amt < 0 { Some(&mk) } else { None })?;
     settle_funding_all(pid, u, &a[2..])?;
     u.cash = i64c(u.cash as i128 - amt as i128)?; u.pos[pi].iso_margin = i64c(u.pos[pi].iso_margin as i128 + amt as i128)?;
-    if amt > 0 { let (e, im, _) = health(pid, u, &a[2..], nw, true)?; if u.cash < 0 || e < im { return Err(err(E::Margin)); } }
-    else { let (e, im, _) = iso_health(pid, u, pi, &a[2..], nw, true)?; if u.pos[pi].iso_margin < 0 || e < im { return Err(err(E::Margin)); } }
+    // collateral leaving a margin bucket is checked without that bucket's positive PnL (same lane as withdraw)
+    if amt > 0 { let (e, im) = health_np(pid, u, &a[2..], nw)?; if u.cash < 0 || e < im { return Err(err(E::Margin)); } }
+    else { let (e, im) = iso_health_np(pid, u, pi, &a[2..], nw)?; if u.pos[pi].iso_margin < 0 || e < im { return Err(err(E::Margin)); } }
     gc_pos(u);
     Ok(())
+}
+/// Value a position contributes to equity with its positive PnL left out (percolator v16 `Eq_no_positive_credit`):
+/// min(base x mark, cost). Losses count in full, gains not at all; `cost` is the net quote paid since the position opened.
+#[inline(always)]
+fn np_value(base: i64, cost: i64, px: u64) -> i128 { core::cmp::min(mulf(base as i128, px), cost as i128) }
+/// Withdrawal lane: (equity without positive unrealized PnL, initial req). Principal can only leave against equity
+/// that does not depend on the oracle having moved in the account's favour, so a manipulated or briefly wrong mark
+/// can't be turned into a withdrawal of collateral (percolator req 8/9/15: positive PnL is junior, no unbacked use).
+fn health_np(pid: &Address, u: &User, a: &[AccountView], nw: Now) -> Result<(i128, i128), ProgramError> {
+    let (mut eq, mut im) = (u.cash as i128, 0i128);
+    for p in u.pos.iter() {
+        if p.market == [0; 32] { break; }
+        if p.flags & POS_ISO != 0 { continue; }
+        let m = find_market(pid, &p.market, a)?;
+        if stale(m, nw) && (p.base != 0 || p.bid_open != 0 || p.ask_open != 0) { return Err(err(E::Stale)); }
+        let (px, b) = (mark(m), band_bps(m));
+        eq += np_value(p.base, p.cost, px);
+        let gross = core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs());
+        im += bps_up(mulf(gross, px), m.imr_bps + b);
+    }
+    Ok((eq, im))
+}
+fn iso_health_np(pid: &Address, u: &User, pi: usize, a: &[AccountView], nw: Now) -> Result<(i128, i128), ProgramError> {
+    let p = &u.pos[pi]; let m = find_market(pid, &p.market, a)?;
+    if stale(m, nw) && (p.base != 0 || p.bid_open != 0 || p.ask_open != 0) { return Err(err(E::Stale)); }
+    let (px, b) = (mark(m), band_bps(m));
+    let gross = core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs());
+    Ok((p.iso_margin as i128 + np_value(p.base, p.cost, px), bps_up(mulf(gross, px), m.imr_bps + b)))
 }
 fn health(pid: &Address, u: &User, a: &[AccountView], nw: Now, need_fresh: bool) -> Result<(i128, i128, i128), ProgramError> {
     let (mut eq, mut im, mut mm) = (u.cash as i128, 0i128, 0i128);
@@ -3302,6 +3333,32 @@ mod kani_proofs {
         assert_eq!(u.cash as i128 + f.makers[0].quote as i128, 0);
         assert_eq!(f.makers[0].budget as i128, (i64::MAX >> 2) as i128 - nts as i128);
         assert_eq!(f.makers[0].volume, lots);
+    }
+    /// Withdrawal lane: a position never contributes more than its mark value or its cost, so positive unrealized PnL is never
+    /// credited, while a loss counts in full (percolator v16 Eq_no_positive_credit).
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn np_value_never_credits_a_gain() {
+        let (base, cost, px): (i64, i64, u64) = (kani::any(), kani::any(), kani::any());
+        kani::assume(base.unsigned_abs() < (1u64 << 32) && px < (1u64 << 48));
+        let mv = base as i128 * px as i128; let v = np_value(base, cost, px);
+        assert!(v <= mv && v <= cost as i128);
+        if mv <= cost as i128 { assert_eq!(v, mv); } // losing (or flat) position: full mark value, the loss counts
+        else { assert_eq!(v, cost as i128); }        // winning position: only what was paid, the gain is left out
+    }
+    /// Pegged orders always price on the tick grid inside [TICK, MAX_PX], whatever the oracle, offset and limits.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn peg_price_in_range() {
+        let (o, off, lo, hi): (u64, i64, u64, u64) = (kani::any(), kani::any(), kani::any(), kani::any());
+        let p = peg_price(o, off, lo, hi);
+        assert!(p >= TICK && p <= MAX_PX && p % TICK == 0);
+    }
+    /// A position that goes flat carries no cost; a reduction on the same side never changes the sign of the basis' owner.
+    #[kani::proof]
+    fn cost_after_flat_is_zero() {
+        let (ob, cost): (i64, i64) = (kani::any(), kani::any()); let paid: i64 = kani::any();
+        assert_eq!(cost_after(ob, 0, cost, paid as i128).unwrap(), 0);
     }
     #[kani::proof]
     fn liq_chunk_bounds() {
