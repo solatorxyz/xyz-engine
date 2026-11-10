@@ -112,7 +112,8 @@ pub const FUNDING_PPB: u64 = 1000000000;
 pub const FUNDING_PERIOD_SLOTS: u64 = 9000;
 pub const FUNDING_INTEREST_8H_PPB: u64 = 100000;
 pub const FUNDING_PREMIUM_CLAMP_8H_PPB: u64 = 500000;
-pub const FUNDING_MAX_RATE_HOURLY_PPB: u64 = 40000000;
+/// 0.5% an hour, the cap Hyperliquid documents (was 4%).
+pub const FUNDING_MAX_RATE_HOURLY_PPB: u64 = 5000000;
 pub const FUNDING_IMPACT_NOTIONAL: u64 = 1000000;
 pub const FUNDING_HOURS_PER_8H: u64 = 8;
 pub const MARK_EMA_SLOTS: u64 = 375;
