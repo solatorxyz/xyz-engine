@@ -17,3 +17,8 @@ name = "native"
 path = "fuzz_targets/native.rs"
 test = false
 doc = false
+[[bin]]
+name = "lanes"
+path = "fuzz_targets/lanes.rs"
+test = false
+doc = false
