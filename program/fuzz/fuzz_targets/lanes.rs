@@ -13,6 +13,9 @@
 //! loop); each assert message names the rule. A transaction that fails is rolled back; a "successful" instruction that wrote
 //! to an account passed read-only is treated as failed (the runtime would refuse it).
 //!
+//! `model_place` is a reference model of the resting-order matcher (`take`), written from the docs: every successful limit
+//! order placed through IX 1 is compared with it (taker lots, cash, cost basis, the orders left, the makers' ledgers, fees).
+//!
 //! Known findings can be switched off with LANES_KNOWN=tag,tag (or `all`) so the fuzzer can go on past them:
 //!   fund-refill  slab_fund with amount <= 0 on a settled entry refills the whole budget although initial margin leaves less free
 //!   liq-aged     liquidate_fast fills maker quotes while the oracle is older than FAST_GUARD_MAX_AGE_SLOTS (no signed price)
@@ -277,6 +280,96 @@ fn fill_checks(w: &World, cx: &Cx, pre: &[FastBook], settle_or_fund: bool, liq: 
     total
 }
 
+
+// ---------- reference model of `take` (resting orders), written from docs/SECURITY.md "Order book" and docs/FAST_PATH.md ----------
+// Rules modelled: a taker fills the best opposite price first; at one price the order that arrived in an earlier slot, then the
+// earlier shard, then the earlier order; never through its limit; the fill is at the maker's price; the taker pays
+// ceil(notional x fee bps), the maker gets its notional (+ floor rebate) in the shard ledger; an order outside its own oracle
+// band is removed, not filled; the taker's own orders never fill (self-trade prevention: cancel the resting one, stop, or
+// decrement both); the taker's own unclaimed fills are booked first; a cost basis is the net quote paid, 0 when flat, re-based at
+// the trade's average price on a flip. Only limit orders (pegs and splines re-price lazily and are left to the invariants).
+struct Pred { base: i128, bucket: i128, cost: i128, books: Vec<(usize, Vec<(K, u64, u64)>)>, ledgers: Vec<(usize, HashMap<K, (i64, i64, u64, u64)>)>, fees: i128, ioc: bool, open: (u64, u64, u64) }
+fn cost_rule(ob: i128, nb: i128, cost: i128, paid: i128) -> i128 { if nb == 0 { 0 } else if ob != 0 && (ob > 0) != (nb > 0) { nb * paid.abs() / (nb - ob).abs() } else { cost + paid } }
+fn model_place(w: &World, cx: &Cx, ui: usize, side: u8, fl: u8, limit: u64, mut qty: u64) -> Option<Pred> {
+    let m: &Market = w.rf(&cx.market); let u: &User = w.rf(&cx.users[ui].u); let uk = cx.users[ui].u;
+    let bid = side == 0; let opp = 1 - side as u64;
+    let (post, reduce, fok) = (fl & 1 != 0, fl & 2 != 0, fl & 8 != 0); let ioc = fl & 4 != 0 || fok || reduce; let stp = (fl as u64 & 96) >> 5;
+    if post { return None; }
+    let p0 = u.pos.iter().find(|p| p.market == cx.market);
+    let iso = p0.is_some_and(|p| p.flags & 1 != 0);
+    let (mut base, mut cost) = (p0.map_or(0, |p| p.base as i128), p0.map_or(0, |p| p.cost as i128));
+    let mut bucket = if iso { p0.unwrap().iso_margin as i128 } else { u.cash as i128 };
+    let mut open = p0.map_or((0, 0, 0), |p| (p.bid_open, p.ask_open, p.n_orders));
+    // 1) the taker's own unclaimed maker fills, shard by shard in account order
+    let mut ledgers: Vec<(usize, HashMap<K, (i64, i64, u64, u64)>)> = vec![]; let mut books: Vec<(usize, Vec<(K, u64, u64)>)> = vec![];
+    let mut all: Vec<(u64, u64, usize, usize, K, u64, u64, u64)> = vec![]; // price, arrival, shard, pos, owner, qty, band, rebate bps
+    for (si, sk) in cx.sh.iter().enumerate() { let s: &Shard = w.rf(sk);
+        let mut led = HashMap::new();
+        for l in &s.ledger[..s.nled as usize] {
+            if l.owner == uk { let ob = base; base += l.base as i128; bucket += l.quote as i128; cost = cost_rule(ob, base, cost, -(l.quote as i128));
+                if s.side == 0 { open.0 -= l.open_reduce } else { open.1 -= l.open_reduce } open.2 -= l.n_closed; }
+            else { led.insert(l.owner, (l.base, l.quote, l.open_reduce, l.n_closed)); } }
+        ledgers.push((si, led));
+        if s.side != opp { continue; }
+        for (i, o) in s.orders[..s.n as usize].iter().enumerate() { if o.meta & 0xff != 0 { return None; } all.push((o.price, o.meta >> 32, si, i, o.owner, o.qty, o.band_bps, (o.meta >> 8) & 0xff)); }
+        books.push((si, vec![])); }
+    if reduce { let cap = if bid && base < 0 { (-base) as u64 } else if !bid && base > 0 { base as u64 } else { 0 }; qty = qty.min(cap); }
+    // 2) priority: price, arrival slot, shard, position
+    all.sort_by(|a, b| (if bid { a.0.cmp(&b.0) } else { b.0.cmp(&a.0) }).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3)));
+    let off = |px: u64, band: u64| band != 0 && (px.abs_diff(m.oracle_px) as u128) * 10000 > m.oracle_px as u128 * band as u128;
+    let within = |px: u64| if bid { px <= limit } else { px >= limit };
+    if fok { let have: u64 = all.iter().filter(|o| o.4 != uk && !off(o.0, o.6) && within(o.0)).map(|o| o.5).sum(); if have < qty { qty = 0; } }
+    let taker_bps = spec::TIERS[(u.tier as usize).min(spec::TIERS.len() - 1)].0;
+    let (mut fees, mut stop) = (0i128, false);
+    let mut rest: Vec<(u64, u64, usize, usize, K, u64, u64, u64)> = vec![];
+    for mut o in all {
+        if stop || qty == 0 || !within(o.0) { rest.push(o); stop = true; continue; }
+        let led = &mut ledgers.iter_mut().find(|x| x.0 == o.2).unwrap().1;
+        if o.4 == uk {
+            let live = !off(o.0, o.6);
+            if stp == 1 && live { rest.push(o); stop = true; continue; }
+            let d = if stp > 1 && live { qty.min(o.5) } else { o.5 };
+            if stp > 1 && live { qty -= d; }
+            if bid { open.1 -= d } else { open.0 -= d }
+            o.5 -= d; if o.5 == 0 { open.2 -= 1; } else { rest.push(o); }
+        } else if off(o.0, o.6) {
+            let e = led.entry(o.4).or_insert((0, 0, 0, 0)); e.2 += o.5; e.3 += 1;
+        } else {
+            let q = qty.min(o.5); let nt = o.0 as i128 * q as i128;
+            let (fee, reb) = ((nt * taker_bps as i128 + 9999) / 10000, nt * o.7 as i128 / 10000);
+            let e = led.entry(o.4).or_insert((0, 0, 0, 0));
+            if bid { e.0 -= q as i64; e.1 += (nt + reb) as i64; } else { e.0 += q as i64; e.1 += (-nt + reb) as i64; }
+            e.2 += q; o.5 -= q; if o.5 == 0 { e.3 += 1; } else { rest.push(o); }
+            fees += fee - reb; qty -= q;
+            let paid = if bid { nt } else { -nt };
+            bucket -= fee + paid; let ob = base; base += if bid { q as i128 } else { -(q as i128) }; cost = cost_rule(ob, base, cost, paid);
+        }
+    }
+    rest.sort_by(|a, b| a.2.cmp(&b.2).then(a.3.cmp(&b.3)));
+    for o in rest { books.iter_mut().find(|x| x.0 == o.2).unwrap().1.push((o.4, o.0, o.5)); }
+    Some(Pred { base, bucket, cost, books, ledgers, fees, ioc, open })
+}
+fn check_pred(w: &World, cx: &Cx, ui: usize, pr: &Pred, fees0: i128, what: &str) {
+    let u: &User = w.rf(&cx.users[ui].u); let uk = cx.users[ui].u;
+    let p = u.pos.iter().find(|p| p.market == cx.market);
+    let iso = p.is_some_and(|p| p.flags & 1 != 0);
+    assert_eq!(p.map_or(0, |p| p.base as i128), pr.base, "{what}: take differs from the reference model: taker lots");
+    assert_eq!(if iso { p.unwrap().iso_margin as i128 } else { u.cash as i128 }, pr.bucket, "{what}: take differs from the reference model: taker cash (notional + fees)");
+    assert_eq!(p.map_or(0, |p| p.cost as i128), pr.cost, "{what}: take differs from the reference model: taker cost basis");
+    if pr.ioc { assert_eq!(p.map_or((0, 0, 0), |p| (p.bid_open, p.ask_open, p.n_orders)), pr.open, "{what}: take differs from the reference model: taker's own resting orders (self-trade prevention)"); }
+    let mut fees = 0i128;
+    for (si, sk) in cx.sh.iter().enumerate() { let s: &Shard = w.rf(sk); fees += s.fee_accum as i128;
+        if let Some((_, want)) = pr.books.iter().find(|x| x.0 == si) {
+            let got: Vec<(K, u64, u64)> = s.orders[..s.n as usize].iter().map(|o| (o.owner, o.price, o.qty)).collect();
+            assert!(got == *want, "{what}: take differs from the reference model: resting orders left in shard {si}");
+            let led: HashMap<K, (i64, i64, u64, u64)> = s.ledger[..s.nled as usize].iter().map(|l| (l.owner, (l.base, l.quote, l.open_reduce, l.n_closed))).collect();
+            assert!(led == pr.ledgers.iter().find(|x| x.0 == si).unwrap().1, "{what}: take differs from the reference model: maker fills in the ledger of shard {si}");
+        }
+        assert!(!s.ledger[..s.nled as usize].iter().any(|l| l.owner == uk), "{what}: the taker's own fills were not claimed");
+    }
+    assert_eq!(fees - fees0, pr.fees, "{what}: take differs from the reference model: fees kept by the shards");
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.len() < 16 { return; }
     let cfg = data[0];
@@ -401,7 +494,7 @@ fuzz_target!(|data: &[u8]| {
     }
     let mut ts_ms: u64 = 1000; let mut slots_used: u64 = 0; let mut idx_moved = false;
     invariants(&w, &cx, vault_amt, true, "setup");
-    let mut okc = [0u32; 32]; let mut tot = [0u32; 32];
+    let mut okc = [0u32; 32]; let mut tot = [0u32; 32]; let mut modelled = 0u32;
     let all_shards_w = |cx: &Cx| -> Vec<Meta> { cx.sh.iter().map(|s| (*s, false, true)).collect() };
     let slabs_for = |cx: &Cx, w: &World, book: &K, sel: u8| -> Vec<Meta> {
         // approved slabs in the book's own order; `sel` can drop one, repeat one or reverse them (the program must cope)
@@ -425,7 +518,10 @@ fuzz_target!(|data: &[u8]| {
             0 | 1 => { let k = if c[7] & 0x30 == 0x10 { 1 } else if c[7] & 0x30 == 0x20 { 2 } else { 0 };
                 let (a1, a2, a3) = match k { 1 => ((c[2] as i64) - 128, 0, 0), 2 => (1 + (c[2] % 7) as i64, 1 + (c[3] % 8) as u64, (c[7] % 3) as u64), _ => (0, 0, 0) };
                 let mut d = vec![1u8]; d.extend(place(side, c[5] & 0x7f, k, if k == 1 { 0 } else { price }, qty, if c[7] & 1 == 1 { 300 } else { 0 }, (c[7] % 4) as u64, a1, a2, a3));
-                w.call(&trade(&cx, ui), &d); }
+                // differential: a limit order's take against the reference model (every shard is passed, funding has not moved)
+                let pred = if k == 0 && !idx_moved { model_place(&w, &cx, ui, side, c[5] & 0x7f, price, qty) } else { None };
+                let fees0: i128 = cx.sh.iter().map(|s| w.rf::<Shard>(s).fee_accum as i128).sum();
+                if w.call(&trade(&cx, ui), &d) { if let Some(pr) = pred { check_pred(&w, &cx, ui, &pr, fees0, &what); modelled += 1; } } }
             2 => { let mut d = vec![3u8]; d.extend_from_slice(&0u16.to_le_bytes()); d.push(1); d.push(2);
                 d.extend_from_slice(&((c[7] % 4) as u64).to_le_bytes()); d.push(side | 128); d.extend_from_slice(&0u64.to_le_bytes());
                 d.extend(place(side, 1, 0, price, qty, 0, (c[7] % 4) as u64, 0, 0, 0)); d.extend(place(1 - side, 1, 0, price + 200, qty, 0, 0, 0, 0, 0));
@@ -640,7 +736,7 @@ fuzz_target!(|data: &[u8]| {
                 } }
         }
     }
-    if std::env::var("NATIVE_STATS").is_ok() { eprintln!("ok/total per op: {:?} ro_refused {}", okc.iter().zip(tot.iter()).enumerate().collect::<Vec<_>>(), w.ro_refused); }
+    if std::env::var("NATIVE_STATS").is_ok() { eprintln!("ok/total per op: {:?} ro_refused {} modelled {}", okc.iter().zip(tot.iter()).enumerate().collect::<Vec<_>>(), w.ro_refused, modelled); }
     // settle + claim everything at one index, aggregate, then the exact end-of-run conservation (also after funding moved)
     w.slot += 1; w.ts += 1; upd(&mut w, &cx, px, (px / 10000) as u64, 0);
     for i in 0..7 { let x = &cx.users[i]; let (a, u) = (x.auth, x.u);
