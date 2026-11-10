@@ -467,11 +467,21 @@ const POS_ISO: u64 = 1;
 const POS_PIN: u64 = spec::POS_FLAG_MAKER_PIN;
 /// Price window of fast-path fills around the mark (no rounding to zero for low prices).
 #[inline(always)]
-fn quote_band(px: u64) -> u64 { (px as u128 * spec::QUOTE_BAND_BPS as u128 / 10000) as u64 }
+fn quote_band(px: u64) -> u64 {
+    // CU: native u64 when the product can't wrap (every real price); u128 multiply/divide are software routines on SBF
+    if px < (1 << 48) { px.wrapping_mul(spec::QUOTE_BAND_BPS) / 10000 } else { (px as u128 * spec::QUOTE_BAND_BPS as u128 / 10000) as u64 }
+}
 /// Oracle band in bps: the oracle's confidence as a share of its price (an OracleSet reports the publishers' dispersion),
 /// capped at spec::BAND_MAX_BPS. Added to the margin requirements, never taken from equity (see spec).
 #[inline(always)]
-fn band_bps(m: &Market) -> u64 { if m.oracle_px == 0 { 0 } else { ((m.oracle_conf as u128 * 10000 / m.oracle_px as u128) as u64).min(spec::BAND_MAX_BPS) } }
+fn band_bps(m: &Market) -> u64 { band_of(m.oracle_conf, m.oracle_px) }
+/// CU: this runs for every position of every health pass. Native u64 division when conf x 10000 can't wrap (any real
+/// confidence), the u128 software division only beyond that.
+#[inline(always)]
+fn band_of(conf: u64, px: u64) -> u64 {
+    if px == 0 { return 0; }
+    (if conf < (1 << 50) { conf.wrapping_mul(10000) / px } else { (conf as u128 * 10000 / px as u128) as u64 }).min(spec::BAND_MAX_BPS)
+}
 /// Isolated position: equity = iso_margin + base * mark (all of the position's cash flows are booked to iso_margin).
 fn iso_health(pid: &Address, u: &User, pi: usize, a: &[AccountView], nw: Now, need_fresh: bool) -> Result<(i128, i128, i128), ProgramError> {
     let p = &u.pos[pi]; let m = find_market(pid, &p.market, a)?;
@@ -845,15 +855,15 @@ fn arrival(c: &(*mut Shard, usize, u64, bool)) -> u64 { unsafe { (*c.0).orders[c
 #[inline(always)]
 fn bound_range(m: &Market) -> (u64, u64) {
     if m.session == 0 || m.bound_bps == 0 || m.bound_ref == 0 { return (0, u64::MAX); }
-    let d = (m.bound_ref as u128 * m.bound_bps as u128 / 10000) as u64;
+    let d = bps_of(m.bound_ref, m.bound_bps);
     (m.bound_ref.saturating_sub(d), m.bound_ref.saturating_add(d))
 }
 /// Re-anchor while closed (price within thresh of the bound moves the reference to the bound, until bound_max), then clamp mark.
 fn apply_bounds(m: &mut Market, px: u64) {
     if m.bound_bps == 0 { return; }
     if m.session == 0 || m.bound_ref == 0 { m.bound_ref = px; m.bound_up = 0; m.bound_dn = 0; return; }
-    let d = (m.bound_ref as u128 * m.bound_bps as u128 / 10000) as u64;
-    let t = (d as u128 * m.bound_thresh_bps as u128 / 10000) as u64;
+    let d = bps_of(m.bound_ref, m.bound_bps);
+    let t = bps_of(d, m.bound_thresh_bps);
     if px >= m.bound_ref + t && m.bound_up < m.bound_max { m.bound_ref += d; m.bound_up += 1; }
     else if px + t <= m.bound_ref && m.bound_dn < m.bound_max { m.bound_ref -= d; m.bound_dn += 1; }
     let (lo, hi) = bound_range(m);
@@ -948,7 +958,22 @@ fn take(pid: &Address, a: &[AccountView], mk: &Key, m: &Market, u: &mut User, uk
 #[inline(always)]
 fn off_band(px: u64, oracle: u64, band: u64) -> bool {
     let d = px.abs_diff(oracle);
-    match (d.checked_mul(10000), oracle.checked_mul(band)) { (Some(l), Some(r)) => l > r, _ => d as u128 * 10000 > oracle as u128 * band as u128 }
+    exceeds(d, oracle, band)
+}
+/// a x 10000 > b x bps. CU: native u64 products when they can't wrap; checked and u128 multiplies are software routines on SBF.
+#[inline(always)]
+fn exceeds(a: u64, b: u64, bps: u64) -> bool {
+    if a < (1 << 48) && b < (1 << 48) && bps <= 65_535 { a.wrapping_mul(10000) > b.wrapping_mul(bps) } else { a as u128 * 10000 > b as u128 * bps as u128 }
+}
+/// x x bps / 10000, rounded down, same fast path.
+#[inline(always)]
+fn bps_of(x: u64, bps: u64) -> u64 {
+    if x < (1 << 48) && bps <= 65_535 { x.wrapping_mul(bps) / 10000 } else { (x as u128 * bps as u128 / 10000) as u64 }
+}
+/// price x qty < MIN_ORDER_NOTIONAL, without a wide multiply for ordinary sizes.
+#[inline(always)]
+fn below_min_notional(price: u64, qty: u64) -> bool {
+    if price < (1 << 32) && qty < (1 << 32) { price.wrapping_mul(qty) < MIN_ORDER_NOTIONAL } else { (price as u128) * (qty as u128) < MIN_ORDER_NOTIONAL as u128 }
 }
 /// FOK pre-check (AUDIT M-3): can `need` be filled at `limit` from other owners' live liquidity in the passed shards?
 fn fok_avail(a: &[AccountView], pid: &Address, mk: &Key, opp: u64, oracle: u64, limit: u64, slot: u64, uk: &Key, need: u64) -> bool {
@@ -1121,7 +1146,7 @@ fn batch(pid: &Address, a: &mut [AccountView], d: &[u8], single: bool) -> Progra
         }
         if k == KIND_PEG { price = peg_price(m.oracle_px, a1, a2, a3); }
         // AUDIT H-3: minimum notional for anything that can rest (anti book-stuffing)
-        if !ioc && (price as u128) * (qty as u128) < MIN_ORDER_NOTIONAL as u128 { return Err(err(E::BadData)); }
+        if !ioc && below_min_notional(price, qty) { return Err(err(E::BadData)); }
         let bo = best(rest, pid, &mk, if bid { SIDE_ASK } else { SIDE_BID }, m.oracle_px).map(|b| b.2);
         let crosses = bo.is_some_and(|p| if bid { p <= price } else { p >= price });
         if post && crosses {
@@ -1768,7 +1793,7 @@ fn read_primary(pid: &Address, x: &AccountView, rest: &[AccountView], feed: &Key
     let conf = med_u(&mut cf[..k]).max(med_u(&mut dev[..k]));
     let mut ts = pt; isort(&mut ts[..k]); let t = ts[(k - 1) / 2];
     if t < m.oracle_ts { return Err(E::Stale); }
-    if (conf as u128) * 10000 > (med as u128) * m.max_conf_bps as u128 { return Err(E::Oracle); }
+    if exceeds(conf, med, m.max_conf_bps) { return Err(E::Oracle); }
     Ok((med, conf, t))
 }
 fn read_pyth(pid: &Address, x: &AccountView, feed: &Key, m: &Market, now: i64, floor: i64) -> Result<(u64, u64, i64), E> {
@@ -1783,7 +1808,7 @@ fn read_pyth(pid: &Address, x: &AccountView, feed: &Key, m: &Market, now: i64, f
     if price <= 0 || expo != m.expo { return Err(E::Oracle); }
     if now - pt > m.max_age_secs as i64 { return Err(E::Stale); }
     if pt < floor { return Err(E::Stale); } // AUDIT L-4: no replay of an older update (floor = last applied publish time)
-    if (conf as u128) * 10000 > (price as u128) * m.max_conf_bps as u128 { return Err(E::Oracle); }
+    if exceeds(conf, price as u64, m.max_conf_bps) { return Err(E::Oracle); } // price > 0 checked above
     // CU: native u64 division for the common px_mul == 1 config (same result: both operands positive)
     let (px, conf_px) = if m.px_mul == 1 && m.px_div > 0 { (price as u64 / m.px_div as u64, conf / m.px_div as u64) } else {
         ((price as i128 * m.px_mul as i128 / m.px_div as i128) as u64, (conf as i128 * m.px_mul as i128 / m.px_div as i128) as u64) };
@@ -3382,6 +3407,30 @@ mod kani_proofs {
     fn cost_after_flat_is_zero() {
         let (ob, cost): (i64, i64) = (kani::any(), kani::any()); let paid: i64 = kani::any();
         assert_eq!(cost_after(ob, 0, cost, paid as i128).unwrap(), 0);
+    }
+    /// The native u64 paths (band_of, quote_band, exceeds, bps_of, below_min_notional) are taken only where their products
+    /// cannot wrap; with no wrap a u64 product and quotient equal the u128 ones, so the paths are exact. (The full
+    /// equality with symbolic 64-bit division does not terminate in the solver; the no-wrap condition is what it rests on.)
+    #[kani::proof]
+    fn native_paths_cannot_wrap() {
+        let (a, b, bps): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        if a < (1 << 50) { assert!(a.checked_mul(10000).is_some()); }                                   // band_of
+        if a < (1 << 48) { assert!(a.checked_mul(spec::QUOTE_BAND_BPS).is_some()); }                    // quote_band
+        if a < (1 << 48) && b < (1 << 48) && bps <= 65_535 { assert!(a.checked_mul(10000).is_some() && b.checked_mul(bps).is_some() && a.checked_mul(bps).is_some()); } // exceeds, bps_of
+        if a < (1 << 32) && b < (1 << 32) { assert!(a.checked_mul(b).is_some()); }                      // below_min_notional
+    }
+    /// Results on small widths, where the solver can do the division: same value as the wide formulas, band capped.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn native_paths_match_wide_small() {
+        let (a, b, bps): (u16, u16, u8) = (kani::any(), kani::any(), kani::any());
+        let (a, b, bps) = (a as u64, b as u64, bps as u64);
+        if b != 0 { assert_eq!(band_of(a, b), ((a as u128 * 10000 / b as u128) as u64).min(spec::BAND_MAX_BPS)); }
+        assert_eq!(band_of(a, 0), 0);
+        assert_eq!(quote_band(a), (a as u128 * spec::QUOTE_BAND_BPS as u128 / 10000) as u64);
+        assert_eq!(exceeds(a, b, bps), a as u128 * 10000 > b as u128 * bps as u128);
+        assert_eq!(bps_of(a, bps), (a as u128 * bps as u128 / 10000) as u64);
+        assert_eq!(below_min_notional(a, b), (a as u128) * (b as u128) < MIN_ORDER_NOTIONAL as u128);
     }
     #[kani::proof]
     fn liq_chunk_bounds() {
