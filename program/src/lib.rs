@@ -360,6 +360,12 @@ fn auth(pid: &Address, admin: &Key, a: &[AccountView]) -> bool {
         for i in 0..(ms.n as usize).min(8) { if ms.keys[i] == k && got & (1 << i) == 0 { got |= 1 << i; cnt += 1; } } }
     cnt >= ms.m
 }
+/// `admin` is a Multisig account (passed) and at least one of its keys signed.
+fn any_member(pid: &Address, admin: &Key, a: &[AccountView]) -> bool {
+    let Some(ms) = a.iter().find(|x| key(x) == *admin) else { return false };
+    let Ok(ms) = load::<Multisig>(ms, pid, DISC_MULTISIG, MULTISIG_SIZE) else { return false };
+    a.iter().any(|x| sg(pid, x) && { let k = key(x); (0..(ms.n as usize).min(8)).any(|i| ms.keys[i] == k) })
+}
 /// accs: admin(s), market, shard(w). data: tag, side u8, lo u64
 fn init_shard(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if a.len() < 3 || !sg(pid, &a[0]) || d.len() < 10 { return Err(err(E::BadData)); }
@@ -1275,8 +1281,11 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
 fn admin(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if a.len() < 2 || d.len() < 10 { return Err(err(E::BadData)); }
     let m: &mut Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
-    if !auth(pid, &m.admin, a) { return Err(err(E::BadAccount)); }
     let v = rd64(d, 2)?;
+    // Emergency stop: any ONE member of the market's multisig can pause (no new risk or deposits; cancels, reduce-only,
+    // withdrawals and liquidations keep working). Un-pausing and everything else needs the full m of n.
+    if d[1] as u64 == ADMIN_PAUSE && v == 1 && any_member(pid, &m.admin, a) { m.paused = 1; return Ok(()); }
+    if !auth(pid, &m.admin, a) { return Err(err(E::BadAccount)); }
     // immediate: pause and new-risk caps (cannot move funds). Everything else goes through the timelock.
     // AUDIT V5-4: on a pooled market the OI cap can only be lowered (never above the value admitted under the pool cap)
     if m.pool != [0; 32] && d[1] as u64 == ADMIN_MAX_OI && (v == 0 || v > m.max_oi) { return Err(err(E::Cap)); }

@@ -595,8 +595,19 @@ fn adm_d(tag: u8, op: u8, v: u64, k: Option<&Address>) -> Vec<u8> {
     e.set_time(e.slot + 216_000); e.send("", vec![w(&m)], vec![29], &[], true);
     assert_eq!(e.market_state().admin, ms.to_bytes());
     let k = |i: usize| AccountMeta::new_readonly(ks[i].pubkey(), true);
-    assert_eq!(try_send(&mut e, vec![k(0), w(&m), r(&ms)], adm_d(22, 1, 1, None), &[&ks[0]]), Some(BAD_ACCOUNT));
-    assert_eq!(try_send(&mut e, vec![AccountMeta::new(a, true), w(&m), r(&ms)], adm_d(22, 1, 1, None), &[]), Some(BAD_ACCOUNT));
+    // one key is not enough for anything that loosens: caps, un-pause
+    assert_eq!(try_send(&mut e, vec![k(0), w(&m), r(&ms)], adm_d(22, 2, 5, None), &[&ks[0]]), Some(BAD_ACCOUNT));
+    assert_eq!(try_send(&mut e, vec![AccountMeta::new(a, true), w(&m), r(&ms)], adm_d(22, 1, 1, None), &[]), Some(BAD_ACCOUNT), "the old admin is out");
+    let stranger = Keypair::new(); e.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
+    assert_eq!(try_send(&mut e, vec![AccountMeta::new_readonly(stranger.pubkey(), true), w(&m), r(&ms)], adm_d(22, 1, 1, None), &[&stranger]), Some(BAD_ACCOUNT), "not a member");
+    // emergency stop: any one member pauses ...
+    e.send("emergency pause (1 member)", vec![k(1), w(&m), r(&ms)], adm_d(22, 1, 1, None), &[&ks[1]], true);
+    assert_eq!(e.market_state().paused, 1);
+    // ... but can't resume alone, and can't set any other pause value
+    assert_eq!(try_send(&mut e, vec![k(1), w(&m), r(&ms)], adm_d(22, 1, 0, None), &[&ks[1]]), Some(BAD_ACCOUNT));
+    assert_eq!(try_send(&mut e, vec![k(1), w(&m), r(&ms)], adm_d(22, 1, 2, None), &[&ks[1]]), Some(BAD_ACCOUNT));
+    e.send("resume (2 of 3 signers)", vec![k(0), w(&m), r(&ms), k(2)], adm_d(22, 1, 0, None), &[&ks[0], &ks[2]], true);
+    assert_eq!(e.market_state().paused, 0);
     e.send("admin pause via multisig (2 of 3 signers)", vec![k(0), w(&m), r(&ms), k(2)], adm_d(22, 1, 1, None), &[&ks[0], &ks[2]], true);
     assert_eq!(e.market_state().paused, 1);
 }

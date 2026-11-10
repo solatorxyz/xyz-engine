@@ -2004,6 +2004,7 @@ dependencies = [
  "solana-message",
  "solana-program-runtime",
  "solana-runtime-transaction",
+ "solana-sha256-hasher",
  "solana-signer",
  "solana-svm-callback",
  "solana-svm-feature-set",
