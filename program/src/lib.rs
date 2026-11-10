@@ -2609,7 +2609,7 @@ fn slab_fund(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
             Ok((eq, im, _)) => maker_budget(m, (nm as i128 + eq - im).clamp(0, nm as i128) as i64),
             Err(_) => e.budget.min(maker_budget(m, nm)) } };
     // set once a maker funds here and kept (another book of the market may still hold its fills): a maker account keeps the slot
-    if nm > 0 || unsettled { u.pos[pi].flags |= POS_PIN; }
+    if nm > 0 || unsettled || e.target > 0 { u.pos[pi].flags |= POS_PIN; } // auto mode: a settle may lock margin later
     if key(&a[3]) == m.fast_book[0] || key(&a[3]) == m.fast_book[1] { sync_mirror(u, m, &mk, nm); }
     if amt > 0 { let (eq, im, _) = health_im(pid, u, &a[2..], nw, true)?; if u.cash < 0 || eq < im { return Err(err(E::Margin)); } }
     Ok(())
@@ -2646,7 +2646,10 @@ fn slab_settle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
         u.maker_volume += vol;
         e.base = 0; e.quote = 0; e.fund = 0;
     }
-    let pm = u.pos.iter().position(|p| p.market == mk);
+    // Auto mode can lock margin below, so the maker gets its slot first and the slot is pinned whenever margin ends up locked.
+    // (A maker that turned auto mode on with nothing funded had no slot: the settle locked its margin anyway, unmirrored and
+    // unpinned, so a withdrawal no longer had to settle its fills first. Found by the fuzzer.)
+    let pm = if e.target > 0 || e.margin > 0 { Some(pos_idx(u, &mk, m.funding_index)?) } else { u.pos.iter().position(|p| p.market == mk) };
     let (eq, _, mm) = health(pid, u, &a[1..], nw, false)?;
     if eq < mm { u.cash = i64c(u.cash as i128 + e.margin as i128)?; if let Some(pi) = pm { lock_mirror(u, pi, -(e.margin as i128))?; } e.margin = 0; }
     else if e.target > 0 {
@@ -2664,6 +2667,7 @@ fn slab_settle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     // (a maker between maintenance and initial margin quotes nothing new). Stale price: no refill.
     let free = match health(pid, u, &a[1..], nw, true) { Ok((eq, im, _)) => (e.margin as i128 + eq - im).clamp(0, e.margin.max(0) as i128) as i64, Err(_) => 0 };
     e.budget = maker_budget(m, free);
+    if e.margin > 0 { if let Some(pi) = pm { u.pos[pi].flags |= POS_PIN; } }
     if key(&a[2]) == m.fast_book[0] || key(&a[2]) == m.fast_book[1] { sync_mirror(u, m, &mk, e.margin); }
     f.ext[mi] = maker_ext(u, &mk);
     gc_pos(u);
