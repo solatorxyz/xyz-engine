@@ -603,6 +603,12 @@ fn adm_d(tag: u8, op: u8, v: u64, k: Option<&Address>) -> Vec<u8> {
     // emergency stop: any one member pauses ...
     e.send("emergency pause (1 member)", vec![k(1), w(&m), r(&ms)], adm_d(22, 1, 1, None), &[&ks[1]], true);
     assert_eq!(e.market_state().paused, 1);
+    // ... but never downgrades a stronger pause: with the oracle breaker tripped (2), a lone member's "pause" used to write 1
+    // over it, after which a single source could re-price a market whose two sources had diverged
+    { let mut raw = e.svm.get_account(&m).unwrap(); raw.data[352..360].copy_from_slice(&2u64.to_le_bytes()); e.svm.set_account(m, raw).unwrap(); }
+    e.send("pause over a tripped breaker (1 member)", vec![k(1), w(&m), r(&ms)], adm_d(22, 1, 1, None), &[&ks[1]], true);
+    assert_eq!(e.market_state().paused, 2);
+    { let mut raw = e.svm.get_account(&m).unwrap(); raw.data[352..360].copy_from_slice(&1u64.to_le_bytes()); e.svm.set_account(m, raw).unwrap(); }
     // ... but can't resume alone, and can't set any other pause value
     assert_eq!(try_send(&mut e, vec![k(1), w(&m), r(&ms)], adm_d(22, 1, 0, None), &[&ks[1]]), Some(BAD_ACCOUNT));
     assert_eq!(try_send(&mut e, vec![k(1), w(&m), r(&ms)], adm_d(22, 1, 2, None), &[&ks[1]]), Some(BAD_ACCOUNT));

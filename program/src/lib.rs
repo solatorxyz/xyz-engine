@@ -658,12 +658,18 @@ fn claim(u: &mut User, uk: &Key, s: &mut Shard) -> ProgramResult {
             let before = long(p.base);
             let ob = p.base; p.base += l.base;
             let closed = ob != 0 && p.base == 0;
-            if p.flags & POS_ISO != 0 { p.iso_margin = i64c(p.iso_margin as i128 + l.quote as i128)?; } else { u.cash = i64c(u.cash as i128 + l.quote as i128)?; }
+            // Funding. The next settle charges every lot of the position from the position's own snapshot, as if the claimed
+            // lots had been held since then. They were held since their fills: what the settle will over- or under-charge,
+            // lots x (index at fill - snapshot), is handed back here. Without it an idle account's resting order collected
+            // (or paid) funding for a period before it was filled -- money that no one on the other side paid.
+            let fadj = if l.fund == 0 && p.funding_snap == 0 { 0 } else { l.fund as i128 - l.base as i128 * p.funding_snap as i128 };
+            let got = l.quote as i128 + fadj;
+            if p.flags & POS_ISO != 0 { p.iso_margin = i64c(p.iso_margin as i128 + got)?; } else { u.cash = i64c(u.cash as i128 + got)?; }
             p.cost = cost_after(ob, p.base, p.cost, -(l.quote as i128))?;
             if s.side == SIDE_BID { p.bid_open -= l.open_reduce } else { p.ask_open -= l.open_reduce }
             p.n_orders -= l.n_closed;
             s.oi_long_delta += long(p.base) - before;
-            u.maker_volume += l.maker_vol;
+            u.maker_volume += l.base.unsigned_abs();
             s.nled -= 1; s.ledger[i] = s.ledger[s.nled as usize];
             if closed { let mk = s.market; for t in u.triggers.iter_mut() { if t.kind != 0 && t.kind & 0xff != TRIGGER_KIND_TWAP && t.market == mk { t.kind = 0; } } }
             return Ok(()); // at most one entry per owner per shard
@@ -672,11 +678,18 @@ fn claim(u: &mut User, uk: &Key, s: &mut Shard) -> ProgramResult {
     }
     Ok(())
 }
+/// acc + lots x index, for Ledger.fund / FastMaker.fund. Native multiply where it cannot wrap (lots < 2^32, |index| < 2^31).
+#[inline(always)]
+fn fund_acc(acc: i64, lots: i64, idx: i64) -> Result<i64, ProgramError> {
+    if idx == 0 { return Ok(acc); }
+    if idx.unsigned_abs() < (1 << 31) && lots.unsigned_abs() < (1 << 32) { acc.checked_add(lots.wrapping_mul(idx)).ok_or(err(E::Math)) }
+    else { i64c(acc as i128 + lots as i128 * idx as i128) }
+}
 fn ledger_entry<'s>(s: &'s mut Shard, owner: &Key) -> Option<&'s mut Ledger> {
     let n = s.nled as usize;
     match s.ledger[..n].iter().position(|l| l.owner == *owner) {
         Some(i) => Some(&mut s.ledger[i]),
-        None if n < MAX_LEDGER => { s.ledger[n] = Ledger { owner: *owner, base: 0, quote: 0, open_reduce: 0, maker_vol: 0, n_closed: 0 }; s.nled += 1; Some(&mut s.ledger[n]) }
+        None if n < MAX_LEDGER => { s.ledger[n] = Ledger { owner: *owner, base: 0, quote: 0, open_reduce: 0, fund: 0, n_closed: 0 }; s.nled += 1; Some(&mut s.ledger[n]) }
         None => None,
     }
 }
@@ -955,7 +968,9 @@ fn take(pid: &Address, a: &[AccountView], mk: &Key, m: &Market, u: &mut User, uk
                 Some(l) => {
                     if taker_bid { l.base -= q as i64; l.quote = i64c(l.quote as i128 + notional + rebate)?; }
                     else { l.base += q as i64; l.quote = i64c(l.quote as i128 - notional + rebate)?; }
-                    l.open_reduce += q; l.maker_vol += q;
+                    // these lots carry funding from this index on, however long they wait for the claim (see claim)
+                    l.fund = fund_acc(l.fund, if taker_bid { -(q as i64) } else { q as i64 }, m.funding_index)?;
+                    l.open_reduce += q;
                     consume(&mut o, q);
                     if o.qty == 0 { l.n_closed += 1; }
                     s.fee_accum = i64c(s.fee_accum as i128 + fee - rebate)?;
@@ -1403,7 +1418,7 @@ fn admin(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let v = rd64(d, 2)?;
     // Emergency stop: any ONE member of the market's multisig can pause (no new risk or deposits; cancels, reduce-only,
     // withdrawals and liquidations keep working). Un-pausing and everything else needs the full m of n.
-    if d[1] as u64 == ADMIN_PAUSE && v == 1 && any_member(pid, &m.admin, a) { m.paused = 1; return Ok(()); }
+    if d[1] as u64 == ADMIN_PAUSE && v == 1 && any_member(pid, &m.admin, a) { if m.paused == 0 { m.paused = 1; } return Ok(()); } // never downgrades a tripped breaker
     if !auth(pid, &m.admin, a) { return Err(err(E::BadAccount)); }
     // immediate: pause and new-risk caps (cannot move funds). Everything else goes through the timelock.
     // AUDIT V5-4: on a pooled market the OI cap can only be lowered (never above the value admitted under the pool cap)
@@ -2373,7 +2388,7 @@ fn fast_join(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if f.makers[..n].iter().any(|x| x.slab == sk) { return Ok(()); } // re-join only registers the block (migration)
     if n >= FAST_MAKERS { return Err(err(E::Cap)); }
     if f.makers[..n].iter().any(|x| x.user == s.user) { return Err(err(E::BadAccount)); } // one slab per maker account
-    f.makers[n] = FastMaker { slab: sk, user: s.user, margin: 0, budget: 0, base: 0, quote: 0, volume: 0, target: 0 };
+    f.makers[n] = FastMaker { slab: sk, user: s.user, margin: 0, budget: 0, base: 0, quote: 0, fund: 0, target: 0 };
     f.n += 1;
     Ok(())
 }
@@ -2571,12 +2586,13 @@ fn slab_fund(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
     let n = f.n as usize;
     let mi = f.makers[..n].iter().position(|x| x.user == uk).ok_or(err(E::BadAccount))?;
-    f.ext[mi] = maker_ext(u, &mk);
+    let vol = f.ext[mi].rebate_bps & !0xffff; // lots filled since the last settle stay counted
+    f.ext[mi] = maker_ext(u, &mk); f.ext[mi].rebate_bps |= vol;
     // the maker always has a position slot here while quoting, so settles never run out of slots (pinned until released)
     let pi = pos_idx(u, &mk, m.funding_index)?;
     if u.pos[pi].flags & POS_ISO != 0 { return Err(err(E::Isolated)); } // makers are cross only
     let e = &mut f.makers[mi];
-    let unsettled = e.base != 0 || e.quote != 0;
+    let unsettled = e.base != 0 || e.quote != 0 || e.fund != 0;
     if amt < 0 && unsettled { return Err(err(E::Ledger)); } // settle first
     if let Some(t) = tgt { e.target = t; }
     let om = e.margin;
@@ -2586,7 +2602,12 @@ fn slab_fund(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     u.cash = i64c(u.cash as i128 - amt as i128)?; e.margin = nm;
     lock_mirror(u, pi, amt as i128)?;
     // only a settle refills the budget: with fills still unsettled, new margin adds its own budget and nothing more
-    e.budget = if unsettled { e.budget.saturating_add(maker_budget(m, nm) - maker_budget(m, om)) } else { maker_budget(m, nm) };
+    // Settled: the budget is what a settle would give -- margin that initial margin leaves free, not the whole margin (a fund of
+    // zero used to hand a maker under its initial requirement a full budget again). Stale price: never more than it had.
+    e.budget = if unsettled { e.budget.saturating_add(maker_budget(m, nm) - maker_budget(m, om)) } else {
+        match health(pid, u, &a[2..], nw, true) {
+            Ok((eq, im, _)) => maker_budget(m, (nm as i128 + eq - im).clamp(0, nm as i128) as i64),
+            Err(_) => e.budget.min(maker_budget(m, nm)) } };
     // set once a maker funds here and kept (another book of the market may still hold its fills): a maker account keeps the slot
     if nm > 0 || unsettled { u.pos[pi].flags |= POS_PIN; }
     if key(&a[3]) == m.fast_book[0] || key(&a[3]) == m.fast_book[1] { sync_mirror(u, m, &mk, nm); }
@@ -2609,16 +2630,21 @@ fn slab_settle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     let mi = f.makers[..n].iter().position(|x| x.user == uk).ok_or(err(E::BadAccount))?;
     let e = &mut f.makers[mi];
     settle_funding_all(pid, u, &a[1..])?;
-    if e.base != 0 || e.quote != 0 {
+    let vol = f.ext[mi].rebate_bps >> 16;
+    if e.base != 0 || e.quote != 0 || e.fund != 0 || vol != 0 {
         let pi = pos_idx(u, &mk, m.funding_index)?;
         if u.pos[pi].flags & POS_ISO != 0 { return Err(err(E::Isolated)); }
         let (ob, before) = (u.pos[pi].base, long(u.pos[pi].base));
         u.pos[pi].base = ob.checked_add(e.base).ok_or(err(E::Math))?;
-        credit(u, pi, e.quote as i128)?;
+        // funding on the unsettled lots, each from the index it was filled at up to now (the position itself was just settled
+        // to the current index): lots x index now - sum(lots x index at fill). The taker side of these fills has been paying
+        // or receiving it all along; without this the maker side did neither.
+        let fpay = if e.fund == 0 && m.funding_index == 0 { 0 } else { e.base as i128 * m.funding_index as i128 - e.fund as i128 };
+        credit(u, pi, e.quote as i128 - fpay)?;
         u.pos[pi].cost = cost_after(ob, u.pos[pi].base, u.pos[pi].cost, -(e.quote as i128))?;
         f.oi_long_delta += long(u.pos[pi].base) - before;
-        u.maker_volume += e.volume;
-        e.base = 0; e.quote = 0; e.volume = 0;
+        u.maker_volume += vol;
+        e.base = 0; e.quote = 0; e.fund = 0;
     }
     let pm = u.pos.iter().position(|p| p.market == mk);
     let (eq, _, mm) = health(pid, u, &a[1..], nw, false)?;
@@ -2853,7 +2879,7 @@ fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base
         let fq = ba.min(left);
         let (sp, mi) = sl[bk];
         let q = unsafe { &(*sp).quotes[base_ix + bl] };
-        let nt = fill_maker(f, mi, q, opp << 3 | bl, bid, bp, fq, f.ext[mi].rebate_bps.min(taker_bps))?;
+        let nt = fill_maker(f, mi, q, opp << 3 | bl, bid, bp, fq, (f.ext[mi].rebate_bps & 0xffff).min(taker_bps), m.funding_index)?;
         let fee = bps_up(nt as i128, taker_bps) as u64;
         fees += fee;
         acc.add(u, pi, bid, fq, nt, fee)?;
@@ -2978,7 +3004,7 @@ fn best_quote(f: &FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: us
 /// Book `fq` lots at `p` against maker `mi` (quote level `ul` in its used table), paying the maker `rb` bps of the notional out
 /// of the book's fees (rb never above the taker fee). Returns the notional.
 #[inline(always)]
-fn fill_maker(f: &mut FastBook, mi: usize, q: &Quote, ul: usize, bid: bool, p: u64, fq: u64, rb: u64) -> Result<u64, ProgramError> {
+fn fill_maker(f: &mut FastBook, mi: usize, q: &Quote, ul: usize, bid: bool, p: u64, fq: u64, rb: u64, fidx: i64) -> Result<u64, ProgramError> {
     let nt = p.wrapping_mul(fq); // px < 2^32, qty < 2^32: cannot wrap (a checked multiply is a software routine)
     let r = if rb != 0 { bps_dn(nt as i128, rb) } else { 0 };
     if r != 0 { f.fee_accum = i64c(f.fee_accum as i128 - r)?; }
@@ -2987,7 +3013,8 @@ fn fill_maker(f: &mut FastBook, mi: usize, q: &Quote, ul: usize, bid: bool, p: u
     // the sign is a branch: a checked i64 / i128 multiply by +-1 is a software routine
     e.base = if bid { e.base.checked_sub(fq as i64) } else { e.base.checked_add(fq as i64) }.ok_or(err(E::Math))?;
     e.quote = i64c(e.quote as i128 + if bid { nt as i128 } else { -(nt as i128) } + r)?;
-    e.volume += fq;
+    e.fund = fund_acc(e.fund, if bid { -(fq as i64) } else { fq as i64 }, fidx)?; // funding runs from this index (slab_settle)
+    f.ext[mi].rebate_bps = f.ext[mi].rebate_bps.wrapping_add(fq << 16);
     let us = &mut f.used[mi][ul];
     if us.gen == q.gen { us.qty += fq as u32; } else { us.gen = q.gen; us.qty = fq as u32; }
     Ok(nt)
@@ -3057,9 +3084,11 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
         Ok((tf.filled, tf.notional))
     };
     let mut ev = FastEv::new(&tk, bid);
+    // same rule as a take: maker quotes fill only while the price they are judged against is recent (resting orders still do)
+    let aged = !(f.fast_px != 0 && slot <= f.fast_slot + spec::FAST_PX_MAX_SLOTS) && slot > m.oracle_slot + spec::FAST_GUARD_MAX_AGE_SLOTS;
     let mut levels = 0u32;
     while left > 0 && levels < spec::LIQ_FAST_MAX_LEVELS {
-        let best = best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi, book_px(f, m, slot));
+        let best = if aged { None } else { best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi, book_px(f, m, slot)) };
         if hybrid {
             let lim = match best { Some((_, _, bp, _)) => if bid { hi.min(bp) } else { lo.max(bp) }, None => if bid { hi } else { lo } };
             let (sf, sn) = shard_take(t, lim, left, &mut sbest)?;
@@ -3071,7 +3100,7 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
         let (sp, mi) = sl[bk];
         let q = unsafe { &(*sp).quotes[base_ix + bl] };
         let fq = ba.min(left);
-        let nt = fill_maker(f, mi, q, opp << 3 | bl, bid, bp, fq, 0)?;
+        let nt = fill_maker(f, mi, q, opp << 3 | bl, bid, bp, fq, 0, m.funding_index)?;
         let sg: i128 = if bid { 1 } else { -1 };
         credit(t, pi, -sg * nt as i128)?;
         let ob = t.pos[pi].base; t.pos[pi].base = ob.checked_add(sg as i64 * fq as i64).ok_or(err(E::Math))?;
@@ -3465,7 +3494,7 @@ mod kani_proofs {
             let before = f.used[0][l].qty as u64;
             // what the matcher guarantees: fq <= quote qty - used and fq <= budget / p
             kani::assume(before + fq < (1 << 32) && p * fq <= f.makers[0].budget as u64);
-            let nt = fill_maker(&mut f, 0, &q, l, bid, p, fq, 0).unwrap();
+            let nt = fill_maker(&mut f, 0, &q, l, bid, p, fq, 0, 0).unwrap();
             assert_eq!(nt, p * fq);
             if f.used[0][l].gen == 7 { assert!(f.used[0][l].qty as u64 == before + fq || before == 0); }
             acc.add(&mut u, 0, bid, fq, nt, 0).unwrap();
@@ -3475,7 +3504,7 @@ mod kani_proofs {
         assert_eq!(u.pos[0].base + f.makers[0].base, 0);
         assert_eq!(u.cash as i128 + f.makers[0].quote as i128, 0);
         assert_eq!(f.makers[0].budget as i128, (i64::MAX >> 2) as i128 - nts as i128);
-        assert_eq!(f.makers[0].volume, lots);
+        assert_eq!(f.ext[0].rebate_bps >> 16, lots);
     }
     /// Withdrawal lane: a position never contributes more than its mark value or its cost, so positive unrealized PnL is never
     /// credited, while a loss counts in full (percolator v16 Eq_no_positive_credit).

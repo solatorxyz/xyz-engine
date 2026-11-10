@@ -167,6 +167,41 @@ fn setup(e: &mut Env) -> (Address, Mk) { e.oracle_update("", 1000_00000000, None
     assert_eq!(e.shard_state(&a0).n, 0);
     let t = e.user_state(&tu); assert_eq!((t.pos[0].base, t.pos[0].cost), (60, 100_010 * 60));
 }
+/// Found by the fuzzer (seed funding-fast-10): a maker's unsettled fills paid and received no funding until the settle, while
+/// the taker on the other side did. The settle now charges each lot from the index it was filled at.
+#[test] fn unsettled_maker_fills_carry_funding_from_the_fill() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e); let (tp, tu) = e.user(10_000_000_000);
+    for _ in 0..3 { e.set_time(e.slot + 27_000); e.oracle_update("", 1000_00000000, None); }
+    let i1 = e.market_state().funding_index; assert_ne!(i1, 0);
+    quote(&mut e, &k, &[(ASK, 100_010, 500)], true);
+    let (c0, t0) = (e.user_state(&k.u).cash, e.user_state(&tu).cash);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 500, true);
+    let fee = t0 - e.user_state(&tu).cash - 500 * 100_010;
+    for _ in 0..2 { e.set_time(e.slot + 27_000); e.oracle_update("", 1000_00000000, None); }
+    let i2 = e.market_state().funding_index; assert_ne!(i2, i1);
+    settle(&mut e, &f, &k);
+    let m = e.market; let mut d = vec![1u8]; d.extend_from_slice(&place_item(1, 4, 200_000, 1, 0, 0)); // any instruction settles the taker
+    let b0 = e.shard(0, 200_000); e.send("", trade_accts(&tp, &tu, &m, &[b0]), d, &[&tp], true);
+    let dm = e.user_state(&k.u).cash - c0 - 500 * 100_010;
+    let dt = e.user_state(&tu).cash - t0 + 500 * 100_010 + fee;
+    assert_eq!(dm, 500 * (i2 - i1), "the short maker receives funding for the time since its fill");
+    assert_eq!(dm + dt, 0, "and it is exactly what the taker paid");
+}
+/// Found by the fuzzer (seed fund-refill-00): slab_fund(0) on a settled entry reset the budget to the whole margin, skipping
+/// the initial-margin limit a settle applies.
+#[test] fn fund_zero_does_not_refill_a_budget_the_settle_withheld() {
+    let mut e = Env::new(); e.oracle_update("", 1000_00000000, None); let f = fast_new(&mut e, 0);
+    let k = maker(&mut e, &f, 1_200_000_000, 1_000_000_000);
+    let (tp, tu) = e.user(100_000_000_000);
+    fund_t(&mut e, &f, &k, 0, 0, true); // manual margin: a settle moves none of it
+    quote(&mut e, &k, &[(ASK, 100_010, 30_000)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 30_000, true); // 3,000M notional: 300M initial margin against 200M outside the book
+    settle(&mut e, &f, &k);
+    let (b, mg) = (fb(&e, &f).makers[0].budget, fb(&e, &f).makers[0].margin);
+    assert!(mg > 0 && b > 0 && b < mg * 10, "the settle left only the free part: budget {b}, margin {mg}");
+    fund_m(&mut e, &f, &k, 0, true);
+    assert_eq!(fb(&e, &f).makers[0].budget, b, "a fund of zero changes nothing");
+}
 #[test] fn time_priority_breaks_price_ties() {
     let mut e = Env::new(); let (f, k) = setup(&mut e); let k2 = maker(&mut e, &f, 10_000_000_000, 1_000_000_000);
     let (tp, tu) = e.user(10_000_000_000);

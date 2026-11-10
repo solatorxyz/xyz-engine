@@ -73,7 +73,10 @@ pub struct Order { pub id: u64, pub owner: Key, pub price: u64, pub qty: u64, pu
 /// Maker fills owed to a user account; claimed lazily when the maker touches the shard.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Ledger { pub owner: Key, pub base: i64, pub quote: i64, pub open_reduce: u64, pub maker_vol: u64, pub n_closed: u64 }
+/// `fund` = sum over the unclaimed fills of (signed lots x the market's funding index at the fill). The lots wait here until the
+/// owner's next claim; the claim uses it so they pay or receive funding from their fill on, not from whenever the owner's
+/// position was last settled. (Maker volume is |base|: a shard is one side, so every fill has the same sign.)
+pub struct Ledger { pub owner: Key, pub base: i64, pub quote: i64, pub open_reduce: u64, pub fund: i64, pub n_closed: u64 }
 
 #[repr(C)]
 pub struct Shard {
@@ -195,12 +198,14 @@ pub struct Used { pub gen: u32, pub qty: u32 }
 #[repr(C)]
 #[derive(Clone, Copy)]
 /// target > 0: auto mode, settle moves margin toward target from free collateral and hands it back when the account needs it.
-pub struct FastMaker { pub slab: Key, pub user: Key, pub margin: i64, pub budget: i64, pub base: i64, pub quote: i64, pub volume: u64, pub target: i64 }
+/// `fund` = sum over the unsettled fills of (signed lots x the funding index at the fill), used by the settle the same way as
+/// Ledger.fund. The maker's unsettled volume (lots) lives in the high 48 bits of its MakerExt.rebate_bps.
+pub struct FastMaker { pub slab: Key, pub user: Key, pub margin: i64, pub budget: i64, pub base: i64, pub quote: i64, pub fund: i64, pub target: i64 }
 /// Copied from the maker's User at every settle / fund: its position in this market (inventory = inv0 + unsettled base) and
 /// its maker rebate in bps.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct MakerExt { pub inv0: i64, pub rebate_bps: u64 }
+pub struct MakerExt { pub inv0: i64, /** low 16 bits: rebate in bps; high 48: lots filled since the last settle */ pub rebate_bps: u64 }
 /// Per-market fill state: takers write here, so quotes and fills never contend on a write lock.
 #[repr(C)]
 pub struct FastBook { pub disc: u64, pub market: Key, pub idx: u64, pub n: u64, pub oi_long_delta: i64, pub fee_accum: i64, pub fills: u64,

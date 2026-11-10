@@ -218,3 +218,26 @@ fn long10(e: &mut Env, dep: u64) -> (Keypair, Address, Keypair, Address, Address
     for _ in 0..2 { e.set_time(e.slot + 2); e.oracle_update("", PX, None); assert_eq!(exec(&mut e, &kp, &ku, &vu, 1, &[b0]), None); }
     let s = e.user_state(&vu); assert_eq!(s.triggers[1].kind, 0); assert_eq!(s.pos[0].base, -32);
 }
+
+// Found by the fuzzer (seed funding-resting-10). A resting order filled long after it was placed was charged funding from the
+// account's last settle, not from the fill: an idle account's ask collected funding for a period in which it was not short,
+// paid by no one. Two accounts of one owner could print it for ~10 bps of fees.
+#[test] fn a_resting_order_earns_funding_only_from_its_fill() {
+    let mut e = Env::new(); e.oracle_update("", PX, None);
+    let a0 = e.shard(1, 100_000); let (mm, mmu) = e.user(10_000_000_000); let (t, tu) = e.user(10_000_000_000);
+    assert_eq!(place(&mut e, &mm, &mmu, &[a0], 1, POST, 100_050, 20), None);
+    for _ in 0..3 { e.set_time(e.slot + 27_000); e.oracle_update("", PX, None); }
+    let i1 = e.market_state().funding_index; assert_ne!(i1, 0, "the index moved while the order rested");
+    let (c0, t0) = (e.user_state(&mmu).cash, e.user_state(&tu).cash);
+    assert_eq!(place(&mut e, &t, &tu, &[a0], 0, IOC, 100_050, 20), None);
+    assert_eq!(batch(&mut e, &mm, &mmu, &[a0], &[], &[]), None); // the maker claims
+    let fee = t0 - e.user_state(&tu).cash - 20 * 100_050;
+    assert_eq!(e.user_state(&mmu).cash - c0, 20 * 100_050, "the sale and nothing else: it was not short before the fill");
+    // from the fill on, the short side receives exactly what the long side pays
+    for _ in 0..2 { e.set_time(e.slot + 27_000); e.oracle_update("", PX, None); }
+    let i2 = e.market_state().funding_index; assert_ne!(i2, i1);
+    assert_eq!(batch(&mut e, &mm, &mmu, &[a0], &[], &[]), None);
+    assert_eq!(batch(&mut e, &t, &tu, &[a0], &[], &[]), None);
+    let (dm, dt) = (e.user_state(&mmu).cash - c0 - 20 * 100_050, e.user_state(&tu).cash - t0 + 20 * 100_050 + fee);
+    assert_eq!(dm, 20 * (i2 - i1)); assert_eq!(dm + dt, 0, "funding nets to zero");
+}
