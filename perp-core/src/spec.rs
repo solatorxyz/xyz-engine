@@ -23,6 +23,9 @@ pub const FLAG_FOK: u64 = 8;
 pub const FLAG_ALO_SLIDE: u64 = 16;
 pub const FLAG_STP_SHIFT: u64 = 5;
 pub const FLAG_STP_MASK: u64 = 96;
+/// Replace: the place lands only if the cancel item at the same index removed a live order (a quote that was
+/// filled or expired in the meantime is not re-posted).
+pub const FLAG_IF_CANCELLED: u64 = 128;
 pub const SIDE_BID: u64 = 0;
 pub const SIDE_ASK: u64 = 1;
 pub const IX_PLACE: u64 = 1;
@@ -90,8 +93,12 @@ pub const EVENTS_LIQ_NOFILL: u64 = 5;
 pub const EVENTS_FAST_FILL: u64 = 6;
 pub const EVENTS_FAST_BATCH: u64 = 7;
 pub const CANCEL_BY_CID_BIT: u64 = 128;
+/// Cancel item side byte: every resting order of the account in the passed shards of this market, both sides (id ignored).
+pub const CANCEL_ALL_BIT: u64 = 64;
 pub const MAX_SPLINE_LEVELS: u64 = 16;
 pub const MAX_KEEPER_TIP: u64 = 1000000;
+/// A TP/SL with no limit price trades as a market order bounded at the mark -/+ this (bps).
+pub const TRIGGER_MARKET_SLIP_BPS: u64 = 1000;
 pub const MAX_OPEN_ORDERS_PER_MARKET: u64 = 16;
 pub const MIN_ORDER_NOTIONAL: u64 = 1000;
 pub const MAX_PX: u64 = 4611686018427387904;

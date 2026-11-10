@@ -602,7 +602,21 @@ fn pos_idx(u: &mut User, mk: &Key, funding_index: i64) -> Result<usize, ProgramE
 }
 /// Free flat, idle positions and keep the used ones packed at the front in their order, so every loop over
 /// positions stops at the first empty slot. Runs last in each instruction (indices held earlier are stale after it).
+#[cold] #[inline(never)]
+fn trig_sync(u: &mut User) {
+    for i in 0..MAX_TRIGGERS {
+        let t = &u.triggers[i];
+        if t.kind == 0 || t.kind & 0xff == TRIGGER_KIND_TWAP { continue; }
+        let mk = t.market;
+        let open = u.pos.iter().any(|p| p.market == mk && p.base != 0);
+        let t = &mut u.triggers[i];
+        if open { t.next_slot = 1; } else if t.next_slot != 0 { t.kind = 0; }
+    }
+}
 fn gc_pos(u: &mut User) {
+    // a TP/SL dies with the position it protected: once it has seen one (next_slot = 1) and the account is flat in that market,
+    // it is cleared, so it can't fire on the next, unrelated position. One set ahead of an entry order waits for the position.
+    if u.triggers[0].kind | u.triggers[1].kind | u.triggers[2].kind | u.triggers[3].kind != 0 { trig_sync(u); }
     let mut j = 0;
     for i in 0..MAX_POS {
         let p = &mut u.pos[i];
@@ -643,6 +657,7 @@ fn claim(u: &mut User, uk: &Key, s: &mut Shard) -> ProgramResult {
             let p = &mut u.pos[pi];
             let before = long(p.base);
             let ob = p.base; p.base += l.base;
+            let closed = ob != 0 && p.base == 0;
             if p.flags & POS_ISO != 0 { p.iso_margin = i64c(p.iso_margin as i128 + l.quote as i128)?; } else { u.cash = i64c(u.cash as i128 + l.quote as i128)?; }
             p.cost = cost_after(ob, p.base, p.cost, -(l.quote as i128))?;
             if s.side == SIDE_BID { p.bid_open -= l.open_reduce } else { p.ask_open -= l.open_reduce }
@@ -650,6 +665,7 @@ fn claim(u: &mut User, uk: &Key, s: &mut Shard) -> ProgramResult {
             s.oi_long_delta += long(p.base) - before;
             u.maker_volume += l.maker_vol;
             s.nled -= 1; s.ledger[i] = s.ledger[s.nled as usize];
+            if closed { let mk = s.market; for t in u.triggers.iter_mut() { if t.kind != 0 && t.kind & 0xff != TRIGGER_KIND_TWAP && t.market == mk { t.kind = 0; } } }
             return Ok(()); // at most one entry per owner per shard
         }
         i += 1;
@@ -982,6 +998,31 @@ fn below_min_notional(price: u64, qty: u64) -> bool {
     if price < (1 << 32) && qty < (1 << 32) { price.wrapping_mul(qty) < MIN_ORDER_NOTIONAL } else { (price as u128) * (qty as u128) < MIN_ORDER_NOTIONAL as u128 }
 }
 /// FOK pre-check (AUDIT M-3): can `need` be filled at `limit` from other owners' live liquidity in the passed shards?
+/// Best price on `side` among the passed shards counting only orders that can still trade (not expired, inside their own band).
+fn best_live(a: &[AccountView], pid: &Address, mk: &Key, side: u64, oracle: u64, slot: u64) -> Option<u64> {
+    let bid = side == SIDE_BID;
+    let (mut b, mut any) = (0u64, false);
+    for x in a {
+        if disc_of(x) != DISC_SHARD || !x.owned_by(pid) { continue; }
+        let s: &Shard = unsafe { &*(x.borrow_unchecked().as_ptr() as *const Shard) };
+        if s.market != *mk || s.side != side || s.n == 0 { continue; }
+        let sorted = s.seq & SPECIAL_BIT == 0;
+        let o0 = &s.orders[0];
+        // the usual case: a pure-limit shard whose top order has no expiry and no band -- its price, nothing else to look at
+        let p = if sorted && o0.expiry_slot | o0.band_bps == 0 { o0.price } else {
+            let mut f: Option<u64> = None;
+            for o in &s.orders[..(s.n as usize).min(MAX_ORDERS)] {
+                let p = if sorted { o.price } else { eff(o, bid, oracle) };
+                if (o.expiry_slot != 0 && slot > o.expiry_slot) || (o.band_bps != 0 && off_band(p, oracle, o.band_bps)) { continue; }
+                if f.is_none_or(|bp| if bid { p > bp } else { p < bp }) { f = Some(p); }
+                if sorted { break; } // best-first: the first live order is the shard's best
+            }
+            match f { Some(p) => p, None => continue }
+        };
+        if !any || (bid && p > b) || (!bid && p < b) { b = p; any = true; }
+    }
+    if any { Some(b) } else { None }
+}
 fn fok_avail(a: &[AccountView], pid: &Address, mk: &Key, opp: u64, oracle: u64, limit: u64, slot: u64, uk: &Key, need: u64) -> bool {
     let bid_side = opp == SIDE_BID;
     let ok_px = |p: u64| if bid_side { p >= limit } else { p <= limit };
@@ -1039,6 +1080,7 @@ fn insert(a: &[AccountView], pid: &Address, mk: &Key, uk: &Key, bid: bool, mut o
 }
 /// side & CANCEL_BY_CID_BIT: `id` is a client order id, searched across all passed shards of that side.
 fn cancel(a: &[AccountView], pid: &Address, mk: &Key, uk: &Key, u: &mut User, pi: usize, id: u64, side: u8, price: u64) -> ProgramResult {
+    if side as u64 & spec::CANCEL_ALL_BIT != 0 { cancel_all_of(a, pid, mk, uk, u, pi); return Ok(()); }
     let by_cid = side as u64 & CANCEL_BY_CID_BIT != 0;
     let side = (side as u64) & 1;
     for x in a {
@@ -1105,15 +1147,32 @@ fn batch(pid: &Address, a: &mut [AccountView], d: &[u8], single: bool) -> Progra
     // so an order alone can't make the account bankrupt when it fills (initial margin is only charged at the mark)
     let mut adverse: i128 = 0; let mpx = mark(m);
     // 1) cancels first (cancel priority within the instruction)
-    for _ in 0..nc {
-        cancel(rest, pid, &mk, &uk, u, pi, rd64(d, o)?, d[o + 8], rd64(d, o + 9)?)?;
-        o += CANCEL_ITEM_SIZE as usize;
+    // FLAG_IF_CANCELLED on any place: note which of the first 64 cancel items removed a live order, read off the account's own
+    // order count. A batch that doesn't use the flag pays one pass over its flag bytes and nothing per cancel.
+    let pb = o + nc * CANCEL_ITEM_SIZE as usize + PLACE_ITEM_FLAGS_OFF as usize;
+    let mut fls = 0u8;
+    if nc != 0 { for j in 0..np { fls |= unsafe { *d.get_unchecked(pb + j * PLACE_ITEM_SIZE as usize) }; } } // in bounds: the length was checked above
+    let mut hit = 0u64;
+    if fls as u64 & spec::FLAG_IF_CANCELLED == 0 {
+        for _ in 0..nc {
+            cancel(rest, pid, &mk, &uk, u, pi, rd64(d, o)?, d[o + 8], rd64(d, o + 9)?)?;
+            o += CANCEL_ITEM_SIZE as usize;
+        }
+    } else {
+        let (mut bit, mut nprev) = (1u64, u.pos[pi].n_orders);
+        for _ in 0..nc {
+            cancel(rest, pid, &mk, &uk, u, pi, rd64(d, o)?, d[o + 8], rd64(d, o + 9)?)?;
+            let n = u.pos[pi].n_orders;
+            if n != nprev { hit |= bit; nprev = n; }
+            bit = bit.wrapping_shl(1);
+            o += CANCEL_ITEM_SIZE as usize;
+        }
     }
     let is_stale = stale(m, nw);
-    let mut risk_up = false;
+    let mut risk_up = false; let mut reduced = false;
     let tier = (u.tier as usize).min(TIERS.len() - 1);
     let (taker_bps, maker_rebate) = TIERS[tier];
-    for _ in 0..np {
+    for ip in 0..np {
         let it = &d[o..o + PLACE_ITEM_SIZE as usize];
         o += PLACE_ITEM_SIZE as usize;
         let bid = it[0] as u64 == SIDE_BID; let fl = it[PLACE_ITEM_FLAGS_OFF as usize] as u64; let k = it[PLACE_ITEM_KIND_OFF as usize] as u64;
@@ -1131,6 +1190,8 @@ fn batch(pid: &Address, a: &mut [AccountView], d: &[u8], single: bool) -> Progra
         let mut post = fl & FLAG_POST_ONLY != 0;
         if k > KIND_SPLINE || qty == 0 || (k != KIND_PEG && (price == 0 || !price.is_multiple_of(TICK))) { return Err(err(E::BadData)); }
         if k != KIND_LIMIT { if reduce || ioc { return Err(err(E::BadData)); } post = true; }
+        // replace: only where the paired cancel pulled a live order (one that filled or expired meanwhile is not quoted again)
+        if fl & spec::FLAG_IF_CANCELLED != 0 && (ip >= 64 || hit >> ip & 1 == 0) { continue; }
         if k == KIND_SPLINE {
             if a2 == 0 || a2 > MAX_SPLINE_LEVELS || a1 <= 0 || price > MAX_PX || qty > MAX_PX || a3 > MAX_PX { return Err(err(E::BadData)); }
             // AUDIT H-1: every level price must be representable and >= 1 tick (no overflow at match time)
@@ -1141,20 +1202,27 @@ fn batch(pid: &Address, a: &mut [AccountView], d: &[u8], single: bool) -> Progra
         if k == KIND_LIMIT && price > MAX_PX { return Err(err(E::BadData)); }
         if expiry != 0 && expiry <= slot { continue; } // already expired: skip, don't fail the batch
         if reduce {
+            if post { return Err(err(E::BadData)); } // reduce-only never rests, post-only never takes: nothing could happen
             let b = u.pos[pi].base;
             let cap = if bid && b < 0 { (-b) as u64 } else if !bid && b > 0 { b as u64 } else { 0 };
             qty = qty.min(cap); ioc = true;
             if qty == 0 { continue; }
         } else {
-            if m.paused != 0 { return Err(err(E::Paused)); }
-            if is_stale { return Err(err(E::Stale)); }
+            // in a batch a paused market or a stale oracle skips the place (like the ALO / FOK / full-bucket skips): the
+            // cancels in the same instruction must land exactly then -- a maker pulling quotes can't be held by its own re-quote
+            if m.paused != 0 { if single { return Err(err(E::Paused)); } continue; }
+            if is_stale { if single { return Err(err(E::Stale)); } continue; }
             risk_up = true;
         }
         if k == KIND_PEG { price = peg_price(m.oracle_px, a1, a2, a3); }
         // AUDIT H-3: minimum notional for anything that can rest (anti book-stuffing)
         if !ioc && below_min_notional(price, qty) { return Err(err(E::BadData)); }
-        let bo = best(rest, pid, &mk, if bid { SIDE_ASK } else { SIDE_BID }, m.oracle_px).map(|b| b.2);
-        let crosses = bo.is_some_and(|p| if bid { p <= price } else { p >= price });
+        let opp = if bid { SIDE_ASK } else { SIDE_BID };
+        let mut bo = best(rest, pid, &mk, opp, m.oracle_px).map(|b| b.2);
+        let mut crosses = bo.is_some_and(|p| if bid { p <= price } else { p >= price });
+        // post-only is judged against the best order that could still trade: an expired or off-band order at the top is not a
+        // cross. Looked at only when the top does cross, so a quote that doesn't pays nothing for it.
+        if post && crosses { bo = best_live(rest, pid, &mk, opp, m.oracle_px, slot); crosses = bo.is_some_and(|p| if bid { p <= price } else { p >= price }); }
         if post && crosses {
             if fl & FLAG_ALO_SLIDE == 0 || k == KIND_PEG { continue; } // ALO: skip, don't fail the batch
             let p = bo.unwrap();
@@ -1167,6 +1235,7 @@ fn batch(pid: &Address, a: &mut [AccountView], d: &[u8], single: bool) -> Progra
             (f.filled, f.abort)
         } else { (0, false) };
         if fok && filled < qty { return Err(err(E::FokUnfilled)); }
+        if reduce && filled != 0 { reduced = true; }
         let left = qty - filled;
         if left > 0 && !ioc && !abort {
             let (total, lvl, a2s) = if k == KIND_SPLINE {
@@ -1199,6 +1268,11 @@ fn batch(pid: &Address, a: &mut [AccountView], d: &[u8], single: bool) -> Progra
         let iso = u.pos[pi].flags & POS_ISO != 0;
         if eq - if iso { 0 } else { adverse } < im { return Err(err(E::Margin)); }
         if iso { let (e2, i2, _) = iso_health(pid, u, pi, &a[2..], nw, true)?; if e2 - adverse < i2 { return Err(err(E::Margin)); } }
+    } else if reduced {
+        // reduce-only never leaves bad debt, whatever price it was sent at (same rule as take_fast and TP/SL): without this a
+        // reduce-only sell far under the mark into a chosen bid hands the account's whole equity -- and more -- to that bid
+        let (eq, _, _) = phealth(pid, u, pi, &a[2..], nw, false)?;
+        if eq < 0 { return Err(err(E::Margin)); }
     }
     gc_pos(u);
     Ok(())
@@ -1217,9 +1291,12 @@ fn set_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult 
     // kind byte: low 6 bits = TP/SL/TWAP, bit 6 = FLAG_MARK (>>2 of 256), bit 7 = FLAG_CONFIRM_ORACLE (>>2 of 512)
     let k = (k & 0x3f) | ((k >> 6 & 1) << 8) | ((k >> 7 & 1) << 9);
     if s >= MAX_TRIGGERS || k & 0xff > TRIGGER_KIND_TWAP || side > 1 { return Err(err(E::BadData)); }
+    let twap = k & 0xff == TRIGGER_KIND_TWAP;
+    // TP/SL: next_slot is the "has protected a position" mark (see gc_pos); a TWAP's is its next slice
+    let armed = u.pos.iter().any(|p| p.market == key(&a[2]) && p.base != 0) as u64;
     let t = Trigger { market: key(&a[2]), kind: k, side, trigger_px: v(0)?, limit_px: v(1)?, qty: v(2)?, tip: v(3)?, interval: v(4)?,
-        next_slot: clock()?.slot, slices_left: v(5)? };
-    if k & 0xff == TRIGGER_KIND_TWAP && (t.slices_left == 0 || t.interval == 0) { return Err(err(E::BadData)); }
+        next_slot: if twap { clock()?.slot } else { armed }, slices_left: v(5)? };
+    if twap && (t.slices_left == 0 || t.interval == 0) { return Err(err(E::BadData)); }
     u.triggers[s] = t;
     Ok(())
 }
@@ -1255,15 +1332,21 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
     settle_funding_all(pid, t, &a[3..])?;
     let pi = pos_idx(t, &mk, m.funding_index)?;
     let twap = k8 == TRIGGER_KIND_TWAP;
-    let mut qty = if twap { tr.qty / tr.slices_left } else { tr.qty };
+    // a slice is what is left over the slices left, so a short fill is caught up by the later ones (and qty < slices still trades)
+    let mut qty = if twap { (tr.qty / tr.slices_left.max(1)).max(1).min(tr.qty) } else { tr.qty };
+    if twap && qty == 0 { t.triggers[si].kind = 0; gc_pos(t); return Ok(()); } // nothing left: clear, no tip
     if !twap {
+        // the reduce cap is read off the position: with resting orders, the keeper must pass the account's own side too, or a
+        // fill it left unclaimed would let the stop sell a position that is already gone (and flip the account)
+        if t.pos[pi].n_orders != 0 { all_shards(pid, rest, &mk, m, tr.side)?; }
         let b = t.pos[pi].base;
         let cap = if bid && b < 0 { (-b) as u64 } else if !bid && b > 0 { b as u64 } else { 0 };
         qty = qty.min(cap);
     } else if m.paused != 0 { return Err(err(E::Paused)); }
     let taker_bps = TIERS[(t.tier as usize).min(TIERS.len() - 1)].0;
-    if qty == 0 && !twap { t.triggers[si].kind = 0; gc_pos(t); return Ok(()); } // nothing to reduce: clear, no tip
-    if qty == 0 { return Err(err(E::NotTriggered)); }
+    if qty == 0 { t.triggers[si].kind = 0; gc_pos(t); return Ok(()); } // nothing to reduce: clear, no tip
+    // no limit = market: the mark -/+ 10%, so a triggered stop is never sold to a stub bid (and a buy stop can fill at all)
+    let limit = if tr.limit_px != 0 { tr.limit_px } else { let px = mark(m); let s = bps_of(px, spec::TRIGGER_MARKET_SLIP_BPS); if bid { px + s } else { px.saturating_sub(s).max(TICK) } };
     // the keeper picks the accounts, the user owns the fill: every opposite shard must be passed (no routing to a worse bid)
     all_shards(pid, rest, &mk, m, if bid { SIDE_ASK } else { SIDE_BID })?;
     // the tip comes out before the account is judged, so it can never leave it under water (checked after the fill)
@@ -1279,22 +1362,27 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
         let px0 = mark(m); let band = quote_band(px0); let (blo, bhi) = bound_range(m);
         let (lo, hi) = (px0.saturating_sub(band).max(blo), (px0 + band).min(bhi));
         let (sl, cnt, _) = collect_slabs(pid, fb, rest, &tk, None, true, true)?;
-        { let mut ev = FastEv::new(&tk, bid); let r = fast_match(pid, fb, &sl[..cnt], (fb.idx as usize) << 4 | opp << 3, opp, bid, lo, hi, rest, &mk, m, t, &tk, pi, tr.limit_px, qty, slot, taker_bps, &mut ev, 0)?; ev.flush(); r }
-    } else { take(pid, rest, &mk, m, t, &tk, pi, bid, tr.limit_px, qty, slot, taker_bps, STP_CANCEL_OLDEST)?.filled };
+        { let mut ev = FastEv::new(&tk, bid); let r = fast_match(pid, fb, &sl[..cnt], (fb.idx as usize) << 4 | opp << 3, opp, bid, lo, hi, rest, &mk, m, t, &tk, pi, limit, qty, slot, taker_bps, &mut ev, 0)?; ev.flush(); r }
+    } else { take(pid, rest, &mk, m, t, &tk, pi, bid, limit, qty, slot, taker_bps, STP_CANCEL_OLDEST)?.filled };
     if filled == 0 { return Err(err(E::NotTriggered)); } // AUDIT M-1: no tip / no slice burn without a fill
+    // TP/SL: the tip is paid in proportion to the fill, out of what is left of it -- however many partial fills it takes, the
+    // keepers together earn the tip once (a keeper feeding it one lot at a time gains nothing)
+    let full_tip = tip;
+    let tip = if twap { tip } else { (tip as i128 * filled as i128 / qty as i128) as i64 };
     let w = &mut t.triggers[si];
     if twap {
-        w.qty -= qty.min(w.qty); w.slices_left -= 1; w.next_slot = slot + tr.interval;
-        if w.slices_left == 0 { w.kind = 0; }
+        w.qty -= filled; w.slices_left -= 1; w.next_slot = slot + tr.interval; // what a slice missed stays in the order
+        if w.slices_left == 0 || w.qty == 0 { w.kind = 0; }
         credit(t, pi, -(tip as i128))?;
         let (eq, im, _) = phealth(pid, t, pi, &a[3..], nw, true)?;
         if eq < im { return Err(err(E::Margin)); }
         // a TWAP slice adds risk like any order: same position and open-interest caps
         let p = &t.pos[pi];
         if m.max_position != 0 && core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs()) > m.max_position as i128 { return Err(err(E::Cap)); }
-        if m.max_oi != 0 && m.oi_long as i128 + if bid { qty as i128 } else { 0 } > m.max_oi as i128 { return Err(err(E::Cap)); }
+        if m.max_oi != 0 && m.oi_long as i128 + if bid { filled as i128 } else { 0 } > m.max_oi as i128 { return Err(err(E::Cap)); }
     } else {
-        w.kind = 0;
+        // a partial fill leaves the rest of the stop armed (it used to be spent by its first lot, leaving the position bare)
+        if filled == qty { w.kind = 0; } else { w.qty = w.qty.saturating_sub(filled); w.tip = (full_tip - tip) as u64; }
         // TP/SL reduce: never leave bad debt (fills may include resting orders from shards the keeper passed)
         credit(t, pi, -(tip as i128))?;
         let (eq, _, _) = phealth(pid, t, pi, &a[3..], nw, false)?;
@@ -2750,10 +2838,11 @@ fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base
             if c.0 != 0 && (bk == usize::MAX || (bid && c.0 < best.0) || (!bid && c.0 > best.0) || (c.0 == best.0 && c.2 < best.2)) { bk = k; best = *c; }
         }
         let (bp, ba, _, bl, b0) = best;
-        // resting orders strictly better than the best quote (or all of them when no quote is usable)
+        // resting orders at the best quote's price or better go first (or all of them when no quote is usable): at one price a
+        // resting order has waited since it was placed, a quote only since its last re-quote -- price, then time, across both books
         if !rest.is_empty() || m.strict_take != 0 {
             acc.book(u, pi, bid)?; // resting-order matching books the taker's position itself
-            let lim = if bk == usize::MAX { limit } else if bid { limit.min(bp - 1) } else { limit.max(bp + 1) };
+            let lim = if bk == usize::MAX { limit } else if bid { limit.min(bp) } else { limit.max(bp) };
             let lb = long(u.pos[pi].base);
             let tf = take(pid, rest, mk, m, u, uk, pi, bid, lim, left, slot, taker_bps, STP_CANCEL_OLDEST)?;
             in_shards += long(u.pos[pi].base) - lb; // take() books this part of the open interest on the shard
@@ -2972,7 +3061,7 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     while left > 0 && levels < spec::LIQ_FAST_MAX_LEVELS {
         let best = best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi, book_px(f, m, slot));
         if hybrid {
-            let lim = match best { Some((_, _, bp, _)) => if bid { hi.min(bp - 1) } else { lo.max(bp + 1) }, None => if bid { hi } else { lo } };
+            let lim = match best { Some((_, _, bp, _)) => if bid { hi.min(bp) } else { lo.max(bp) }, None => if bid { hi } else { lo } };
             let (sf, sn) = shard_take(t, lim, left, &mut sbest)?;
             left -= sf; filled += sf; notional += sn;
             if left == 0 { break; }

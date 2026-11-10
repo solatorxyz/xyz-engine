@@ -153,6 +153,20 @@ fn setup(e: &mut Env) -> (Address, Mk) { e.oracle_update("", 1000_00000000, None
     let t = e.user_state(&tu); assert_eq!(t.pos[0].base, 100);
     assert_eq!(t.pos[0].cost, 100_010 * 30 + 100_015 * 50 + 100_020 * 20);
 }
+/// One price, a resting order and a maker quote: the resting order has waited since it was placed, the quote only since its
+/// last re-quote, so the resting order fills first and the quote takes what is left.
+#[test] fn resting_order_fills_before_a_quote_at_the_same_price() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let a0 = e.shard(1, 100_000); let (rm, ru) = e.user(10_000_000_000); let (tp, tu) = e.user(10_000_000_000);
+    let m = e.market;
+    let mut d = vec![1u8]; d.extend_from_slice(&place_item(1, 1, 100_010, 50, 0, 0));
+    e.send("", trade_accts(&rm, &ru, &m, &[a0]), d, &[&rm], true);
+    quote(&mut e, &k, &[(ASK, 100_010, 40)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[a0], 0, PX + 100, 60, true);
+    assert_eq!(fb(&e, &f).makers[0].base, -10, "the quote only fills what the resting 50 could not");
+    assert_eq!(e.shard_state(&a0).n, 0);
+    let t = e.user_state(&tu); assert_eq!((t.pos[0].base, t.pos[0].cost), (60, 100_010 * 60));
+}
 #[test] fn time_priority_breaks_price_ties() {
     let mut e = Env::new(); let (f, k) = setup(&mut e); let k2 = maker(&mut e, &f, 10_000_000_000, 1_000_000_000);
     let (tp, tu) = e.user(10_000_000_000);
