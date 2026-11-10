@@ -2695,7 +2695,9 @@ fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base
     // only the first sl.len() entries are ever read, and each is written first
     let mut cand: [core::mem::MaybeUninit<Cand>; FAST_MAKERS] = [core::mem::MaybeUninit::uninit(); FAST_MAKERS];
     let oracle = book_px(f, m, slot);
-    for (k, &(sp, mi)) in sl.iter().enumerate() { cand[k].write(slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0, oracle)); }
+    // maker quotes are judged against the book's price, so they fill only while that price is recent (spec::FAST_GUARD_MAX_AGE_SLOTS)
+    let aged = !(f.fast_px != 0 && slot <= f.fast_slot + spec::FAST_PX_MAX_SLOTS) && slot > m.oracle_slot + spec::FAST_GUARD_MAX_AGE_SLOTS;
+    for (k, &(sp, mi)) in sl.iter().enumerate() { cand[k].write(if aged { (0, 0, 0, 0, 0) } else { slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0, oracle) }); }
     let (mut acc, mut fees) = (Acc { q: 0, nt: 0, fee: 0 }, 0u64);
     while left > 0 {
         let (mut bk, mut best): (usize, Cand) = (usize::MAX, (0, 0, 0, 0, 0));
@@ -2807,6 +2809,10 @@ fn slab_first(f: &FastBook, sp: *const Slab, mi: usize, base_ix: usize, opp: usi
     let lad = unsafe { s.lad.get_unchecked(base_ix >> 3) };
     let (room, peg) = (ladder_room(f, lad, mi, bid, oracle, slot), lad.flags & spec::LADDER_PEG != 0);
     if room == 0 { return (0, 0, 0, 0, 0); }
+    // default maker guard (spec::FAST_GUARD_BPS): fixed-price levels through the book's price are skipped
+    let guard = !peg && lad.tol_bps == 0;
+    let g = if guard { oracle.min(1 << 40).wrapping_mul(spec::FAST_GUARD_BPS) / 10000 } else { 0 };
+    let (glo, ghi) = (oracle.saturating_sub(g), oracle.saturating_add(g));
     let mut best: Cand = (0, 0, 0, 0, 0);
     for l in from..SLAB_LEVELS {
         let q = unsafe { s.quotes.get_unchecked(base_ix + l) };
@@ -2816,6 +2822,7 @@ fn slab_first(f: &FastBook, sp: *const Slab, mi: usize, base_ix: usize, opp: usi
         // beyond the band on the far side every later level is too
         if bid { if p > hi { break; } if p < lo { continue; } } else { if p < lo { break; } if p > hi { continue; } }
         if slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
+        if guard && (if bid { p < glo } else { p > ghi }) { continue; } // taker buys an ask under the price / sells into a bid over it
         let u_ = unsafe { f.used.get_unchecked(mi).get_unchecked(opp << 3 | l) };
         let av = (if u_.gen == q.gen { q.qty.saturating_sub(u_.qty) } else { q.qty }) as u64;
         let av = av.min(e.budget as u64 / p).min(room);

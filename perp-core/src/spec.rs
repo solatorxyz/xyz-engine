@@ -354,6 +354,14 @@ pub const IX_UPDATE_ORACLE_SOFT: u64 = 78;
 pub const FAST_PX_MAGIC: [u8; 8] = *b"etfastpx";
 pub const FAST_PX_MSG: usize = 64;
 pub const FAST_PX_MAX_SLOTS: u64 = 8;
+/// Default maker guard on the fast path (no opt-in). A fixed-price ladder without its own tolerance does not fill at a level
+/// more than FAST_GUARD_BPS through the book's price (a bid above it, an ask below it): after a move such a quote is stale,
+/// not an offer, and it must not depend on the maker's cancel landing first. Pegged ladders move with the price and ladders
+/// with a tolerance keep the maker's own limit.
+pub const FAST_GUARD_BPS: u64 = 10;
+/// Maker quotes fill only while the price they are judged against is recent: a signed price at most FAST_PX_MAX_SLOTS old, or
+/// an oracle update at most this many slots old (half the usual staleness limit). Resting orders are not affected.
+pub const FAST_GUARD_MAX_AGE_SLOTS: u64 = 75;
 /// A signed price further than this from the oracle is ignored.
 pub const FAST_PX_MAX_DEV_BPS: u64 = 100;
 /// Oracle band (bps of the oracle price) added to the initial and maintenance requirements: the oracle's confidence —

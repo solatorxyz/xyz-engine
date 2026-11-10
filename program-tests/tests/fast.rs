@@ -457,7 +457,7 @@ fn slab_q(e: &Env, k: &Address, i: usize) -> Quote { let d = e.data(k); let o = 
     qty: u32::from_le_bytes(d[o + 4..o + 8].try_into().unwrap()), gen: u32::from_le_bytes(d[o + 8..o + 12].try_into().unwrap()), slot: u32::from_le_bytes(d[o + 12..o + 16].try_into().unwrap()) } }
 /// Reference model of take_fast's maker matching, written from the rules, not from the code: repeatedly take the best usable
 /// quote (better price, then older quote slot, then slab order, then level order); a quote is usable when live (qty, age <= 30
-/// slots, inside mark +-5%, maker not killed, not the taker's own), and its size is capped by what is left of this quote
+/// slots, inside mark +-5%, not more than 10 bps through the oracle, maker not killed, not the taker's own), and its size is capped by what is left of this quote
 /// generation and by the maker's budget. Returns (lots per maker, taker lots, notional).
 fn model_take(e: &Env, f: &Address, slabs: &[(Address, Address)], taker: &Address, bid: bool, limit: u64, mut left: u64) -> (Vec<i64>, u64) {
     let b = fb(e, f); let ms = e.market_state(); let px0 = if ms.mark_px != 0 { ms.mark_px } else { ms.oracle_px };
@@ -473,6 +473,8 @@ fn model_take(e: &Env, f: &Address, slabs: &[(Address, Address)], taker: &Addres
             for l in 0..8 {
                 let q = slab_q(e, sl, opp << 3 | l); let p = q.px as u64;
                 if q.qty == 0 || slot - q.slot.min(slot) > 30 || p == 0 || p < lo || p > hi { continue; }
+                // default maker guard: a fixed-price quote more than 10 bps through the oracle is stale, not an offer
+                let g = ms.oracle_px * 10 / 10000; if (bid && p < ms.oracle_px - g) || (!bid && p > ms.oracle_px + g) { continue; }
                 let u = used[k][opp << 3 | l]; let av = (if u.0 == q.gen { q.qty.saturating_sub(u.1) } else { q.qty }) as u64;
                 let av = av.min(budget[k] as u64 / p); if av == 0 { continue; }
                 let better = match best { None => true, Some((bp, bs, _, _, _)) => (bid && p < bp) || (!bid && p > bp) || (p == bp && q.slot < bs) };
@@ -1354,4 +1356,52 @@ fn place_bid(e: &mut Env, kp: &Keypair, u: &Address, shards: &[Address], px: u64
     settle(&mut e, &f, &k); // below maintenance without it: the margin comes back to cash
     assert_eq!(e.user_state(&k.u).pos[0].iso_margin, 0);
     e.send("", vec![AccountMeta::new(lp.pubkey(), true), w(&lu), w(&k.u), r(&m), w(&ins), r(&f)], d, &[&lp], true);
+}
+
+// ---- default maker guard (spec::FAST_GUARD_BPS / FAST_GUARD_MAX_AGE_SLOTS): protection that does not depend on a cancel landing ----
+fn mbase(e: &Env, f: &Address) -> i64 { fb(e, f).makers[0].base }
+#[test] fn fixed_quote_left_through_the_price_is_not_filled() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100), (0, 99_990, 100)], true); // plain fixed ladder: no peg, no tolerance, no flags
+    // price falls 0.5%; the maker's cancel has not landed. Its bid at 99,990 is now 490 over the price: not an offer any more
+    later(&mut e, 2); e.oracle_update("", 995_00000000, None);
+    tk_try(&mut e, &tp, &tu, &f, &[k.slab], 1, 0, 99_000, 50);
+    assert_eq!(mbase(&e, &f), 0, "a seller can't hit the stale bid");
+    // the ask (above the price) is still a real offer
+    tk_try(&mut e, &tp, &tu, &f, &[k.slab], 0, 0, 100_100, 10);
+    assert_eq!(mbase(&e, &f), -10, "the far side still fills");
+    // once the maker requotes around the new price it fills again
+    quote(&mut e, &k, &[(0, 99_490, 100)], true);
+    tk_try(&mut e, &tp, &tu, &f, &[k.slab], 1, 0, 99_000, 50);
+    assert_eq!(mbase(&e, &f), 40, "requoted bid fills");
+}
+#[test] fn fixed_quote_within_the_guard_still_fills() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000);
+    quote(&mut e, &k, &[(0, 99_990, 100)], true);
+    later(&mut e, 2); e.oracle_update("", 999_50000000, None); // 5 bps down: the bid is 4 bps over the price, inside the 10 bps guard
+    tk_try(&mut e, &tp, &tu, &f, &[k.slab], 1, 0, 99_000, 50);
+    assert_eq!(mbase(&e, &f), 50);
+}
+#[test] fn own_tolerance_replaces_the_default_guard() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000);
+    // bid ladder with the maker's own limit: reference 100,000, 100 bps
+    quote(&mut e, &k, &[(0x8000, 100_000, 100), (0, 99_990, 100)], true);
+    later(&mut e, 2); e.oracle_update("", 995_00000000, None); // 50 bps: inside the maker's 100 bps, beyond the default 10
+    tk_try(&mut e, &tp, &tu, &f, &[k.slab], 1, 0, 99_000, 50);
+    assert_eq!(mbase(&e, &f), 50, "the maker chose a wider limit");
+}
+#[test] fn maker_quotes_need_a_recent_price() {
+    let mut e = Env::new(); let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000);
+    later(&mut e, 80); // the oracle has not been updated for 80 slots (limit 75); the quote itself is new
+    quote(&mut e, &k, &[(ASK, 100_010, 100)], true);
+    tk_try(&mut e, &tp, &tu, &f, &[k.slab], 0, 0, 100_100, 10);
+    assert_eq!(mbase(&e, &f), 0, "no maker fill against an old price");
+    e.oracle_update("", 1000_00000000, None);
+    quote(&mut e, &k, &[(ASK, 100_010, 100)], true);
+    tk_try(&mut e, &tp, &tu, &f, &[k.slab], 0, 0, 100_100, 10);
+    assert_eq!(mbase(&e, &f), -10, "fills once the price is recent");
 }
