@@ -173,6 +173,48 @@ fn pending(w: &World, cx: &Cx, ui: usize) -> bool {
         || cx.books.iter().any(|f| { let f: &FastBook = w.rf(f); f.makers[..f.n as usize].iter().any(|e| e.user == uk && (e.base != 0 || e.quote != 0)) })
 }
 
+/// The order rules of 2026-11-10 (docs/ORDER_RULES.md), after every successful instruction that exercises one.
+fn order_rule_checks(w: &World, cx: &Cx, op: usize, ui: usize, si: usize, pre_users: &[User], pre_led: &[i64], ro_single: bool, repl: Option<(u64, bool)>, cancel_all: bool, what: &str) {
+    let m: &Market = w.rf(&cx.market);
+    let base = |x: &User| x.pos.iter().find(|p| p.market == cx.market).map_or(0i64, |p| p.base);
+    // the bucket the market position is margined in, as the program judges it
+    let bucket_eq = |x: &User| { let (c, iso) = booked(x, m); iso.map_or(c.eq, |i| i.eq) };
+    let shrunk = |b0: i64, b1: i64| b1.unsigned_abs() <= b0.unsigned_abs() && (b1 == 0 || (b1 > 0) == (b0 > 0));
+    // a stop that has protected a position does not outlive it
+    let no_stale_stop = |x: &User, who: &str| { if base(x) == 0 { for t in x.triggers.iter() {
+        assert!(t.kind == 0 || t.kind & 0xff == 3 || t.next_slot == 0, "{what}: {who} is flat but still has an armed TP/SL"); } } };
+    let uk = cx.users[ui].u; let now: &User = w.rf(&uk);
+    if matches!(op, 0 | 1 | 2 | 3) { no_stale_stop(now, "the account"); }
+    if ro_single {
+        let b0 = base(&pre_users[ui]) + pre_led[ui]; let b1 = base(now);
+        assert!(shrunk(b0, b1), "{what}: a reduce-only order grew or flipped the position ({b0} -> {b1})");
+        if b1 != b0 { assert!(bucket_eq(now) >= 0, "{what}: a reduce-only fill left equity {} < 0", bucket_eq(now)); }
+    }
+    let mine = |f: &dyn Fn(&Order) -> bool| cx.sh.iter().any(|s| { let s: &Shard = w.rf(s); s.orders[..s.n as usize].iter().any(|o| o.owner == uk && f(o)) });
+    if let Some((cid, had)) = repl { assert!(had || !mine(&|o| o.cid == cid), "{what}: an IF_CANCELLED place landed though its cancel removed nothing"); }
+    if cancel_all { assert!(!mine(&|_| true), "{what}: orders left after a cancel-all"); }
+    if op == 26 {
+        let ti = ui % 6; let (tk, kp) = (cx.users[ti].u, cx.users[6].u);
+        let (t0, t1): (&User, &User) = (&pre_users[ti], w.rf(&tk));
+        let (tr0, tr1) = (&pre_users[ti].triggers[si], &t1.triggers[si]);
+        let tip = w.rf::<User>(&kp).cash as i128 - pre_users[6].cash as i128;
+        assert!(tip >= 0 && tip <= tr0.tip.min(spec::MAX_KEEPER_TIP) as i128, "{what}: keeper was paid {tip}, the trigger's tip is {}", tr0.tip);
+        if tr0.kind & 0xff == 3 {
+            assert!(tr1.kind == 0 || (tr1.slices_left + 1 == tr0.slices_left && tr1.qty < tr0.qty), "{what}: a TWAP slice ran without using a slice or lots");
+        } else {
+            let (b0, b1) = (base(t0) + pre_led[ti], base(t1));
+            assert!(shrunk(b0, b1), "{what}: a TP/SL grew or flipped the position ({b0} -> {b1})");
+            if b1 != b0 { assert!(bucket_eq(t1) >= 0, "{what}: a TP/SL left equity {} < 0", bucket_eq(t1)); }
+            assert!(tr1.kind == 0 || (tr1.qty < tr0.qty && tr1.tip <= tr0.tip), "{what}: a TP/SL filled without its size going down");
+            // the tip is paid once over all partial fills: what was paid now came out of what is left
+            if tr1.kind != 0 { assert_eq!(tr1.tip as i128 + tip, tr0.tip.min(spec::MAX_KEEPER_TIP) as i128, "{what}: a partial TP/SL fill did not take its tip out of the stop"); }
+            // a stop is spent only when its size is done or there is nothing left to reduce: a partial fill leaves it armed
+            let cap0 = if tr0.side == 0 && b0 < 0 { b0.unsigned_abs() } else if tr0.side == 1 && b0 > 0 { b0 as u64 } else { 0 };
+            if cap0 != 0 && tr1.kind == 0 && b1 != 0 { assert!(b0.unsigned_abs() - b1.unsigned_abs() >= tr0.qty, "{what}: a TP/SL was spent by a partial fill ({b0} -> {b1}, size {})", tr0.qty); }
+            no_stale_stop(t1, "the stop's account");
+        }
+    }
+}
 /// Global invariants, after every successful instruction.
 fn invariants(w: &World, cx: &Cx, vault_amt: i128, exact_money: bool, what: &str) {
     let m: &Market = w.rf(&cx.market); let ins: &Insurance = w.rf(&cx.ins);
@@ -494,7 +536,7 @@ fuzz_target!(|data: &[u8]| {
     }
     let mut ts_ms: u64 = 1000; let mut slots_used: u64 = 0; let mut idx_moved = false;
     invariants(&w, &cx, vault_amt, true, "setup");
-    let mut okc = [0u32; 32]; let mut tot = [0u32; 32]; let mut modelled = 0u32;
+    let mut okc = [0u32; 32]; let mut tot = [0u32; 32]; let mut modelled = 0u32; let mut mark_cid = 1000u64;
     let all_shards_w = |cx: &Cx| -> Vec<Meta> { cx.sh.iter().map(|s| (*s, false, true)).collect() };
     let slabs_for = |cx: &Cx, w: &World, book: &K, sel: u8| -> Vec<Meta> {
         // approved slabs in the book's own order; `sel` can drop one, repeat one or reverse them (the program must cope)
@@ -511,6 +553,8 @@ fuzz_target!(|data: &[u8]| {
         let pre_users: Vec<User> = cx.users.iter().map(|x| w.cp::<User>(&x.u)).collect();
         let pre_true: Vec<(Hl, Option<Hl>)> = (0..7).map(|i| truth(&w, &cx, i)).collect();
         let pre_m: Market = w.cp(&market);
+        let pre_led: Vec<i64> = cx.users.iter().map(|x| cx.sh.iter().map(|s| { let s: &Shard = w.rf(s); s.ledger[..s.nled as usize].iter().filter(|l| l.owner == x.u).map(|l| l.base).sum::<i64>() }).sum()).collect();
+        let (mut ro_single, mut repl, mut cancel_all) = (false, None::<(u64, bool)>, false);
         let (mut settle_or_fund, mut liq, mut taker) = (false, false, None::<K>);
         let what = format!("step {step} op {op} user {ui}");
         if dbg() { eprintln!("{what} {:?} slot {} px {}", &c[2..], w.slot, pu(px)); }
@@ -521,10 +565,21 @@ fuzz_target!(|data: &[u8]| {
                 // differential: a limit order's take against the reference model (every shard is passed, funding has not moved)
                 let pred = if k == 0 && !idx_moved { model_place(&w, &cx, ui, side, c[5] & 0x7f, price, qty) } else { None };
                 let fees0: i128 = cx.sh.iter().map(|s| w.rf::<Shard>(s).fee_accum as i128).sum();
+                ro_single = k == 0 && c[5] & 2 != 0;
                 if w.call(&trade(&cx, ui), &d) { if let Some(pr) = pred { check_pred(&w, &cx, ui, &pr, fees0, &what); modelled += 1; } } }
-            2 => { let mut d = vec![3u8]; d.extend_from_slice(&0u16.to_le_bytes()); d.push(1); d.push(2);
-                d.extend_from_slice(&((c[7] % 4) as u64).to_le_bytes()); d.push(side | 128); d.extend_from_slice(&0u64.to_le_bytes());
-                d.extend(place(side, 1, 0, price, qty, 0, (c[7] % 4) as u64, 0, 0, 0)); d.extend(place(1 - side, 1, 0, price + 200, qty, 0, 0, 0, 0, 0));
+            2 => { let cid = (c[7] % 4) as u64;
+                let mut d = vec![3u8]; d.extend_from_slice(&0u16.to_le_bytes());
+                match c[5] & 3 {
+                    // cancel everything, place nothing
+                    2 => { cancel_all = true; d.push(1); d.push(0); d.extend_from_slice(&0u64.to_le_bytes()); d.push(64); d.extend_from_slice(&0u64.to_le_bytes()); }
+                    // replace: the first place carries FLAG_IF_CANCELLED and a cid no other order has
+                    1 => { mark_cid += 1;
+                        let had = cid != 0 && cx.sh.iter().any(|s| { let s: &Shard = w.rf(s); s.side == side as u64 && s.orders[..s.n as usize].iter().any(|o| o.owner == u && o.cid == cid) });
+                        repl = Some((mark_cid, had));
+                        d.push(1); d.push(2); d.extend_from_slice(&cid.to_le_bytes()); d.push(side | 128); d.extend_from_slice(&0u64.to_le_bytes());
+                        d.extend(place(side, 1 | 128, 0, price, qty, 0, mark_cid, 0, 0, 0)); d.extend(place(1 - side, 1, 0, price + 200, qty, 0, 0, 0, 0, 0)); }
+                    _ => { d.push(1); d.push(2); d.extend_from_slice(&cid.to_le_bytes()); d.push(side | 128); d.extend_from_slice(&0u64.to_le_bytes());
+                        d.extend(place(side, 1, 0, price, qty, 0, cid, 0, 0, 0)); d.extend(place(1 - side, 1, 0, price + 200, qty, 0, 0, 0, 0, 0)); } }
                 w.call(&trade(&cx, ui), &d); }
             3 => { let mut d = vec![2u8]; d.extend_from_slice(&0u16.to_le_bytes()); d.push(1); d.push(0);
                 let id = ((c[2] % 4) as u64) << 40 | (c[7] as u64 % 16); d.extend_from_slice(&id.to_le_bytes()); d.push(side); d.extend_from_slice(&price.to_le_bytes());
@@ -665,7 +720,7 @@ fuzz_target!(|data: &[u8]| {
                 0 => { let s = cx.sh[(c[3] % 4) as usize]; let mut mm = vec![(s, false, true)]; mm.extend(cx.users.iter().map(|x| (x.u, false, true))); w.call(&mm, &[24]); }
                 1 => { w.call(&[(u, false, true), (market, false, false)], &[15]); }
                 _ => { let mut mm = vec![(market, false, true), (ins, false, true)]; mm.extend(all_shards_w(&cx)); mm.extend(cx.books.iter().map(|f| (*f, false, true))); w.call(&mm, &[16]); } } }
-            25 => { let mut d = vec![20u8, c[7] % 4, (1 + c[2] % 3) | (c[3] & 0xc0), side]; for v in [price, if side == 0 { price + 2000 } else { price.saturating_sub(2000) }, qty, 3, 1, 2] { d.extend_from_slice(&v.to_le_bytes()); }
+            25 => { let mut d = vec![20u8, c[7] % 4, (1 + c[2] % 3) | (c[3] & 0xc0), side]; for v in [price, if c[3] & 0x20 != 0 { 0 } else if side == 0 { price + 2000 } else { price.saturating_sub(2000) }, qty, 3, 1, 2] { d.extend_from_slice(&v.to_le_bytes()); }
                 w.call(&[(auth, true, true), (u, false, true), (market, false, false)], &d); }
             26 => { // keeper (user 6) runs a trigger of `ui`: through the side's registered book with every slab, and all shards
                 let tr = pre_users[ui].triggers[(c[7] % 4) as usize]; let opp = if tr.side == 0 { 1 } else { 0 }; let book = cx.book(opp);
@@ -717,6 +772,7 @@ fuzz_target!(|data: &[u8]| {
             let m: &Market = w.rf(&market);
             if m.funding_index != 0 { idx_moved = true; }
             invariants(&w, &cx, vault_amt, !idx_moved, &what);
+            order_rule_checks(&w, &cx, op, ui, (c[7] % 4) as usize, &pre_users, &pre_led, ro_single, repl, cancel_all, &what);
             let lots = fill_checks(&w, &cx, &pre_books, settle_or_fund, liq, taker, &what);
             if op != 13 && op != 14 && op != 18 { for (bi, fk) in cx.books.iter().enumerate() { let f: &FastBook = w.rf(fk); for mi in 0..pre_books[bi].n as usize {
                 assert!(f.makers[mi].budget <= pre_books[bi].makers[mi].budget, "{what}: a maker budget rose outside fund / settle"); } } }
