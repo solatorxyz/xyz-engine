@@ -1690,10 +1690,14 @@ fn fast_bbo(sh: &[AccountView], pid: &Address, m: &Market, mk: &Key, slot: u64, 
                 let base = (f.idx as usize) << 4 | sd << 3;
                 let lad = &s.lad[base >> 3];
                 let mut room = ladder_room(f, lad, mi, sd == 1, px, slot);
+                // same default maker guard as the matcher (slab_first): a level no taker can fill doesn't count for the mark
+                let guard = lad.flags & spec::LADDER_PEG == 0 && lad.tol_bps == 0;
+                let g = if guard { px.min(1 << 40).wrapping_mul(spec::FAST_GUARD_BPS) / 10000 } else { 0 };
                 for l in 0..SLAB_LEVELS {
                     if room == 0 || budget == 0 { break; }
                     let q = &s.quotes[base + l]; let p = qpx(q.px, px, lad.flags & spec::LADDER_PEG != 0);
                     if q.qty == 0 || p < lo || p > hi || q.slot as u64 >= slot & 0xffff_ffff || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
+                    if guard && (if sd == 1 { p < px.saturating_sub(g) } else { p > px.saturating_add(g) }) { continue; }
                     let u_ = &f.used[mi][sd << 3 | l];
                     let left = if u_.gen == q.gen { (q.qty as u64).saturating_sub(u_.qty as u64) } else { q.qty as u64 };
                     let qty = left.min(room).min((budget / p as u128) as u64);
