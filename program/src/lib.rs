@@ -569,7 +569,8 @@ fn iso_health_np(pid: &Address, u: &User, pi: usize, a: &[AccountView], nw: Now)
     let gross = core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs());
     Ok((p.iso_margin as i128 + np_value(p.base, p.cost, px), bps_up(mulf(gross, px), m.imr_bps + b)))
 }
-fn health(pid: &Address, u: &User, a: &[AccountView], nw: Now, need_fresh: bool) -> Result<(i128, i128, i128), ProgramError> {
+#[inline(always)]
+fn health_g<const MM: bool>(pid: &Address, u: &User, a: &[AccountView], nw: Now, need_fresh: bool) -> Result<(i128, i128, i128), ProgramError> {
     let (mut eq, mut im, mut mm) = (u.cash as i128, 0i128, 0i128);
     for p in u.pos.iter() {
         if p.market == [0; 32] { break; }
@@ -580,10 +581,15 @@ fn health(pid: &Address, u: &User, a: &[AccountView], nw: Now, need_fresh: bool)
         eq += mulf(p.base as i128, px);
         let gross = core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs());
         im += bps_up(mulf(gross, px), m.imr_bps + b);
-        mm += bps_up(mulf((p.base as i128).abs(), px), m.mmr_bps + b);
+        if MM { mm += bps_up(mulf((p.base as i128).abs(), px), m.mmr_bps + b); }
     }
     Ok((eq, im, mm))
 }
+/// (equity, initial requirement, maintenance requirement) of the cross account.
+fn health(pid: &Address, u: &User, a: &[AccountView], nw: Now, need_fresh: bool) -> Result<(i128, i128, i128), ProgramError> { health_g::<true>(pid, u, a, nw, need_fresh) }
+/// The same pass without the maintenance requirement (third value 0), for the checks that only compare equity with the
+/// initial requirement: one product and one bps rounding less per position.
+fn health_im(pid: &Address, u: &User, a: &[AccountView], nw: Now, need_fresh: bool) -> Result<(i128, i128, i128), ProgramError> { health_g::<false>(pid, u, a, nw, need_fresh) }
 fn pos_idx(u: &mut User, mk: &Key, funding_index: i64) -> Result<usize, ProgramError> {
     let mut free = usize::MAX;
     for (i, p) in u.pos.iter().enumerate() {
@@ -1189,7 +1195,7 @@ fn batch(pid: &Address, a: &mut [AccountView], d: &[u8], single: bool) -> Progra
         if m.max_oi != 0 && m.oi_long > m.max_oi { return Err(err(E::Cap)); }
         let p = &u.pos[pi]; // per-account position limit (gross incl. resting orders)
         if m.max_position != 0 && core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs()) > m.max_position as i128 { return Err(err(E::Cap)); }
-        let (eq, im, _) = health(pid, u, &a[2..], nw, true)?;
+        let (eq, im, _) = health_im(pid, u, &a[2..], nw, true)?;
         let iso = u.pos[pi].flags & POS_ISO != 0;
         if eq - if iso { 0 } else { adverse } < im { return Err(err(E::Margin)); }
         if iso { let (e2, i2, _) = iso_health(pid, u, pi, &a[2..], nw, true)?; if e2 - adverse < i2 { return Err(err(E::Margin)); } }
@@ -1293,7 +1299,7 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
         credit(t, pi, -(tip as i128))?;
         let (eq, _, _) = phealth(pid, t, pi, &a[3..], nw, false)?;
         if eq < 0 { return Err(err(E::Margin)); }
-        if t.pos[pi].flags & POS_ISO == 0 { let (ce, _, _) = health(pid, t, &a[3..], nw, false)?; if ce < 0 { return Err(err(E::Margin)); } }
+        if t.pos[pi].flags & POS_ISO == 0 { let (ce, _, _) = health_im(pid, t, &a[3..], nw, false)?; if ce < 0 { return Err(err(E::Margin)); } }
     }
     kp.cash = i64c(kp.cash as i128 + tip as i128)?;
     emit(&[&[EVENTS_TRIGGER as u8, si as u8, tr.kind as u8], &tk, &filled.to_le_bytes()]);
@@ -1944,7 +1950,7 @@ fn liquidate_core(pid: &Address, a: &mut [AccountView], d: &[u8], vlt: bool) -> 
             ins.balance = i64c(ins.balance as i128 - from_ins)?; lq.cash = i64c(lq.cash as i128 - from_v)?; credit(t, pi, -eq2)?;
         }
     }
-    let (le, lim, _) = health(pid, lq, mkts, nw, true)?;
+    let (le, lim, _) = health_im(pid, lq, mkts, nw, true)?;
     if le < lim { return Err(err(E::Margin)); }
     emit(&[&[EVENTS_LIQUIDATION as u8], &tk, &q.to_le_bytes(), &px.to_le_bytes(), &key(&a[1])]);
     gc_pos(t); gc_pos(lq);
@@ -2496,7 +2502,7 @@ fn slab_fund(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     // set once a maker funds here and kept (another book of the market may still hold its fills): a maker account keeps the slot
     if nm > 0 || unsettled { u.pos[pi].flags |= POS_PIN; }
     if key(&a[3]) == m.fast_book[0] || key(&a[3]) == m.fast_book[1] { sync_mirror(u, m, &mk, nm); }
-    if amt > 0 { let (eq, im, _) = health(pid, u, &a[2..], nw, true)?; if u.cash < 0 || eq < im { return Err(err(E::Margin)); } }
+    if amt > 0 { let (eq, im, _) = health_im(pid, u, &a[2..], nw, true)?; if u.cash < 0 || eq < im { return Err(err(E::Margin)); } }
     Ok(())
 }
 /// Permissionless: move a maker's fills into its User and refill the budget. A maker below maintenance gets its margin back
@@ -2532,7 +2538,7 @@ fn slab_settle(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     else if e.target > 0 {
         // Auto mode works like cross margin through the keeper's settles: idle cash tops the margin up to target,
         // and margin goes back to cash first when the rest of the account falls short of initial margin. Skipped on a stale price.
-        if let Ok((eq, im, _)) = health(pid, u, &a[1..], nw, true) {
+        if let Ok((eq, im, _)) = health_im(pid, u, &a[1..], nw, true) {
             let mv: i128 = if eq < im { -((im - eq).min(e.margin as i128)) }
                 else if e.target > e.margin { ((e.target - e.margin) as i128).min((u.cash as i128).max(0)).min(eq - im) }
                 else { -((e.margin - e.target) as i128) };
@@ -2618,7 +2624,7 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
         let p = &u.pos[pi];
         if m.max_position != 0 && core::cmp::max((p.base as i128 + p.bid_open as i128).abs(), (p.base as i128 - p.ask_open as i128).abs()) > m.max_position as i128 { return Err(err(E::Cap)); }
         cp!(10);
-        let (eq, im, _) = health(pid, u, &a[2..], nw, true)?;
+        let (eq, im, _) = health_im(pid, u, &a[2..], nw, true)?;
         if eq < im { return Err(err(E::Margin)); }
         cp!(11);
         if p.flags & POS_ISO != 0 { let (e2, i2, _) = iso_health(pid, u, pi, &a[2..], nw, true)?; if e2 < i2 { return Err(err(E::Margin)); } }
@@ -2707,7 +2713,7 @@ fn batch_take(pid: &Address, f: &mut FastBook, fk: &Key, m: &Market, mk: &Key, m
 /// any fill from below; initial margin follows the gross exposure, which over a partial fill never exceeds the larger of now
 /// and full fill. So when this holds, every possible fill of the order leaves equity >= initial margin. Also the position cap.
 fn worst_ok(pid: &Address, u: &User, pi: usize, mkts: &[AccountView], nw: Now, m: &Market, bid: bool, qty: u64, worst: u64, taker_bps: u64) -> bool {
-    let Ok((eq, im, _)) = health(pid, u, mkts, nw, true) else { return false };
+    let Ok((eq, im, _)) = health_im(pid, u, mkts, nw, true) else { return false };
     let (p, px, q) = (&u.pos[pi], mark(m), qty as i128);
     let nt = mulf(q, worst);
     let slip = if bid { nt - mulf(q, px) } else { mulf(q, px) - nt };
@@ -3066,7 +3072,7 @@ fn assert_state(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
     let min_eq = rd64(d, 3)? as i64;
     if min_eq != i64::MIN {
         let clk = clock()?;
-        let (eq, _, _) = health(pid, u, &a[1..], (clk.slot, clk.unix_timestamp), false)?;
+        let (eq, _, _) = health_im(pid, u, &a[1..], (clk.slot, clk.unix_timestamp), false)?;
         if eq < min_eq as i128 { return Err(err(E::Assert)); }
     }
     Ok(())
@@ -3209,7 +3215,7 @@ fn vault_withdraw(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let s0: &mut User = load(&a[3], pid, DISC_USER, USER_SIZE)?;
     if out > s0.cash as i128 { return Err(err(E::Margin)); }
     s0.cash = i64c(s0.cash as i128 - out)?;
-    let (eq, im, _) = health(pid, s0, &a[3..], nw, true)?;
+    let (eq, im, _) = health_im(pid, s0, &a[3..], nw, true)?;
     if eq < im { return Err(err(E::Margin)); }
     v.shares -= sh; vd.shares -= sh; vd.basis = i64c(vd.basis as i128 - cost)?;
     vault_mark(v, nav - out, clk.slot)?;

@@ -7,20 +7,20 @@
 | deposit (SPL transfer CPI) | 1383 |
 | deposit (SPL transfer CPI) | 1383 |
 | deposit (SPL transfer CPI) | 1383 |
-| place 1 post-only (resting, no match) | 1711 |
-| batch place 10 (5 bid + 5 ask levels) | 8962 |
-| batch replace (cancel 10 + place 10) | 11753 |
+| place 1 post-only (resting, no match) | 1648 |
+| batch place 10 (5 bid + 5 ask levels) | 8899 |
+| batch replace (cancel 10 + place 10) | 11690 |
 | batch cancel 10 | 3665 |
-| taker IOC: match 5 levels across 3 shards | 6419 |
-| taker IOC: match 1 level | 2756 |
+| taker IOC: match 5 levels across 3 shards | 6356 |
+| taker IOC: match 1 level | 2693 |
 | withdraw (margin check + PDA-signed SPL CPI) | 2083 |
-| batch replace + claim maker fills (3 shards w/ ledgers) | 10927 |
+| batch replace + claim maker fills (3 shards w/ ledgers) | 10864 |
 | update_oracle + premium/mark from full shard set (5 shards) | 3309 |
-| liquidate (takeover at mark: health x2, transfer, fees) | 4677 |
+| liquidate (takeover at mark: health x2, transfer, fees) | 4610 |
 | deposit (SPL transfer CPI) | 1383 |
-| adl_rank (permissionless re-score) | 2057 |
-| ADL (bankrupt -> on-chain ranked counterparty -> insurance) | 7460 |
+| adl_rank (permissionless re-score) | 2054 |
+| ADL (bankrupt -> on-chain ranked counterparty -> insurance) | 7447 |
 | settle_funding (permissionless, 1 position) | 199 |
 | aggregate OI/fees from 9 shards (crank) | 733 |
-| liquidate_book (permissionless, 1 chunk into the book, no liquidator capital) | 5717 |
-| exec SL trigger on mark (keeper crank, IOC reduce-only) | 3599 |
+| liquidate_book (permissionless, 1 chunk into the book, no liquidator capital) | 5710 |
+| exec SL trigger on mark (keeper crank, IOC reduce-only) | 3532 |
