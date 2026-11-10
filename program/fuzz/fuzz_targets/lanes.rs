@@ -196,7 +196,7 @@ fn invariants(w: &World, cx: &Cx, vault_amt: i128, exact_money: bool, what: &str
             if p.base == 0 { assert_eq!(p.cost, 0, "{what}: flat position with a cost basis"); }
             assert_eq!((p.bid_open, p.ask_open, p.n_orders), (bo, ao, no), "{what}: open-order accounting (bid_open, ask_open, n_orders) != resting orders + unclaimed ledger");
         }
-        if !have { assert!(bo == 0 && ao == 0 && no == 0 && locked == 0 && !unsettled, "{what}: orders, fills or maker margin without a position slot"); }
+        if !have { assert!(bo == 0 && ao == 0 && no == 0 && locked == 0 && !unsettled, "{what}: orders, fills or maker margin without a position slot (bid_open {bo} ask_open {ao} orders {no} locked {locked} unsettled {unsettled})"); }
         assert!(locked >= 0, "{what}: negative maker margin");
         // complete_view / maker_clear rely on this: unsettled fast fills always sit behind locked margin (so behind a non-zero mirror)
         if unsettled { assert!(locked > 0, "{what}: unsettled maker fills with no margin locked"); }
@@ -268,7 +268,7 @@ fn fill_checks(w: &World, cx: &Cx, pre: &[FastBook], settle_or_fund: bool, liq: 
                 if ask { dbase -= fq; snt += p * fq; } else { dbase += fq; snt -= p * fq; }
             }
             if settle_or_fund { assert_eq!(lots, 0, "{what}: a settle / fund filled quotes"); continue; }
-            assert_eq!(e.volume as i128 - e0.volume as i128, lots as i128, "{what}: maker volume != lots recorded in its used table");
+            assert_eq!((f.ext[mi].rebate_bps >> 16) as i128 - (b0.ext[mi].rebate_bps >> 16) as i128, lots as i128, "{what}: maker volume != lots recorded in its used table");
             assert_eq!(e.base as i128 - e0.base as i128, dbase, "{what}: maker lots != lots recorded in its used table");
             assert_eq!(e0.budget as i128 - e.budget as i128, nt, "{what}: maker budget did not drop by exactly the filled notional");
             let rebate = e.quote as i128 - e0.quote as i128 - snt;
@@ -692,7 +692,7 @@ fuzz_target!(|data: &[u8]| {
                     let is_member = cx.pooled && mem.contains(&who);
                     assert!(tag == 22 && d[1] as u64 == spec::ADMIN_PAUSE && val == 1 && is_member, "{what}: admin instruction {tag} op {} succeeded for a single signer that is not the admin", d[1]);
                     let off = core::mem::offset_of!(Market, paused);
-                    let mut exp = before[0].clone(); exp[off..off + 8].copy_from_slice(&1u64.to_le_bytes());
+                    let mut exp = before[0].clone(); if exp[off..off + 8] == 0u64.to_le_bytes() { exp[off..off + 8].copy_from_slice(&1u64.to_le_bytes()); } // a stronger pause (breaker) is kept
                     assert!(after[0] == exp && after[1] == before[1] && after[2] == before[2], "{what}: single-member emergency pause changed more than paused = 1");
                 } }
             28 => { // full authority: immediate admin actions and tiers
