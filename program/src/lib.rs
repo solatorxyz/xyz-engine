@@ -3255,6 +3255,9 @@ mod arith_tests {
 }
 // ---------- Kani proofs of program-level arithmetic fast paths ----------
 // Each fast path (native u64) must give the same value as the checked i128 path it replaces.
+/// Further machine-checked properties live in proofs.rs (same access to private items as this file).
+#[cfg(kani)]
+mod proofs;
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
