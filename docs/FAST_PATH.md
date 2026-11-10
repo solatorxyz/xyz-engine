@@ -37,7 +37,7 @@ A maker can fill at most margin / IMR of notional between settles. That bounds w
 - FastBook is 2000 bytes (auto target added). Nothing on devnet uses it yet.
 
 ## Frontend (Codex owns UI)
-Use `sdk/ts/everytick.ts` (builders, decoders, `fastDepth`). `sdk/ts/smoke.ts` shows reading a FastBook, slabs, a User and a Market from RPC.
+Use `sdk/ts/solator.ts` (builders, decoders, `fastDepth`). `sdk/ts/smoke.ts` shows reading a FastBook, slabs, a User and a Market from RPC.
 - Order book: `fastDepth(decodeFastBook(fast), slabs, slot, mark)` gives live maker levels (used qty, age, ±5% band and budget applied). Merge with shard orders.
 - Sending: `sendFast(relayUrl, connection, rawTx)` posts through the txsend relay (`/tx` on the web host: straight to the
   leaders' TPU) and resolves at *processed* (~1 slot) — show the fill then, confirm in the background.
