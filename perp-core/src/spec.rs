@@ -446,6 +446,30 @@ pub const IX_VAULT_MOVE: u64 = 83;
 /// vault's value until it is used again. accs: vault(w), sub(w), [the sub's markets, the books it quotes on, the shards of
 /// markets where it rests orders]. data: tag
 pub const IX_VAULT_VALUE: u64 = 84;
+/// A signing lease: which one of a key's hosts may sign for a slot. The next-price signer runs on more than one machine,
+/// all holding the same key, and "one price a market a slot" must survive a machine that is slow, cut off or restarted.
+/// The lease gives every slot to at most one member: a member signs for slot s only while the chain says it holds the
+/// lease over s. The key itself puts its signing under the lease (once) and names up to LEASE_MEMBERS host identities.
+/// The lease account is the key's `create_with_seed(key, LEASE_SEED, program)`, which only the key can create, so every
+/// host derives the same one. accs: key(s), lease(w, zeroed). data: tag, n u8, n x member [32]
+pub const IX_LEASE_INIT: u64 = 85;
+/// A member takes the lease, or the holder extends it, up to slot `until` (inclusive). The holder can only extend; anyone
+/// else can take it only once the chain is past the holder's last slot, and then holds from the current slot on. So the
+/// slots two members were ever given never overlap, whatever their clocks or connections do.
+/// accs: member(s), lease(w). data: tag, until u64
+pub const IX_LEASE_CLAIM: u64 = 86;
+pub const LEASE_SEED: &str = "lease";
+pub const LEASE_MEMBERS: u64 = 4;
+/// Furthest ahead a lease can reach (2 minutes): the longest a dead holder can keep the others out.
+pub const LEASE_MAX_SLOTS: u64 = 300;
+pub const LEASE_SIZE: u64 = 208;
+pub const LEASE_KEY_OFF: u64 = 8;
+pub const LEASE_MEMBERS_OFF: u64 = 40;
+pub const LEASE_N_OFF: u64 = 168;
+pub const LEASE_HOLDER_OFF: u64 = 176;
+pub const LEASE_SINCE_OFF: u64 = 184;
+pub const LEASE_EXPIRY_OFF: u64 = 192;
+pub const LEASE_TERM_OFF: u64 = 200;
 /// How old a remembered sub-account value may be when a deposit, withdrawal, takeover or crank uses it in place of the
 /// account (30 s). It bounds what a depositor or withdrawer can gain by picking a remembered value over the live one:
 /// the market's move on that sub-account's inventory over this window, on their own share.

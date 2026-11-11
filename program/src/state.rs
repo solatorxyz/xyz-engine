@@ -449,3 +449,21 @@ pub struct VaultLink {
 pub const VAULT_SIZE: usize = core::mem::size_of::<Vault>();
 pub const VDEP_SIZE: usize = core::mem::size_of::<VaultDeposit>();
 pub const VLINK_SIZE: usize = core::mem::size_of::<VaultLink>();
+
+// ---------- signing lease ----------
+pub const DISC_LEASE: u64 = 0x504552504c534501; // "PERPLSE\x01"
+pub const LEASE_MEMBERS: usize = 4;
+/// Which host of a signing key may sign for a slot (spec::IX_LEASE_INIT). `members[holder]` holds the slots
+/// `since..=expiry`; `term` counts how many times the lease changed hands or was taken again after running out.
+#[repr(C)]
+pub struct Lease {
+    pub disc: u64,
+    pub key: Key,
+    pub members: [Key; LEASE_MEMBERS],
+    pub n: u64,
+    pub holder: u64,
+    pub since: u64,
+    pub expiry: u64,
+    pub term: u64,
+}
+pub const LEASE_SIZE: usize = core::mem::size_of::<Lease>();

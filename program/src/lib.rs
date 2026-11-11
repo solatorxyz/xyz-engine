@@ -67,6 +67,17 @@ const _: () = {
             && MAX_LEDGER as u64 * spec::LEDGER_SIZE + spec::SHARD_LEDGER_OFF == spec::SHARD_SIZE
     );
     assert!(
+        LEASE_SIZE as u64 == spec::LEASE_SIZE
+            && LEASE_MEMBERS as u64 == spec::LEASE_MEMBERS
+            && off!(Lease, key) as u64 == spec::LEASE_KEY_OFF
+            && off!(Lease, members) as u64 == spec::LEASE_MEMBERS_OFF
+            && off!(Lease, n) as u64 == spec::LEASE_N_OFF
+            && off!(Lease, holder) as u64 == spec::LEASE_HOLDER_OFF
+            && off!(Lease, since) as u64 == spec::LEASE_SINCE_OFF
+            && off!(Lease, expiry) as u64 == spec::LEASE_EXPIRY_OFF
+            && off!(Lease, term) as u64 == spec::LEASE_TERM_OFF
+    );
+    assert!(
         INS_SIZE as u64 == spec::INSURANCE_SIZE
             && RANK_SIZE as u64 == spec::RANK_SIZE
             && POOL_SIZE as u64 == spec::POOL_SIZE
@@ -116,6 +127,7 @@ mod error;
 mod events;
 mod fast_take;
 mod init;
+mod lease;
 mod liquidation;
 mod margin;
 mod math;
@@ -135,6 +147,7 @@ use error::*;
 use events::*;
 use fast_take::*;
 use init::*;
+use lease::*;
 use liquidation::*;
 use margin::*;
 use math::*;
@@ -234,6 +247,8 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
         spec::IX_VAULT_OPERATOR => vault_operator(pid, accs, data),
         spec::IX_VAULT_MOVE => vault_move(pid, accs, data),
         spec::IX_VAULT_VALUE => vault_value(pid, accs),
+        spec::IX_LEASE_INIT => lease_init(pid, accs, data),
+        spec::IX_LEASE_CLAIM => lease_claim(pid, accs, data),
         spec::IX_ADMIN_EXECUTE => admin_execute(pid, accs),
         IX_AGG_INIT => agg_init(pid, accs, data),
         IX_AGG_POST => agg_post(pid, accs, data),

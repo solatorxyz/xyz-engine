@@ -8,9 +8,10 @@ cost_after_same_side_accumulates_exactly cost_after_flip_rebases_with_the_right_
 liq_needed_at_least_one_lot liq_needed_products_fit band_bps_capped funding_rate_clamped ladder_room_tolerance_cannot_wrap
 ladder_room_inventory_cap ladder_room_fresh_only fast_guard_window_cannot_wrap qpx_pegged_price_exact_or_unusable
 maker_budget_never_negative reduce_ok_bounds_the_worst_fill_reduced off_band_matches_wide_formula
-native_paths_cannot_wrap native_paths_match_wide_small"
+native_paths_cannot_wrap native_paths_match_wide_small
+lease_step_keeps_terms_apart lease_step_refuses_a_second_holder"
 fail=0
-for h in $(grep -h -A2 'kani::proof' src/proofs.rs src/lib.rs | grep -oE 'fn [a-z0-9_]+' | sed 's/fn //' | grep -E "${1:-.}"); do
+for h in $(grep -h -A2 'kani::proof' src/*.rs | grep -oE 'fn [a-z0-9_]+' | sed 's/fn //' | grep -E "${1:-.}"); do
   t0=$(date +%s)
   out=$(timeout "${KANI_LIMIT:-600}" cargo kani --harness "$h" --output-format terse 2>&1); rc=$?
   dt=$(( $(date +%s) - t0 ))

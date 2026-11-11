@@ -72,7 +72,9 @@ fn cost_after_same_side_accumulates_exactly() {
     let want = cost as i128 + paid as i128;
     match cost_after(ob, nb, cost, paid as i128) {
         Ok(c) => assert_eq!(c as i128, want),
-        Err(_) => assert!(want > i64::MAX as i128 || want < i64::MIN as i128),
+        Err(_) => {
+            assert!(want > i64::MAX as i128 || want < i64::MIN as i128)
+        }
     }
 }
 /// A flip re-bases to the new position at this trade's average price: the basis takes the sign of the new position (or 0)
@@ -180,7 +182,7 @@ fn ladder_room_tolerance_cannot_wrap() {
     let f: FastBook = unsafe { core::mem::zeroed() };
     let l = Ladder { ref_px: kani::any(), tol_bps: kani::any(), flags: 0, inv_max: 0, _r1: 0 };
     let (oracle, slot, bid): (u64, u64, bool) = (kani::any(), kani::any(), kani::any());
-    let room = ladder_room(&f, &l, 0, bid, oracle, slot);
+    let room = ladder_room(&f, &l, 0, bid, oracle, slot, kani::any());
     let (r, d) = (l.ref_px as u64, oracle.abs_diff(l.ref_px as u64));
     assert!(d.min(1 << 40).checked_mul(10000).is_some() && r.checked_mul(l.tol_bps as u64).is_some());
     let beyond = d as u128 * 10000 > r as u128 * l.tol_bps as u128;
@@ -204,13 +206,15 @@ fn ladder_room_inventory_cap() {
     let l = Ladder { ref_px: 0, tol_bps: 0, flags: 0, inv_max: kani::any(), _r1: 0 };
     kani::assume(l.inv_max != 0);
     let bid: bool = kani::any();
-    let room = ladder_room(&f, &l, mi, bid, kani::any(), kani::any()) as i128;
+    let room = ladder_room(&f, &l, mi, bid, kani::any(), kani::any(), kani::any()) as i128;
     let inv = f.ext[mi].inv0 as i128 + f.makers[mi].base as i128;
     // taker buys (bid): the maker sells, its short may reach inv_max; taker sells: its long may reach inv_max
     let left = l.inv_max as i128 + if bid { inv } else { -inv };
     assert_eq!(room, left.max(0));
 }
-/// A fresh-only ladder (flags bits 8-15 = N) gives no room without a signed price at most min(N, FAST_PX_MAX_SLOTS) slots old.
+/// A fresh-only ladder (flags bits 8-15 = N) gives an ordinary fill no room without a signed price at most
+/// min(N, FAST_PX_MAX_SLOTS) slots old. A next-price fill (`nx`) is the one exception: it trades at the price signed for
+/// its own slot, which the caller has already verified, so the book's newest price does not gate it.
 #[kani::proof]
 #[kani::solver(cadical)]
 fn ladder_room_fresh_only() {
@@ -219,14 +223,17 @@ fn ladder_room_fresh_only() {
     f.fast_slot = kani::any();
     kani::assume(f.fast_slot < (1 << 62));
     let l = Ladder { ref_px: 0, tol_bps: 0, flags: kani::any(), inv_max: 0, _r1: 0 };
-    let slot: u64 = kani::any();
+    let (slot, nx): (u64, bool) = (kani::any(), kani::any());
     let fr = (l.flags >> spec::LADDER_FRESH_SHIFT) as u64;
-    let room = ladder_room(&f, &l, 0, kani::any(), kani::any(), slot);
-    if fr != 0 && (f.fast_px == 0 || slot > f.fast_slot + fr.min(spec::FAST_PX_MAX_SLOTS)) {
+    let room = ladder_room(&f, &l, 0, kani::any(), kani::any(), slot, nx);
+    if fr != 0 && !nx && (f.fast_px == 0 || slot > f.fast_slot + fr.min(spec::FAST_PX_MAX_SLOTS)) {
         assert_eq!(room, 0);
     }
-    if fr != 0 && room != 0 {
+    if fr != 0 && !nx && room != 0 {
         assert!(f.fast_px != 0 && slot <= f.fast_slot + spec::FAST_PX_MAX_SLOTS);
+    }
+    if fr == 0 || nx {
+        assert_eq!(room, u64::MAX); // no tolerance and no inventory cap on this ladder: nothing else limits it
     }
 }
 /// The default maker guard, as written in slab_first and fast_bbo: g = oracle.min(2^40).wrapping_mul(FAST_GUARD_BPS) / 10000.

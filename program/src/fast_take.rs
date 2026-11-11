@@ -476,9 +476,9 @@ pub(crate) fn fast_match(
 /// boundary on its own terms (see cost_after), same as booking every fill. A take moves at most 2^32 lots at prices < 2^32,
 /// so notional and fees fit u64; the sign is a branch, never an i128 multiply (a software routine on SBF).
 pub(crate) struct Acc {
-    q: u64,
-    nt: u64,
-    fee: u64,
+    pub(crate) q: u64,
+    pub(crate) nt: u64,
+    pub(crate) fee: u64,
 }
 
 impl Acc {
