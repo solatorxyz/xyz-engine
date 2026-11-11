@@ -16,43 +16,84 @@ pub const MAX_POS: usize = 16;
 #[repr(C)]
 pub struct Market {
     pub disc: u64,
-    pub admin: Key, pub mint: Key, pub vault: Key, pub insurance: Key, pub oracle: Key, pub feed_id: Key,
-    pub vault_bump: u64, pub bucket_width: u64, pub imr_bps: u64, pub mmr_bps: u64,
-    pub max_staleness_slots: u64, pub max_conf_bps: u64, pub max_age_secs: u64,
-    pub expo: i64, pub px_mul: i64, pub px_div: i64,
-    pub oracle_px: u64, pub oracle_conf: u64, pub oracle_slot: u64,
-    pub funding_index: i64, pub funding_rate: i64, pub funding_slot: u64,
+    pub admin: Key,
+    pub mint: Key,
+    pub vault: Key,
+    pub insurance: Key,
+    pub oracle: Key,
+    pub feed_id: Key,
+    pub vault_bump: u64,
+    pub bucket_width: u64,
+    pub imr_bps: u64,
+    pub mmr_bps: u64,
+    pub max_staleness_slots: u64,
+    pub max_conf_bps: u64,
+    pub max_age_secs: u64,
+    pub expo: i64,
+    pub px_mul: i64,
+    pub px_div: i64,
+    pub oracle_px: u64,
+    pub oracle_conf: u64,
+    pub oracle_slot: u64,
+    pub funding_index: i64,
+    pub funding_rate: i64,
+    pub funding_slot: u64,
     /// Long open interest, aggregated LAZILY from shard counters (not written per trade).
-    pub oi_long: u64, pub max_oi: u64, pub fees: i64,
+    pub oi_long: u64,
+    pub max_oi: u64,
+    pub fees: i64,
     /// admin: 1 = paused (no new risk/deposits; cancels, reduce-only, withdraw, liquidation still work)
     /// event_seq: slot of the last book sample (mark EMA weight); the name is kept for the layout
-    pub paused: u64, pub tvl_cap: u64, pub event_seq: u64,
+    pub paused: u64,
+    pub tvl_cap: u64,
+    pub event_seq: u64,
     /// AUDIT L-4: Pyth publish_time of the stored price (freshness checked at use time, monotonic updates)
     pub oracle_ts: i64,
     /// optional second oracle (PriceUpdateV2, own feed id) used as fallback / divergence circuit breaker
-    pub oracle2: Key, pub feed_id2: Key, pub oracle2_px: u64,
+    pub oracle2: Key,
+    pub feed_id2: Key,
+    pub oracle2_px: u64,
     /// shards created (order ids are shard_no << 40 | seq, AUDIT L-3)
     pub n_shards: u64,
     /// on-chain ADL ranking account (AUDIT M-5); bad debt not absorbable by insurance/counterparty
-    pub adl_rank: Key, pub bad_debt: i64,
+    pub adl_rank: Key,
+    pub bad_debt: i64,
     /// funding v4: remainder (quote*ppb*slots), premium TWAP accumulator, last sample, period start/len, impact notional
-    pub funding_rem: i64, pub prem_acc: i64, pub prem_slots: u64, pub prem_last: i64, pub period_start: u64, pub funding_period: u64, pub impact_notional: u64,
+    pub funding_rem: i64,
+    pub prem_acc: i64,
+    pub prem_slots: u64,
+    pub prem_last: i64,
+    pub period_start: u64,
+    pub funding_period: u64,
+    pub impact_notional: u64,
     /// mark = median(oracle, oracle + EMA(mid - oracle), mid)
-    pub mark_px: u64, pub mark_ema: i64,
+    pub mark_px: u64,
+    pub mark_ema: i64,
     /// collateral pool (zero = market-owned vault); PDA seed key for the vault authority
-    pub pool: Key, pub vault_seed: Key,
+    pub pool: Key,
+    pub vault_seed: Key,
     /// per-account max |position| (lots), 0 = none
     pub max_position: u64,
     /// timelocked admin change: op, value, earliest slot, key (new admin / oracle2)
-    pub pending_op: u64, pub pending_val: u64, pub pending_eta: u64, pub pending_key: Key,
+    pub pending_op: u64,
+    pub pending_val: u64,
+    pub pending_eta: u64,
+    pub pending_key: Key,
     /// resting-book shards per side; strict_take = 1 makes takers prove they saw every opposite shard
-    pub n_side: [u64; 2], pub strict_take: u64,
+    pub n_side: [u64; 2],
+    pub strict_take: u64,
     /// discovery bounds: mark stays within bound_ref +- bound_bps; while closed the reference re-anchors up to bound_max times per direction
-    pub bound_ref: u64, pub bound_bps: u64, pub bound_thresh_bps: u64, pub bound_max: u64, pub bound_up: u64, pub bound_dn: u64,
+    pub bound_ref: u64,
+    pub bound_bps: u64,
+    pub bound_thresh_bps: u64,
+    pub bound_max: u64,
+    pub bound_up: u64,
+    pub bound_dn: u64,
     /// 0 = external market open, 1 = closed (internal pricing)
     pub session: u64,
     /// external perp consensus price and its publish time
-    pub ext_px: u64, pub ext_ts: i64,
+    pub ext_px: u64,
+    pub ext_ts: i64,
     /// key allowed to flip `session` (the keeper), besides the admin
     pub session_auth: Key,
     /// The market's FastBooks: [0] takes sells (makers' bids), [1] takes buys (makers' asks); a both-sides book sits in both.
@@ -62,13 +103,23 @@ pub struct Market {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Order { pub id: u64, pub owner: Key, pub price: u64, pub qty: u64, pub expiry_slot: u64, pub band_bps: u64,
+pub struct Order {
+    pub id: u64,
+    pub owner: Key,
+    pub price: u64,
+    pub qty: u64,
+    pub expiry_slot: u64,
+    pub band_bps: u64,
     /// client order id
     pub cid: u64,
     /// kind (bits 0-7) | maker rebate bps snapshot (8-15) | spline levels n (16-23) | current level (24-31)
     pub meta: u64,
     /// peg: a1 offset, a2 min, a3 max. spline: a1 step, a2 base qty, a3 qty step.
-    pub a1: i64, pub a2: u64, pub a3: u64, pub lvl_left: u64 }
+    pub a1: i64,
+    pub a2: u64,
+    pub a3: u64,
+    pub lvl_left: u64,
+}
 
 /// Maker fills owed to a user account; claimed lazily when the maker touches the shard.
 #[repr(C)]
@@ -76,14 +127,28 @@ pub struct Order { pub id: u64, pub owner: Key, pub price: u64, pub qty: u64, pu
 /// `fund` = sum over the unclaimed fills of (signed lots x the market's funding index at the fill). The lots wait here until the
 /// owner's next claim; the claim uses it so they pay or receive funding from their fill on, not from whenever the owner's
 /// position was last settled. (Maker volume is |base|: a shard is one side, so every fill has the same sign.)
-pub struct Ledger { pub owner: Key, pub base: i64, pub quote: i64, pub open_reduce: u64, pub fund: i64, pub n_closed: u64 }
+pub struct Ledger {
+    pub owner: Key,
+    pub base: i64,
+    pub quote: i64,
+    pub open_reduce: u64,
+    pub fund: i64,
+    pub n_closed: u64,
+}
 
 #[repr(C)]
 pub struct Shard {
-    pub disc: u64, pub market: Key,
-    pub side: u64, pub lo: u64, pub width: u64, pub seq: u64, pub n: u64, pub nled: u64,
+    pub disc: u64,
+    pub market: Key,
+    pub side: u64,
+    pub lo: u64,
+    pub width: u64,
+    pub seq: u64,
+    pub n: u64,
+    pub nled: u64,
     /// Per-shard accumulators (moved off the Market write path).
-    pub oi_long_delta: i64, pub fee_accum: i64,
+    pub oi_long_delta: i64,
+    pub fee_accum: i64,
     /// per-market shard number (high bits of order ids)
     pub shard_no: u64,
     pub orders: [Order; MAX_ORDERS],
@@ -92,23 +157,44 @@ pub struct Shard {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Pos { pub market: Key, pub base: i64, pub funding_snap: i64, pub bid_open: u64, pub ask_open: u64,
+pub struct Pos {
+    pub market: Key,
+    pub base: i64,
+    pub funding_snap: i64,
+    pub bid_open: u64,
+    pub ask_open: u64,
     /// resting orders + unclaimed closed orders in this market (cap MAX_OPEN_ORDERS_PER_MARKET bounds shards a liquidator must pass)
     pub n_orders: u64,
     /// net quote paid since the position was opened (PnL = base*mark - cost); reset when flat. ADL ranking.
     pub cost: i64,
     /// isolated margin allocated to this position (flags & POS_FLAG_ISOLATED)
-    pub iso_margin: i64, pub flags: u64 }
+    pub iso_margin: i64,
+    pub flags: u64,
+}
 
 /// TP/SL (reduce-only, one-shot) or TWAP (slice every `interval` slots); executed by a permissionless keeper.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Trigger { pub market: Key, pub kind: u64, pub side: u64, pub trigger_px: u64, pub limit_px: u64, pub qty: u64, pub tip: u64,
-    pub interval: u64, pub next_slot: u64, pub slices_left: u64 }
+pub struct Trigger {
+    pub market: Key,
+    pub kind: u64,
+    pub side: u64,
+    pub trigger_px: u64,
+    pub limit_px: u64,
+    pub qty: u64,
+    pub tip: u64,
+    pub interval: u64,
+    pub next_slot: u64,
+    pub slices_left: u64,
+}
 
 #[repr(C)]
 pub struct User {
-    pub disc: u64, pub authority: Key, pub cash: i64, pub tier: u64, pub maker_volume: u64,
+    pub disc: u64,
+    pub authority: Key,
+    pub cash: i64,
+    pub tier: u64,
+    pub maker_volume: u64,
     /// collateral vault this account is bound to (set on first deposit). Cash is only valid against this vault.
     pub home_vault: Key,
     pub pos: [Pos; MAX_POS],
@@ -116,25 +202,52 @@ pub struct User {
 }
 
 #[repr(C)]
-pub struct Insurance { pub disc: u64, pub market: Key, pub balance: i64,
+pub struct Insurance {
+    pub disc: u64,
+    pub market: Key,
+    pub balance: i64,
     /// OI change from liquidation takeovers (folded by `aggregate`, keeps Market read-only in liquidate)
-    pub oi_long_delta: i64 }
+    pub oi_long_delta: i64,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct RankEntry { pub user: Key, pub score: i64 }
+pub struct RankEntry {
+    pub user: Key,
+    pub score: i64,
+}
 /// ADL queue: top RANK_N profitable+leveraged accounts per side (0 = long, 1 = short), score desc.
 #[repr(C)]
-pub struct Rank { pub disc: u64, pub market: Key, pub n_long: u64, pub n_short: u64, pub entries: [RankEntry; 2 * RANK_N] }
+pub struct Rank {
+    pub disc: u64,
+    pub market: Key,
+    pub n_long: u64,
+    pub n_short: u64,
+    pub entries: [RankEntry; 2 * RANK_N],
+}
 
 /// Pooled collateral: one vault shared by admin-approved markets (cross-margin across markets).
 #[repr(C)]
-pub struct Pool { pub disc: u64, pub admin: Key, pub mint: Key, pub vault: Key, pub vault_bump: u64, pub n_markets: u64,
+pub struct Pool {
+    pub disc: u64,
+    pub admin: Key,
+    pub mint: Key,
+    pub vault: Key,
+    pub vault_bump: u64,
+    pub n_markets: u64,
     /// AUDIT N-6: market admission is timelocked (pool_propose -> init_market after eta) and exposure-capped
-    pub pending_market: Key, pub pending_eta: u64, pub max_market_oi: u64 }
+    pub pending_market: Key,
+    pub pending_eta: u64,
+    pub max_market_oi: u64,
+}
 /// m-of-n admin: a market/pool admin key may be the address of this account; signers among keys authorize.
 #[repr(C)]
-pub struct Multisig { pub disc: u64, pub m: u64, pub n: u64, pub keys: [Key; 8] }
+pub struct Multisig {
+    pub disc: u64,
+    pub m: u64,
+    pub n: u64,
+    pub keys: [Key; 8],
+}
 pub const DISC_MULTISIG: u64 = 0x504552504d534701;
 pub const MULTISIG_SIZE: usize = core::mem::size_of::<Multisig>();
 
@@ -164,7 +277,13 @@ pub const DISC_DELEGATE: u64 = 0x5045525044454c01; // "PERPDEL\x01"
 /// Session key / one-click trading: `delegate` may place and cancel orders for `user` until `expiry_slot`,
 /// each order qty <= `max_qty`. It can never withdraw, transfer, change margin mode or set triggers (those stay authority-only).
 #[repr(C)]
-pub struct Delegate { pub disc: u64, pub user: Key, pub delegate: Key, pub expiry_slot: u64, pub max_qty: u64 }
+pub struct Delegate {
+    pub disc: u64,
+    pub user: Key,
+    pub delegate: Key,
+    pub expiry_slot: u64,
+    pub max_qty: u64,
+}
 pub const DELEGATE_SIZE: usize = core::mem::size_of::<Delegate>();
 
 // ---------- fast quote path ----------
@@ -175,47 +294,94 @@ pub const SLAB_LEVELS: usize = 8;
 pub const FAST_MAKERS: usize = 8;
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Quote { pub px: u32, pub qty: u32, pub gen: u32, pub slot: u32 }
+pub struct Quote {
+    pub px: u32,
+    pub qty: u32,
+    pub gen: u32,
+    pub slot: u32,
+}
 pub const SLAB_LADDERS: usize = SLAB_QUOTES / SLAB_LEVELS;
 /// A maker's protection for one ladder (market, side). ref_px / tol_bps: the ladder stops filling once the oracle is more than
 /// tol_bps away from the oracle price the maker quoted against (0 = off). inv_max: the ladder stops filling once the maker's
 /// inventory in this market would pass inv_max lots long (bid ladder) or short (ask ladder) (0 = off). flags: spec::LADDER_PEG.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Ladder { pub ref_px: u32, pub tol_bps: u16, pub flags: u16, pub inv_max: u32, pub _r1: u32 }
+pub struct Ladder {
+    pub ref_px: u32,
+    pub tol_bps: u16,
+    pub flags: u16,
+    pub inv_max: u32,
+    pub _r1: u32,
+}
 /// A maker's quotes for every market: written by the maker alone, read by takers. Index = market idx << 4 | side << 3 | level.
 #[repr(C)]
-pub struct Slab { pub disc: u64, pub authority: Key, pub user: Key, pub gen: u64, pub count: u64, pub kill: u64, pub quotes: [Quote; SLAB_QUOTES],
+pub struct Slab {
+    pub disc: u64,
+    pub authority: Key,
+    pub user: Key,
+    pub gen: u64,
+    pub count: u64,
+    pub kill: u64,
+    pub quotes: [Quote; SLAB_QUOTES],
     pub lad: [Ladder; SLAB_LADDERS],
     /// Market each quote block (FastBook idx) belongs to, written when the admin approves the slab on a book. Takes check it,
     /// so a block quoted for one market can never fill on another market's book that happens to use the same idx.
-    pub idx_market: [Key; SLAB_IDX] }
+    pub idx_market: [Key; SLAB_IDX],
+}
 pub const SLAB_IDX: usize = SLAB_QUOTES / (2 * SLAB_LEVELS);
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct Used { pub gen: u32, pub qty: u32 }
+pub struct Used {
+    pub gen: u32,
+    pub qty: u32,
+}
 /// Margin locked for quoting here, the notional it may still fill, and fills not yet moved to the maker's User.
 #[repr(C)]
 #[derive(Clone, Copy)]
 /// target > 0: auto mode, settle moves margin toward target from free collateral and hands it back when the account needs it.
 /// `fund` = sum over the unsettled fills of (signed lots x the funding index at the fill), used by the settle the same way as
 /// Ledger.fund. The maker's unsettled volume (lots) lives in the high 48 bits of its MakerExt.rebate_bps.
-pub struct FastMaker { pub slab: Key, pub user: Key, pub margin: i64, pub budget: i64, pub base: i64, pub quote: i64, pub fund: i64, pub target: i64 }
+pub struct FastMaker {
+    pub slab: Key,
+    pub user: Key,
+    pub margin: i64,
+    pub budget: i64,
+    pub base: i64,
+    pub quote: i64,
+    pub fund: i64,
+    pub target: i64,
+}
 /// Copied from the maker's User at every settle / fund: its position in this market (inventory = inv0 + unsettled base) and
 /// its maker rebate in bps.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct MakerExt { pub inv0: i64, /** low 16 bits: rebate in bps; high 48: lots filled since the last settle */ pub rebate_bps: u64 }
+pub struct MakerExt {
+    pub inv0: i64,
+    /** low 16 bits: rebate in bps; high 48: lots filled since the last settle */
+    pub rebate_bps: u64,
+}
 /// Per-market fill state: takers write here, so quotes and fills never contend on a write lock.
 #[repr(C)]
-pub struct FastBook { pub disc: u64, pub market: Key, pub idx: u64, pub n: u64, pub oi_long_delta: i64, pub fee_accum: i64, pub fills: u64,
-    pub makers: [FastMaker; FAST_MAKERS], pub used: [[Used; 2 * SLAB_LEVELS]; FAST_MAKERS],
+pub struct FastBook {
+    pub disc: u64,
+    pub market: Key,
+    pub idx: u64,
+    pub n: u64,
+    pub oi_long_delta: i64,
+    pub fee_accum: i64,
+    pub fills: u64,
+    pub makers: [FastMaker; FAST_MAKERS],
+    pub used: [[Used; 2 * SLAB_LEVELS]; FAST_MAKERS],
     /// 0 = both sides; 1 = makers' bids only (sellers write here); 2 = makers' asks only (buyers write here).
     /// A split market has one book per side, so buys and sells never contend for the same write lock.
     pub side: u64,
     pub ext: [MakerExt; FAST_MAKERS],
     /// key whose signed prices this book takes (zero = none) and the newest one seen: price, signer's slot, signer's ms clock
-    pub px_signer: Key, pub fast_px: u64, pub fast_slot: u64, pub fast_ts: u64 }
+    pub px_signer: Key,
+    pub fast_px: u64,
+    pub fast_slot: u64,
+    pub fast_ts: u64,
+}
 pub const SLAB_SIZE: usize = core::mem::size_of::<Slab>();
 pub const FAST_SIZE: usize = core::mem::size_of::<FastBook>();
 
@@ -227,27 +393,59 @@ pub const VAULT_SUBS: usize = 32;
 /// Liquidity, insurance and liquidation takeover in one pool. Positions sit in program-controlled User sub-accounts
 /// (authority = this account); subs[0] holds the idle cash. Sub-accounts in `active` must be passed to price the vault.
 #[repr(C)]
-pub struct Vault { pub disc: u64, pub admin: Key, pub token_vault: Key, pub shares: u64, pub nav: i64, pub peak_nav: i64, pub nav_slot: u64,
-    pub lockup_slots: u64, pub day_cap_bps: u64, pub perf_bps: u64, pub dd_bps: u64, pub halted: u64, pub day_start: u64, pub day_out: i64,
-    pub active: u64, pub n_subs: u64, pub subs: [Key; VAULT_SUBS],
+pub struct Vault {
+    pub disc: u64,
+    pub admin: Key,
+    pub token_vault: Key,
+    pub shares: u64,
+    pub nav: i64,
+    pub peak_nav: i64,
+    pub nav_slot: u64,
+    pub lockup_slots: u64,
+    pub day_cap_bps: u64,
+    pub perf_bps: u64,
+    pub dd_bps: u64,
+    pub halted: u64,
+    pub day_start: u64,
+    pub day_out: i64,
+    pub active: u64,
+    pub n_subs: u64,
+    pub subs: [Key; VAULT_SUBS],
     /// The vault as a maker. `operator` (zero = none) is the hot key that writes the quotes of the vault's slabs and nothing
     /// else: it can never move value out. Every quote it writes must be pegged to the book's price and on its own side of it
     /// (an ask at or above, a bid at or below), and, when the admin asks for it:
     /// q_min_edge_bps: at least this far from the price, measured on the ladder's reference price (the ladder then needs a
     /// tolerance, at most q_max_tol_bps when that is set, so the reference stays near the price);
     /// q_fresh != 0: the ladder fills only against a recent signed price.
-    pub operator: Key, pub q_min_edge_bps: u64, pub q_max_tol_bps: u64, pub q_fresh: u64,
+    pub operator: Key,
+    pub q_min_edge_bps: u64,
+    pub q_max_tol_bps: u64,
+    pub q_fresh: u64,
     /// The vault's value, kept in parts. A vault that quotes many markets has more accounts than one transaction can carry,
     /// so each sub-account is valued on its own (vault_value, or whenever it is passed to an instruction that values the
     /// vault): `sub_eq` is what it was worth at slot `sub_slot`. A deposit or withdrawal may use a part instead of the
     /// account itself only while it is at most VAULT_VALUE_MAX_AGE_SLOTS old. Cash moved between sub-accounts, deposited
     /// or withdrawn is applied to the parts on the spot, so a part is only ever out of date by what the market did since.
-    pub sub_eq: [i64; VAULT_SUBS], pub sub_slot: [u64; VAULT_SUBS] }
+    pub sub_eq: [i64; VAULT_SUBS],
+    pub sub_slot: [u64; VAULT_SUBS],
+}
 #[repr(C)]
-pub struct VaultDeposit { pub disc: u64, pub vault: Key, pub owner: Key, pub shares: u64, pub unlock_slot: u64, pub basis: i64 }
+pub struct VaultDeposit {
+    pub disc: u64,
+    pub vault: Key,
+    pub owner: Key,
+    pub shares: u64,
+    pub unlock_slot: u64,
+    pub basis: i64,
+}
 /// Markets the vault may take positions in, with an inventory cap as bps of NAV.
 #[repr(C)]
-pub struct VaultLink { pub disc: u64, pub vault: Key, pub market: Key, pub cap_bps: u64 }
+pub struct VaultLink {
+    pub disc: u64,
+    pub vault: Key,
+    pub market: Key,
+    pub cap_bps: u64,
+}
 pub const VAULT_SIZE: usize = core::mem::size_of::<Vault>();
 pub const VDEP_SIZE: usize = core::mem::size_of::<VaultDeposit>();
 pub const VLINK_SIZE: usize = core::mem::size_of::<VaultLink>();

@@ -27,7 +27,11 @@ fn np_value_is_min_of_value_and_cost() {
     let mv = mulf(base as i128, px);
     let v = np_value(base, cost, px);
     assert!(v <= mv && v <= cost as i128);
-    if mv > cost as i128 { assert_eq!(v, cost as i128); } else { assert_eq!(v, mv); }
+    if mv > cost as i128 {
+        assert_eq!(v, cost as i128);
+    } else {
+        assert_eq!(v, mv);
+    }
 }
 /// The wide path of mulf (|a| >= 2^32) at a reduced width: exact product, no overflow. At full width the same expression
 /// is bounded by 2^63 * 2^64 < 2^127.
@@ -47,9 +51,14 @@ fn mulf_wide_path_reduced() {
 fn np_value_never_credits_a_gain_reduced() {
     let (base, cost, px): (i64, i64, u64) = (kani::any(), kani::any(), kani::any());
     kani::assume(base.unsigned_abs() < (1u64 << 16) && px < (1u64 << 20));
-    let mv = base as i128 * px as i128; let v = np_value(base, cost, px);
+    let mv = base as i128 * px as i128;
+    let v = np_value(base, cost, px);
     assert!(v <= mv && v <= cost as i128);
-    if mv <= cost as i128 { assert_eq!(v, mv); } else { assert_eq!(v, cost as i128); }
+    if mv <= cost as i128 {
+        assert_eq!(v, mv);
+    } else {
+        assert_eq!(v, cost as i128);
+    }
     assert_eq!(mv - v, (mv - cost as i128).max(0));
 }
 
@@ -107,9 +116,13 @@ fn liq_needed_at_least_one_lot() {
     assert!(q >= 1);
     let worst = LIQ_FEE_BPS << (LIQ_BOOK_BAND_STEPS - 1);
     // a ratio at or below 4/5 of the worst liquidation fee gives no relief: the whole position (u64::MAX, capped by callers)
-    if 5 * mmr <= 4 * worst { assert_eq!(q, u64::MAX); }
+    if 5 * mmr <= 4 * worst {
+        assert_eq!(q, u64::MAX);
+    }
     // an account at or above 1.25 x maintenance needs only the minimum lot
-    if 4 * eq as i128 >= 5 * mm as i128 && 5 * mmr > 4 * worst { assert_eq!(q, 1); }
+    if 4 * eq as i128 >= 5 * mm as i128 && 5 * mmr > 4 * worst {
+        assert_eq!(q, 1);
+    }
 }
 /// The products inside liq_needed at the widths the program can reach: |eq|, mm < 2^62 (an i64 of quote), up to 2^32 lots
 /// at prices below 2^32, ratio up to 100%: nothing overflows i128.
@@ -125,7 +138,9 @@ fn liq_needed_products_fit() {
     let relief = n.checked_mul(5 * mmr as i128 - 4 * worst_fee).unwrap();
     let deficit = (5 * mm as i128 - 4 * eq as i128).max(0).checked_mul(10000).unwrap();
     let num = deficit.checked_mul(ab as i128).unwrap();
-    if relief > 0 { assert!(num.checked_add(relief - 1).is_some()); }
+    if relief > 0 {
+        assert!(num.checked_add(relief - 1).is_some());
+    }
 }
 
 // ---------- oracle band, funding clamp ----------
@@ -134,10 +149,13 @@ fn liq_needed_products_fit() {
 #[kani::solver(cadical)]
 fn band_bps_capped() {
     let mut m: Market = unsafe { core::mem::zeroed() };
-    m.oracle_px = kani::any(); m.oracle_conf = kani::any();
+    m.oracle_px = kani::any();
+    m.oracle_conf = kani::any();
     let b = band_bps(&m);
     assert!(b <= spec::BAND_MAX_BPS);
-    if m.oracle_px == 0 || m.oracle_conf == 0 { assert_eq!(b, 0); }
+    if m.oracle_px == 0 || m.oracle_conf == 0 {
+        assert_eq!(b, 0);
+    }
 }
 /// The funding rate is clamped to +-FUNDING_MAX_RATE_HOURLY_PPB for every accumulator and sample count, never panics, and
 /// with no samples (or a zero premium) is the interest term alone.
@@ -147,7 +165,9 @@ fn funding_rate_clamped() {
     let (acc, n): (i64, u64) = (kani::any(), kani::any());
     let r = funding_rate_from(acc, n);
     assert!(r >= -(FUNDING_MAX_RATE_HOURLY_PPB as i64) && r <= FUNDING_MAX_RATE_HOURLY_PPB as i64);
-    if n == 0 || acc == 0 { assert_eq!(r, (FUNDING_INTEREST_8H_PPB / FUNDING_HOURS_PER_8H) as i64); }
+    if n == 0 || acc == 0 {
+        assert_eq!(r, (FUNDING_INTEREST_8H_PPB / FUNDING_HOURS_PER_8H) as i64);
+    }
 }
 
 // ---------- fast path: ladder tolerance, default maker guard, pegged price, maker budget ----------
@@ -164,7 +184,11 @@ fn ladder_room_tolerance_cannot_wrap() {
     let (r, d) = (l.ref_px as u64, oracle.abs_diff(l.ref_px as u64));
     assert!(d.min(1 << 40).checked_mul(10000).is_some() && r.checked_mul(l.tol_bps as u64).is_some());
     let beyond = d as u128 * 10000 > r as u128 * l.tol_bps as u128;
-    if l.tol_bps != 0 && beyond { assert_eq!(room, 0); } else { assert_eq!(room, u64::MAX); }
+    if l.tol_bps != 0 && beyond {
+        assert_eq!(room, 0);
+    } else {
+        assert_eq!(room, u64::MAX);
+    }
 }
 /// With an inventory cap the room is exactly what the cap leaves on that side (never negative), for inventories whose sum
 /// cannot overflow (|position|, |unsettled| < 2^61).
@@ -172,8 +196,10 @@ fn ladder_room_tolerance_cannot_wrap() {
 #[kani::solver(cadical)]
 fn ladder_room_inventory_cap() {
     let mut f: FastBook = unsafe { core::mem::zeroed() };
-    let mi: usize = kani::any(); kani::assume(mi < FAST_MAKERS);
-    f.ext[mi].inv0 = kani::any(); f.makers[mi].base = kani::any();
+    let mi: usize = kani::any();
+    kani::assume(mi < FAST_MAKERS);
+    f.ext[mi].inv0 = kani::any();
+    f.makers[mi].base = kani::any();
     kani::assume(f.ext[mi].inv0.unsigned_abs() < (1 << 61) && f.makers[mi].base.unsigned_abs() < (1 << 61));
     let l = Ladder { ref_px: 0, tol_bps: 0, flags: 0, inv_max: kani::any(), _r1: 0 };
     kani::assume(l.inv_max != 0);
@@ -189,14 +215,19 @@ fn ladder_room_inventory_cap() {
 #[kani::solver(cadical)]
 fn ladder_room_fresh_only() {
     let mut f: FastBook = unsafe { core::mem::zeroed() };
-    f.fast_px = kani::any(); f.fast_slot = kani::any();
+    f.fast_px = kani::any();
+    f.fast_slot = kani::any();
     kani::assume(f.fast_slot < (1 << 62));
     let l = Ladder { ref_px: 0, tol_bps: 0, flags: kani::any(), inv_max: 0, _r1: 0 };
     let slot: u64 = kani::any();
     let fr = (l.flags >> spec::LADDER_FRESH_SHIFT) as u64;
     let room = ladder_room(&f, &l, 0, kani::any(), kani::any(), slot);
-    if fr != 0 && (f.fast_px == 0 || slot > f.fast_slot + fr.min(spec::FAST_PX_MAX_SLOTS)) { assert_eq!(room, 0); }
-    if fr != 0 && room != 0 { assert!(f.fast_px != 0 && slot <= f.fast_slot + spec::FAST_PX_MAX_SLOTS); }
+    if fr != 0 && (f.fast_px == 0 || slot > f.fast_slot + fr.min(spec::FAST_PX_MAX_SLOTS)) {
+        assert_eq!(room, 0);
+    }
+    if fr != 0 && room != 0 {
+        assert!(f.fast_px != 0 && slot <= f.fast_slot + spec::FAST_PX_MAX_SLOTS);
+    }
 }
 /// The default maker guard, as written in slab_first and fast_bbo: g = oracle.min(2^40).wrapping_mul(FAST_GUARD_BPS) / 10000.
 /// The multiply never wraps, g is at most FAST_GUARD_BPS of the price (exactly its floor up to 2^40), and
@@ -210,7 +241,10 @@ fn fast_guard_window_cannot_wrap() {
     let (glo, ghi) = (oracle.saturating_sub(g), oracle.saturating_add(g));
     assert!(glo <= oracle && oracle <= ghi);
     assert!(g as u128 * 10000 <= oracle as u128 * spec::FAST_GUARD_BPS as u128);
-    if oracle <= (1 << 40) { assert_eq!(g as u128, oracle as u128 * spec::FAST_GUARD_BPS as u128 / 10000); assert_eq!(glo, oracle - g); }
+    if oracle <= (1 << 40) {
+        assert_eq!(g as u128, oracle as u128 * spec::FAST_GUARD_BPS as u128 / 10000);
+        assert_eq!(glo, oracle - g);
+    }
 }
 /// A pegged level prices at book price + offset - QUOTE_PEG_BIAS when that lies in (0, 2^32), else it is unusable (0);
 /// a fixed level is its own px. Book prices below 2^62.
@@ -219,9 +253,18 @@ fn qpx_pegged_price_exact_or_unusable() {
     let (px, oracle, peg): (u32, u64, bool) = (kani::any(), kani::any(), kani::any());
     let p = qpx(px, oracle, peg);
     assert!(p < (1 << 32));
-    if !peg { assert_eq!(p, px as u64); return; }
+    if !peg {
+        assert_eq!(p, px as u64);
+        return;
+    }
     let want = oracle as i128 + px as i128 - spec::QUOTE_PEG_BIAS as i128;
-    if oracle < (1 << 62) { if want > 0 && want < (1i128 << 32) { assert_eq!(p as i128, want); } else { assert_eq!(p, 0); } }
+    if oracle < (1 << 62) {
+        if want > 0 && want < (1i128 << 32) {
+            assert_eq!(p as i128, want);
+        } else {
+            assert_eq!(p, 0);
+        }
+    }
 }
 /// The quoting budget is margin x 10000 / IMR: never negative, 0 for no (or negative) margin, at least the margin.
 /// 16-bit margin, IMR from 1 bps to 100% (the any-i64 version did not finish; the i64 conversion saturates by construction).
@@ -234,7 +277,11 @@ fn maker_budget_never_negative() {
     m.imr_bps = imr as u64;
     let b = maker_budget(&m, margin as i64);
     assert!(b >= 0);
-    if margin <= 0 { assert_eq!(b, 0); } else { assert!(b >= margin as i64); }
+    if margin <= 0 {
+        assert_eq!(b, 0);
+    } else {
+        assert!(b >= margin as i64);
+    }
 }
 /// reduce_ok (batch reduce-only pre-check): when it passes, equity after the worst fill (slip at the worst price plus the
 /// taker fee rounded up) is not negative; no panic (12-bit lots, 20-bit prices, fee up to 1%).
@@ -243,7 +290,9 @@ fn maker_budget_never_negative() {
 fn reduce_ok_bounds_the_worst_fill_reduced() {
     let eq: i64 = kani::any();
     let (px0, worst, qty, bps): (u64, u64, u64, u64) = (kani::any(), kani::any(), kani::any(), kani::any());
-    kani::assume(px0 < (1 << 20) && worst < (1 << 20) && qty < (1 << 12) && bps <= 100 && eq.unsigned_abs() < (1 << 40));
+    kani::assume(
+        px0 < (1 << 20) && worst < (1 << 20) && qty < (1 << 12) && bps <= 100 && eq.unsigned_abs() < (1 << 40),
+    );
     if reduce_ok(eq as i128, 0, px0, worst, qty, bps) {
         let slip = qty as i128 * (px0 as i128 - worst as i128).abs();
         let fee_up = (qty as i128 * worst as i128 * bps as i128 + 9999) / 10000;

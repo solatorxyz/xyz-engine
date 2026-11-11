@@ -1,0 +1,4 @@
+# One style for the whole workspace. Wider than the default because the program's signatures carry the same five or six
+# account and clock arguments everywhere; at 100 columns most of them would wrap and the arithmetic would be harder to read.
+max_width = 120
+use_small_heuristics = "Max"
