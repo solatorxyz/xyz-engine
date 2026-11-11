@@ -3,26 +3,58 @@
 mod state;
 // OracleSet (IX 43): median of several independent aggregated publishers with a quorum.
 include!("common.rs");
-const BAD_DATA: u32 = 2; const E_ORACLE: u32 = 8;
+const BAD_DATA: u32 = 2;
+const E_ORACLE: u32 = 8;
 fn try_send(e: &mut Env, accounts: Vec<AccountMeta>, data: Vec<u8>, signers: &[&Keypair]) -> Option<u32> {
     let ix = Instruction { program_id: e.pid, accounts, data };
-    let mut s: Vec<&Keypair> = vec![&e.admin]; s.extend_from_slice(signers);
+    let mut s: Vec<&Keypair> = vec![&e.admin];
+    s.extend_from_slice(signers);
     let tx = Transaction::new_signed_with_payer(&[ix], Some(&e.admin.pubkey()), &s, e.svm.latest_blockhash());
-    let r = e.svm.send_transaction(tx); e.svm.expire_blockhash();
-    match r { Ok(_) => None, Err(f) => { let s = format!("{:?}", f.err);
-        Some(s.split("Custom(").nth(1).and_then(|x| x.split(')').next()).and_then(|x| x.parse().ok()).unwrap_or(u32::MAX)) } }
+    let r = e.svm.send_transaction(tx);
+    e.svm.expire_blockhash();
+    match r {
+        Ok(_) => None,
+        Err(f) => {
+            let s = format!("{:?}", f.err);
+            Some(
+                s.split("Custom(")
+                    .nth(1)
+                    .and_then(|x| x.split(')').next())
+                    .and_then(|x| x.parse().ok())
+                    .unwrap_or(u32::MAX),
+            )
+        }
+    }
 }
-fn post(px: i64, ts: i64) -> Vec<u8> { let mut d = vec![41u8]; for v in [px, 1_000_000, ts, 3] { d.extend_from_slice(&v.to_le_bytes()); } d }
+fn post(px: i64, ts: i64) -> Vec<u8> {
+    let mut d = vec![41u8];
+    for v in [px, 1_000_000, ts, 3] {
+        d.extend_from_slice(&v.to_le_bytes());
+    }
+    d
+}
 fn member(e: &mut Env, k: &Keypair) -> Address {
-    let a = Address::new_unique(); e.prog_acct(a, state::AGG_SIZE);
-    let mut d = vec![40u8]; d.extend_from_slice(&e.feed); d.extend_from_slice(&(-8i32).to_le_bytes()); d.extend_from_slice(&2000u64.to_le_bytes());
+    let a = Address::new_unique();
+    e.prog_acct(a, state::AGG_SIZE);
+    let mut d = vec![40u8];
+    d.extend_from_slice(&e.feed);
+    d.extend_from_slice(&(-8i32).to_le_bytes());
+    d.extend_from_slice(&2000u64.to_le_bytes());
     assert_eq!(try_send(e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], d, &[k]), None);
     a
 }
-fn oset_ix(q: u8, ms: &[Address]) -> Vec<u8> { let mut d = vec![43u8, q, ms.len() as u8]; for m in ms { d.extend_from_slice(m.as_ref()); } d }
+fn oset_ix(q: u8, ms: &[Address]) -> Vec<u8> {
+    let mut d = vec![43u8, q, ms.len() as u8];
+    for m in ms {
+        d.extend_from_slice(m.as_ref());
+    }
+    d
+}
 /// Market oracle becomes an OracleSet of 3 publishers, quorum 2.
 fn set_env() -> (Env, Vec<Keypair>, Vec<Address>) {
-    let mut e = Env::new(); let o = e.oracle; e.prog_acct(o, state::OSET_SIZE);
+    let mut e = Env::new();
+    let o = e.oracle;
+    e.prog_acct(o, state::OSET_SIZE);
     let ks: Vec<Keypair> = (0..3).map(|_| Keypair::new()).collect();
     let ms: Vec<Address> = ks.iter().map(|k| member(&mut e, k)).collect();
     let a = e.admin.pubkey();
@@ -31,11 +63,16 @@ fn set_env() -> (Env, Vec<Keypair>, Vec<Address>) {
 }
 fn upd(e: &mut Env, ms: &[Address]) -> Option<u32> {
     let (m, o) = (e.market, e.oracle);
-    let mut acc = vec![w(&m), r(&o)]; for x in ms { acc.push(r(x)); }
+    let mut acc = vec![w(&m), r(&o)];
+    for x in ms {
+        acc.push(r(x));
+    }
     try_send(e, acc, vec![4], &[])
 }
-#[test] fn median_of_members_sets_price() {
-    let (mut e, ks, ms) = set_env(); let ts = e.ts;
+#[test]
+fn median_of_members_sets_price() {
+    let (mut e, ks, ms) = set_env();
+    let ts = e.ts;
     for (i, p) in [1000_00000000i64, 1002_00000000, 1001_00000000].iter().enumerate() {
         let (k, a) = (&ks[i], ms[i]);
         assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(*p, ts), &[k]), None);
@@ -43,8 +80,10 @@ fn upd(e: &mut Env, ms: &[Address]) -> Option<u32> {
     assert_eq!(upd(&mut e, &ms), None);
     assert_eq!(e.market_state().oracle_px, 100_100);
 }
-#[test] fn one_outlier_does_not_move_the_median() {
-    let (mut e, ks, ms) = set_env(); let ts = e.ts;
+#[test]
+fn one_outlier_does_not_move_the_median() {
+    let (mut e, ks, ms) = set_env();
+    let ts = e.ts;
     for (i, p) in [1000_00000000i64, 1000_00000000, 1150_00000000].iter().enumerate() {
         let (k, a) = (&ks[i], ms[i]);
         assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(*p, ts), &[k]), None);
@@ -52,8 +91,10 @@ fn upd(e: &mut Env, ms: &[Address]) -> Option<u32> {
     assert_eq!(upd(&mut e, &ms), None);
     assert_eq!(e.market_state().oracle_px, 100_000);
 }
-#[test] fn below_quorum_is_rejected() {
-    let (mut e, ks, ms) = set_env(); let ts = e.ts;
+#[test]
+fn below_quorum_is_rejected() {
+    let (mut e, ks, ms) = set_env();
+    let ts = e.ts;
     let (k, a) = (&ks[0], ms[0]);
     assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000, ts), &[k]), None);
     assert_eq!(upd(&mut e, &ms), Some(E_ORACLE), "1 of 3 posted, quorum 2");
@@ -62,46 +103,92 @@ fn upd(e: &mut Env, ms: &[Address]) -> Option<u32> {
     assert_eq!(upd(&mut e, &ms[..1]), Some(19), "a member left out is refused outright");
     assert_eq!(upd(&mut e, &ms), None);
 }
-#[test] fn init_validation() {
-    let mut e = Env::new(); let o = e.oracle; e.prog_acct(o, state::OSET_SIZE);
+#[test]
+fn init_validation() {
+    let mut e = Env::new();
+    let o = e.oracle;
+    e.prog_acct(o, state::OSET_SIZE);
     let ks: Vec<Keypair> = (0..4).map(|_| Keypair::new()).collect();
     let ms: Vec<Address> = ks.iter().map(|k| member(&mut e, k)).collect();
     let a = e.admin.pubkey();
-    assert_eq!(try_send(&mut e, vec![AccountMeta::new(a, true), w(&o)], oset_ix(2, &ms), &[]), Some(BAD_DATA), "quorum must exceed n/2");
-    assert_eq!(try_send(&mut e, vec![AccountMeta::new(a, true), w(&o)], oset_ix(2, &[ms[0], ms[0], ms[1]]), &[]), Some(BAD_DATA), "duplicate member");
+    assert_eq!(
+        try_send(&mut e, vec![AccountMeta::new(a, true), w(&o)], oset_ix(2, &ms), &[]),
+        Some(BAD_DATA),
+        "quorum must exceed n/2"
+    );
+    assert_eq!(
+        try_send(&mut e, vec![AccountMeta::new(a, true), w(&o)], oset_ix(2, &[ms[0], ms[0], ms[1]]), &[]),
+        Some(BAD_DATA),
+        "duplicate member"
+    );
     assert_eq!(try_send(&mut e, vec![AccountMeta::new(a, true), w(&o)], oset_ix(3, &ms), &[]), None);
 }
-#[test] fn every_member_must_be_passed() {
-    let (mut e, ks, ms) = set_env(); let ts = e.ts;
-    for i in 0..3 { let (k, a) = (&ks[i], ms[i]); assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000, ts), &[k]), None); }
+#[test]
+fn every_member_must_be_passed() {
+    let (mut e, ks, ms) = set_env();
+    let ts = e.ts;
+    for i in 0..3 {
+        let (k, a) = (&ks[i], ms[i]);
+        assert_eq!(
+            try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000, ts), &[k]),
+            None
+        );
+    }
     assert_eq!(upd(&mut e, &ms[..2]), Some(19), "two of three passed: refused even though the quorum is 2");
     assert_eq!(upd(&mut e, &ms), None);
 }
-#[test] fn two_disagreeing_members_are_unusable() {
-    let (mut e, ks, ms) = set_env(); let ts = e.ts;
+#[test]
+fn two_disagreeing_members_are_unusable() {
+    let (mut e, ks, ms) = set_env();
+    let ts = e.ts;
     // one member stale (never posted): the remaining two disagree by 3% -> conf too wide
-    for (i, p) in [(0usize, 1000_00000000i64), (1, 1030_00000000)] { let (k, a) = (&ks[i], ms[i]); assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(p, ts), &[k]), None); }
+    for (i, p) in [(0usize, 1000_00000000i64), (1, 1030_00000000)] {
+        let (k, a) = (&ks[i], ms[i]);
+        assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(p, ts), &[k]), None);
+    }
     assert_eq!(upd(&mut e, &ms), Some(E_ORACLE));
     // agreeing pair: price is their mean
-    let (k, a) = (&ks[1], ms[1]); assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_20000000, ts + 1), &[k]), None);
+    let (k, a) = (&ks[1], ms[1]);
+    assert_eq!(
+        try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_20000000, ts + 1), &[k]),
+        None
+    );
     assert_eq!(upd(&mut e, &ms), None);
     assert_eq!(e.market_state().oracle_px, 100_010);
 }
-fn post_ext(px: i64, ts: i64, ext: i64) -> Vec<u8> { let mut d = post(px, ts); d.extend_from_slice(&ext.to_le_bytes()); d.extend_from_slice(&ts.to_le_bytes()); d }
-#[test] fn external_price_is_the_members_median() {
-    let (mut e, ks, ms) = set_env(); let ts = e.ts;
+fn post_ext(px: i64, ts: i64, ext: i64) -> Vec<u8> {
+    let mut d = post(px, ts);
+    d.extend_from_slice(&ext.to_le_bytes());
+    d.extend_from_slice(&ts.to_le_bytes());
+    d
+}
+#[test]
+fn external_price_is_the_members_median() {
+    let (mut e, ks, ms) = set_env();
+    let ts = e.ts;
     for (i, x) in [1001_00000000i64, 1009_00000000, 1003_00000000].iter().enumerate() {
         let (k, a) = (&ks[i], ms[i]);
-        assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post_ext(1000_00000000, ts, *x), &[k]), None);
+        assert_eq!(
+            try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post_ext(1000_00000000, ts, *x), &[k]),
+            None
+        );
     }
     assert_eq!(upd(&mut e, &ms), None);
     let s = e.market_state();
     assert_eq!((s.oracle_px, s.ext_px), (100_000, 100_300), "ext = median of the members' external perp prices");
 }
-#[test] fn non_primary_account_is_a_no_op() {
+#[test]
+fn non_primary_account_is_a_no_op() {
     // a client still passing a former single AGG (now just a member) changes nothing and does not fail its transaction
-    let (mut e, ks, ms) = set_env(); let ts = e.ts;
-    for i in 0..3 { let (k, a) = (&ks[i], ms[i]); assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000, ts), &[k]), None); }
+    let (mut e, ks, ms) = set_env();
+    let ts = e.ts;
+    for i in 0..3 {
+        let (k, a) = (&ks[i], ms[i]);
+        assert_eq!(
+            try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000, ts), &[k]),
+            None
+        );
+    }
     let before = e.market_state().oracle_px;
     let m = e.market;
     assert_eq!(try_send(&mut e, vec![w(&m), r(&ms[0])], vec![4], &[]), None);
@@ -113,12 +200,19 @@ fn post_ext(px: i64, ts: i64, ext: i64) -> Vec<u8> { let mut d = post(px, ts); d
 // ---- post-and-push (IX 78): update_oracle that never fails the transaction ----
 fn upd_soft(e: &mut Env, ms: &[Address]) -> Option<u32> {
     let (m, o) = (e.market, e.oracle);
-    let mut acc = vec![w(&m), r(&o)]; for x in ms { acc.push(r(x)); }
+    let mut acc = vec![w(&m), r(&o)];
+    for x in ms {
+        acc.push(r(x));
+    }
     try_send(e, acc, vec![78], &[])
 }
-fn snapshot(e: &mut Env) -> Vec<u8> { e.svm.get_account(&e.market).unwrap().data }
-#[test] fn soft_update_applies_a_usable_price() {
-    let (mut e, ks, ms) = set_env(); let ts = e.ts;
+fn snapshot(e: &mut Env) -> Vec<u8> {
+    e.svm.get_account(&e.market).unwrap().data
+}
+#[test]
+fn soft_update_applies_a_usable_price() {
+    let (mut e, ks, ms) = set_env();
+    let ts = e.ts;
     for (i, p) in [1000_00000000i64, 1002_00000000, 1001_00000000].iter().enumerate() {
         let (k, a) = (&ks[i], ms[i]);
         assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(*p, ts), &[k]), None);
@@ -126,8 +220,10 @@ fn snapshot(e: &mut Env) -> Vec<u8> { e.svm.get_account(&e.market).unwrap().data
     assert_eq!(upd_soft(&mut e, &ms), None);
     assert_eq!(e.market_state().oracle_px, 100_100, "same effect as IX 4 when the oracle is usable");
 }
-#[test] fn soft_update_below_quorum_leaves_the_market_untouched() {
-    let (mut e, ks, ms) = set_env(); let ts = e.ts;
+#[test]
+fn soft_update_below_quorum_leaves_the_market_untouched() {
+    let (mut e, ks, ms) = set_env();
+    let ts = e.ts;
     let (k, a) = (&ks[0], ms[0]);
     assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000, ts), &[k]), None);
     let before = snapshot(&mut e);
@@ -137,16 +233,33 @@ fn snapshot(e: &mut Env) -> Vec<u8> { e.svm.get_account(&e.market).unwrap().data
     assert_eq!(upd_soft(&mut e, &ms[..1]), None, "a member left out: IX 4 would refuse (19), IX 78 is a no-op");
     assert_eq!(snapshot(&mut e), before);
 }
-#[test] fn post_and_push_in_one_transaction() {
+#[test]
+fn post_and_push_in_one_transaction() {
     // a publisher's price post and the market update land together; the post stands even when the update is a no-op
-    let (mut e, ks, ms) = set_env(); let ts = e.ts; let (m, o) = (e.market, e.oracle);
-    let mut acc = vec![w(&m), r(&o)]; for x in &ms { acc.push(r(x)); }
+    let (mut e, ks, ms) = set_env();
+    let ts = e.ts;
+    let (m, o) = (e.market, e.oracle);
+    let mut acc = vec![w(&m), r(&o)];
+    for x in &ms {
+        acc.push(r(x));
+    }
     let push = Instruction { program_id: e.pid, accounts: acc, data: vec![78] };
     let send2 = |e: &mut Env, i: usize, px: i64| {
         let (k, a) = (&ks[i], ms[i]);
-        let ix1 = Instruction { program_id: e.pid, accounts: vec![AccountMeta::new(k.pubkey(), true), w(&a)], data: post(px, ts) };
-        let tx = Transaction::new_signed_with_payer(&[ix1, push.clone()], Some(&e.admin.pubkey()), &[&e.admin, k], e.svm.latest_blockhash());
-        let r = e.svm.send_transaction(tx).is_ok(); e.svm.expire_blockhash(); r
+        let ix1 = Instruction {
+            program_id: e.pid,
+            accounts: vec![AccountMeta::new(k.pubkey(), true), w(&a)],
+            data: post(px, ts),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix1, push.clone()],
+            Some(&e.admin.pubkey()),
+            &[&e.admin, k],
+            e.svm.latest_blockhash(),
+        );
+        let r = e.svm.send_transaction(tx).is_ok();
+        e.svm.expire_blockhash();
+        r
     };
     let before = snapshot(&mut e);
     assert!(send2(&mut e, 0, 1000_00000000), "first post lands although 1/3 is below quorum");
@@ -156,44 +269,102 @@ fn snapshot(e: &mut Env) -> Vec<u8> { e.svm.get_account(&e.market).unwrap().data
     assert!(send2(&mut e, 2, 1004_00000000));
     assert_eq!(e.market_state().oracle_px, 100_200, "third post moves the median in its own tx");
 }
-#[test] fn soft_update_on_a_foreign_account_is_a_no_op() {
+#[test]
+fn soft_update_on_a_foreign_account_is_a_no_op() {
     let (mut e, _ks, ms) = set_env();
-    let junk = Address::new_unique(); e.prog_acct(junk, state::MARKET_SIZE);
-    let o = e.oracle; let mut acc = vec![w(&junk), r(&o)]; for x in &ms { acc.push(r(x)); }
+    let junk = Address::new_unique();
+    e.prog_acct(junk, state::MARKET_SIZE);
+    let o = e.oracle;
+    let mut acc = vec![w(&junk), r(&o)];
+    for x in &ms {
+        acc.push(r(x));
+    }
     assert_eq!(try_send(&mut e, acc, vec![78], &[]), None, "not a market: nothing to revert, nothing fails");
 }
-#[test] fn soft_update_cu_fits_the_publisher_budget() {
+#[test]
+fn soft_update_cu_fits_the_publisher_budget() {
     // the publisher budgets PUSH_CU (default 6k) per IX 78 with a 3-member set: keep it honest
-    let (mut e, ks, ms) = set_env(); let ts = e.ts;
-    for i in 0..3 { let (k, a) = (&ks[i], ms[i]); assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000 + i as i64, ts), &[k]), None); }
-    let (m, o) = (e.market, e.oracle); let mut acc = vec![w(&m), r(&o)]; for x in &ms { acc.push(r(x)); }
+    let (mut e, ks, ms) = set_env();
+    let ts = e.ts;
+    for i in 0..3 {
+        let (k, a) = (&ks[i], ms[i]);
+        assert_eq!(
+            try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000 + i as i64, ts), &[k]),
+            None
+        );
+    }
+    let (m, o) = (e.market, e.oracle);
+    let mut acc = vec![w(&m), r(&o)];
+    for x in &ms {
+        acc.push(r(x));
+    }
     let cu = e.send("ix78 set3", acc.clone(), vec![78], &[], true).unwrap();
     assert!(cu < 6_000, "IX 78 (3-member set, usable) used {cu} CU");
     // an unusable set (1 of 3 posted): the revert path
-    let (mut e2, ks2, ms2) = set_env(); let (k, a, ts2) = (&ks2[0], ms2[0], e2.ts);
-    assert_eq!(try_send(&mut e2, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000, ts2), &[k]), None);
-    let (m, o) = (e2.market, e2.oracle); let mut acc = vec![w(&m), r(&o)]; for x in &ms2 { acc.push(r(x)); }
+    let (mut e2, ks2, ms2) = set_env();
+    let (k, a, ts2) = (&ks2[0], ms2[0], e2.ts);
+    assert_eq!(
+        try_send(&mut e2, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000, ts2), &[k]),
+        None
+    );
+    let (m, o) = (e2.market, e2.oracle);
+    let mut acc = vec![w(&m), r(&o)];
+    for x in &ms2 {
+        acc.push(r(x));
+    }
     let cu2 = e2.send("ix78 set3 revert", acc, vec![78], &[], true).unwrap();
     assert!(cu2 < 6_000, "IX 78 revert path used {cu2} CU");
     println!("IX78 usable={cu} revert={cu2}");
 }
-#[test] fn soft_update_reverts_a_partial_write() {
+#[test]
+fn soft_update_reverts_a_partial_write() {
     // the revert path that matters: funding / premium bookkeeping is written before the book scan, and the scan then fails
     // (one shard of a two-shard market passed) -> IX 4 fails the tx, IX 78 lands with the market byte-identical
-    let (mut e, ks, ms) = set_env(); let ts = e.ts;
-    for i in 0..3 { let (k, a) = (&ks[i], ms[i]); assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1000_00000000 + i as i64 * 100_000, ts), &[k]), None); }
+    let (mut e, ks, ms) = set_env();
+    let ts = e.ts;
+    for i in 0..3 {
+        let (k, a) = (&ks[i], ms[i]);
+        assert_eq!(
+            try_send(
+                &mut e,
+                vec![AccountMeta::new(k.pubkey(), true), w(&a)],
+                post(1000_00000000 + i as i64 * 100_000, ts),
+                &[k]
+            ),
+            None
+        );
+    }
     let (s0, s1) = (e.shard(0, 0), e.shard(1, 0));
     assert_eq!(upd(&mut e, &ms), None, "first full update");
     let (m, o) = (e.market, e.oracle);
     // time passes so the funding accrual has something to write; a fresh post keeps the set usable
-    let slot = e.slot + 50; e.set_time(slot); let ts2 = e.ts;
-    for i in 0..3 { let (k, a) = (&ks[i], ms[i]); assert_eq!(try_send(&mut e, vec![AccountMeta::new(k.pubkey(), true), w(&a)], post(1001_00000000 + i as i64 * 100_000, ts2), &[k]), None); }
+    let slot = e.slot + 50;
+    e.set_time(slot);
+    let ts2 = e.ts;
+    for i in 0..3 {
+        let (k, a) = (&ks[i], ms[i]);
+        assert_eq!(
+            try_send(
+                &mut e,
+                vec![AccountMeta::new(k.pubkey(), true), w(&a)],
+                post(1001_00000000 + i as i64 * 100_000, ts2),
+                &[k]
+            ),
+            None
+        );
+    }
     let before = snapshot(&mut e);
-    let mut acc = vec![w(&m), r(&o)]; for x in &ms { acc.push(r(x)); } acc.push(r(&s0)); // s1 missing
+    let mut acc = vec![w(&m), r(&o)];
+    for x in &ms {
+        acc.push(r(x));
+    }
+    acc.push(r(&s0)); // s1 missing
     assert!(try_send(&mut e, acc.clone(), vec![4], &[]).is_some(), "IX 4 with an incomplete book fails");
     assert_eq!(try_send(&mut e, acc.clone(), vec![78], &[]), None, "IX 78 lands");
     assert_eq!(snapshot(&mut e), before, "funding/premium writes made before the failing scan were rolled back");
     acc.push(r(&s1));
     assert_eq!(try_send(&mut e, acc, vec![78], &[]), None, "complete book: applies");
-    let after = e.market_state(); assert_eq!(after.oracle_px, 100_100); assert_ne!(snapshot(&mut e), before);
+    let after = e.market_state();
+    assert_eq!(after.oracle_px, 100_100);
+    assert_ne!(snapshot(&mut e), before);
 }

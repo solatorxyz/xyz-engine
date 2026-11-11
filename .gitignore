@@ -1,3 +1,9 @@
-target/
+*.tsbuildinfo
+.next/
 Cargo.lock.bak
 __pycache__/
+node_modules/
+program/fuzz/artifacts/
+program/fuzz/corpus/
+program/fuzz/target/
+target/

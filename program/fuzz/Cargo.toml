@@ -22,3 +22,8 @@ name = "lanes"
 path = "fuzz_targets/lanes.rs"
 test = false
 doc = false
+[[bin]]
+name = "vault"
+path = "fuzz_targets/vault.rs"
+test = false
+doc = false
