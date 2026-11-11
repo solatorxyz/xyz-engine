@@ -187,7 +187,7 @@ A host signs the price for slot s only while the lease it read (finalized) says 
 - Proved for all 64-bit inputs: `lease_step_keeps_terms_apart`, `lease_step_refuses_a_second_holder` (Kani).
 - Against the built program: `tests/lease.rs` (4,000 random claims by three hosts; the set of slots each was ever told
   it holds never meets another's; only the key itself can put its signing under a lease; a stranger cannot claim).
-- Host side: `deploy/vault/test_lease.py` (hosts that read late, lose claims and freeze for hundreds of slots never sign
+- Host side, in the operator tooling (`deploy/vault/test_lease.py`): (hosts that read late, lose claims and freeze for hundreds of slots never sign
   the same slot; a dead holder is replaced within a term; two healthy hosts do not trade the lease back and forth).
   Two mutants are caught: a chain that lets a standby in early, and a host that assumes its renewal landed.
 - Not a check in the fill path. A key that ignores its lease can sign anything, as it could before the lease existed.

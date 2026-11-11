@@ -33,7 +33,7 @@ OBJDUMP = os.environ.get("OBJDUMP") or next(
     ),
     "llvm-objdump",
 )
-CRATE = "perp_program"
+CRATE = os.environ.get("CRATE", "perp_program")  # CRATE=solator_guard for the guard program
 
 
 def functions(path, modules):
