@@ -19,7 +19,7 @@
 | liquidate (takeover at mark: health x2, transfer, fees) | 4629 |
 | deposit (SPL transfer CPI) | 1383 |
 | adl_rank (permissionless re-score) | 2054 |
-| ADL (bankrupt -> on-chain ranked counterparty -> insurance) | 7481 |
+| ADL (bankrupt -> on-chain ranked counterparty -> insurance) | 7500 |
 | settle_funding (permissionless, 1 position) | 199 |
 | aggregate OI/fees from 9 shards (crank) | 733 |
 | liquidate_book (permissionless, 1 chunk into the book, no liquidator capital) | 5942 |

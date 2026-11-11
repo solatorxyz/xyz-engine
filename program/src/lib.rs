@@ -2315,7 +2315,9 @@ fn adl_rank(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
 fn adl(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if a.len() < 5 { return Err(err(E::BadAccount)); }
     let t: &mut User = load(&a[0], pid, DISC_USER, USER_SIZE)?;
-    let m: &mut Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+    // held shared: the health passes below read this market through the account list. Its two writes go through a borrow of
+    // their own, made where they happen, and this one is not read again after them.
+    let m: &Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
     let ins: &mut Insurance = load(&a[2], pid, DISC_INS, INS_SIZE)?;
     let r: &mut Rank = load(&a[3], pid, DISC_RANK, RANK_SIZE)?;
     if m.insurance != key(&a[2]) || m.adl_rank != key(&a[3]) { return Err(err(E::BadAccount)); }
@@ -2380,7 +2382,8 @@ fn adl(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     // and the most it pays toward the target's deficit (never its collateral, never more than its equity)
     let c_gain = ((mulf(ocb as i128, px) - c.pos[ci].cost as i128) * q as i128 / ocb.unsigned_abs() as i128).max(0);
     t.pos[ti].base += dq; c.pos[ci].base -= dq;
-    m.oi_long = (m.oi_long as i64 + long(t.pos[ti].base) + long(c.pos[ci].base) - l0) as u64;
+    { let mw: &mut Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+      mw.oi_long = mw.oi_long.wrapping_add_signed(long(t.pos[ti].base) + long(c.pos[ci].base) - l0); } // partial sums may dip below zero; the total is exact (as in the crank)
     credit(t, ti, -n)?; credit(c, ci, n)?;
     t.pos[ti].cost = cost_after(otb, t.pos[ti].base, t.pos[ti].cost, n)?; c.pos[ci].cost = cost_after(ocb, c.pos[ci].base, c.pos[ci].cost, -n)?;
     let (mut eq2, _, _) = phealth(pid, t, ti, mkts, nw, false)?;
@@ -2396,7 +2399,7 @@ fn adl(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
         ins.balance = i64c(ins.balance as i128 - from_ins)?;
         credit(c, ci, -from_c)?; ce -= from_c;
         credit(t, ti, deficit)?; // VERIFY-1: the unrecovered part is carried in bad_debt, not also in the target's cash
-        m.bad_debt = i64c(m.bad_debt as i128 + deficit - from_ins - from_c)?;
+        let mw: &mut Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?; mw.bad_debt = i64c(mw.bad_debt as i128 + deficit - from_ins - from_c)?;
     }
     // re-rank the counterparty at its new size
     rank_remove(r, side, &ck);
@@ -3456,8 +3459,11 @@ fn vault_withdraw(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let sh = rd64(d, 1)?;
     let v: &mut Vault = load(&a[1], pid, DISC_VAULT, VAULT_SIZE)?;
     let vd: &mut VaultDeposit = load(&a[2], pid, DISC_VDEP, VDEP_SIZE)?;
-    let m: &mut Market = load(&a[4], pid, DISC_MARKET, MARKET_SIZE)?;
-    if vd.vault != key(&a[1]) || vd.owner != key(&a[0]) || key(&a[3]) != v.subs[0] || key(&a[5]) != v.token_vault || m.vault != v.token_vault { return Err(err(E::BadAccount)); }
+    // held shared and read once: the valuation below reads this market again through the account list. The fee is booked through
+    // a borrow of its own further down.
+    let m: &Market = load(&a[4], pid, DISC_MARKET, MARKET_SIZE)?;
+    let (m_vault, m_bump, m_seed) = (m.vault, m.vault_bump, m.vault_seed);
+    if vd.vault != key(&a[1]) || vd.owner != key(&a[0]) || key(&a[3]) != v.subs[0] || key(&a[5]) != v.token_vault || m_vault != v.token_vault { return Err(err(E::BadAccount)); }
     if a[7].address() != &pinocchio_token::ID { return Err(err(E::TokenProgram)); }
     if sh == 0 || sh > vd.shares { return Err(err(E::BadData)); }
     let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
@@ -3479,13 +3485,13 @@ fn vault_withdraw(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     if out + fee > s0.cash as i128 { return Err(err(E::Margin)); }
     s0.cash = i64c(s0.cash as i128 - out - fee)?;
     v.sub_eq[0] = i64c(v.sub_eq[0] as i128 - out - fee)?;
-    if fee > 0 { m.fees = i64c(m.fees as i128 + fee)?; }
+    if fee > 0 { let mw: &mut Market = load(&a[4], pid, DISC_MARKET, MARKET_SIZE)?; mw.fees = i64c(mw.fees as i128 + fee)?; }
     let (eq, im, _) = health_im(pid, s0, &a[3..], nw, true)?;
     if eq < im { return Err(err(E::Margin)); }
     v.shares -= sh; vd.shares -= sh; vd.basis = i64c(vd.basis as i128 - cost)?;
     vault_mark(v, nav - out - fee, clk.slot)?;
-    let bump = [m.vault_bump as u8];
-    let seeds = [Seed::from(b"vault".as_slice()), Seed::from(&m.vault_seed), Seed::from(&bump)];
+    let bump = [m_bump as u8];
+    let seeds = [Seed::from(b"vault".as_slice()), Seed::from(&m_seed), Seed::from(&bump)];
     pinocchio_token::instructions::Transfer::new(&a[5], &a[6], &a[8], out as u64)
         .invoke_signed_with_program(&[Signer::from(&seeds)], a[7].address())
 }
