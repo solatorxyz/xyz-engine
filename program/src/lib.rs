@@ -235,6 +235,13 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
         spec::IX_VAULT_TAKEOVER => vault_takeover(pid, accs, data),
         spec::IX_VAULT_CRANK => vault_crank(pid, accs),
         spec::IX_VAULT_SET => vault_set(pid, accs, data),
+        spec::IX_VAULT_SLAB_INIT => vault_slab_init(pid, accs),
+        spec::IX_VAULT_JOIN => vault_join(pid, accs),
+        spec::IX_VAULT_QUOTE => vault_quote(pid, accs, data),
+        spec::IX_VAULT_FUND => vault_fund(pid, accs, data),
+        spec::IX_VAULT_KILL => vault_kill(pid, accs, data),
+        spec::IX_VAULT_OPERATOR => vault_operator(pid, accs, data),
+        spec::IX_VAULT_MOVE => vault_move(pid, accs, data),
         spec::IX_ADMIN_EXECUTE => admin_execute(pid, accs),
         IX_AGG_INIT => agg_init(pid, accs, data),
         IX_AGG_POST => agg_post(pid, accs, data),
@@ -2380,7 +2387,11 @@ fn fast_join(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     let s: &mut Slab = load(&a[3], pid, DISC_SLAB, SLAB_SIZE)?;
     if !auth(pid, &m.admin, a) || f.market != key(&a[1]) { return Err(err(E::BadAccount)); }
     if a.len() < 5 || !sg(pid, &a[4]) || key(&a[4]) != s.authority { return Err(err(E::BadAccount)); }
-    let (n, sk, mk) = (f.n as usize, key(&a[3]), key(&a[1]));
+    join_core(f, s, key(&a[3]), key(&a[1]))
+}
+/// Bind the slab's quote block for this book's idx to the market and list the slab's account as a maker of the book.
+fn join_core(f: &mut FastBook, s: &mut Slab, sk: Key, mk: Key) -> ProgramResult {
+    let n = f.n as usize;
     let ix = (f.idx as usize).min(SLAB_IDX - 1);
     // the slab's quote block for this idx belongs to this market from now on (another market can't claim it)
     if s.idx_market[ix] != [0; 32] && s.idx_market[ix] != mk { return Err(err(E::BadAccount)); }
@@ -2398,6 +2409,11 @@ fn slab_quote(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if a.len() < 2 || !sg(pid, &a[0]) { return Err(err(E::BadAccount)); }
     let s: &mut Slab = load(&a[1], pid, DISC_SLAB, SLAB_SIZE)?;
     if s.authority != key(&a[0]) { return Err(err(E::BadAccount)); }
+    quote_core(s, d)
+}
+/// The quote write itself, shared with the vault's quoting instruction (inlined: slab_quote compiles to what it was).
+#[inline(always)]
+fn quote_core(s: &mut Slab, d: &[u8]) -> ProgramResult {
     let mut body = &d[1..];
     if body.len() % spec::QUOTE_ITEM_SIZE != 0 { return Err(err(E::BadData)); }
     // ladder settings items come first (idx high bit set), so the quote loop below stays as tight as before
@@ -2484,7 +2500,7 @@ fn ladder_room(f: &FastBook, l: &Ladder, mi: usize, bid: bool, oracle: u64, slot
 /// transaction). accs: target(w)
 fn slab_grow(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if a.is_empty() || !a[0].owned_by(pid) { return Err(err(E::BadAccount)); }
-    let want = match disc_of(&a[0]) { DISC_SLAB => SLAB_SIZE, DISC_FAST => FAST_SIZE, DISC_MARKET => MARKET_SIZE, _ => return Err(err(E::BadAccount)) };
+    let want = match disc_of(&a[0]) { DISC_SLAB => SLAB_SIZE, DISC_FAST => FAST_SIZE, DISC_MARKET => MARKET_SIZE, DISC_VAULT => VAULT_SIZE, _ => return Err(err(E::BadAccount)) };
     if a[0].data_len() >= want { return Ok(()); }
     a[0].resize(want)
 }
@@ -2575,13 +2591,21 @@ fn maker_budget(m: &Market, margin: i64) -> i64 { i64::try_from(margin.max(0) as
 /// accs: authority(s), user(w), market(r), fast(w), [other markets]. data: tag, amount i64, [target i64]
 fn slab_fund(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if a.len() < 4 { return Err(err(E::BadData)); }
+    let u: &User = load(&a[1], pid, DISC_USER, USER_SIZE)?;
+    if !sg(pid, &a[0]) || u.authority != key(&a[0]) { return Err(err(E::BadAccount)); }
+    fund_core(pid, a, d)
+}
+/// slab_fund once the caller's right to move this account's margin is established (its own key, or its vault's rules).
+/// accs: -, user(w), market(r), fast(w), [other markets]
+fn fund_core(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 4 { return Err(err(E::BadData)); }
     let amt = rd64(d, 1)? as i64;
     let tgt = if d.len() > 9 { let t = rd64(d, 9)? as i64; if t < 0 { return Err(err(E::BadData)); } Some(t) } else { None };
     let u: &mut User = load(&a[1], pid, DISC_USER, USER_SIZE)?;
     let m: &Market = load(&a[2], pid, DISC_MARKET, MARKET_SIZE)?;
     let f: &mut FastBook = load(&a[3], pid, DISC_FAST, FAST_SIZE)?;
     let (uk, mk) = (key(&a[1]), key(&a[2]));
-    if !sg(pid, &a[0]) || u.authority != key(&a[0]) || f.market != mk { return Err(err(E::BadAccount)); }
+    if f.market != mk { return Err(err(E::BadAccount)); }
     home(u, m)?;
     let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
     let n = f.n as usize;
@@ -3269,9 +3293,17 @@ fn vault_nav(pid: &Address, v: &Vault, a: &[AccountView], nw: Now) -> Result<i12
         let x = a.iter().find(|x| key(x) == v.subs[i]).ok_or(err(E::MissingShards))?;
         let u: &mut User = load(x, pid, DISC_USER, USER_SIZE)?;
         settle_funding_all(pid, u, a)?;
-        nav += health(pid, u, a, nw, true)?.0;
+        // A sub-account that quotes: its fills must be settled into it (and its resting orders' fills claimed) before it is
+        // valued, and the margin it has locked in the books is the vault's too. The program takes that margin out of the
+        // account's cash, so equity alone would leave it out and a deposit would buy the vault below its worth.
+        complete_view(pid, u, &v.subs[i], a, None)?;
+        nav += health(pid, u, a, nw, true)?.0 + maker_mirror(u);
     }
     Ok(nav)
+}
+/// Margin an account has locked for quoting, as the program mirrors it on its pinned cross positions.
+fn maker_mirror(u: &User) -> i128 {
+    u.pos.iter().filter(|p| p.market != [0; 32] && p.flags & (POS_PIN | POS_ISO) == POS_PIN).map(|p| p.iso_margin as i128).sum()
 }
 /// Remember the value, track the peak, and stop new takeovers past the drawdown limit.
 fn vault_mark(v: &mut Vault, nav: i128, slot: u64) -> ProgramResult {
@@ -3385,6 +3417,140 @@ fn vault_set(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if !auth(pid, &v.admin, a) { return Err(err(E::BadAccount)); }
     v.lockup_slots = rd64(d, 1)?; v.day_cap_bps = rd64(d, 9)?; v.dd_bps = rd64(d, 17)?; v.halted = rd64(d, 25)?;
     if v.day_cap_bps > 10000 || v.dd_bps > 10000 { return Err(err(E::BadData)); }
+    Ok(())
+}
+
+// ---------- the vault as a maker ----------
+// Depositors' money quotes the markets: a sub-account of the vault is the maker. Its slab's quoting authority is the vault
+// account itself, which can sign nothing, so slab_quote / slab_kill / fast_join never apply and these instructions are the
+// only way in. Who may do what:
+//   vault admin   makes the slab, approves it on a book (with the market admin), locks margin, names the operator and the rules
+//   operator      writes quotes inside the rules, stops them, releases margin, moves idle cash between the vault's own accounts
+//   anyone        settles fills (slab_settle), stops the quotes of a halted vault
+// Nothing here moves value out of the vault; the quote rules bound what a quote can give away.
+fn vault_sub(v: &Vault, k: &Key) -> Result<usize, ProgramError> { v.subs[..(v.n_subs as usize).min(VAULT_SUBS)].iter().position(|x| x == k).ok_or(err(E::BadAccount)) }
+fn vault_op(pid: &Address, v: &Vault, x: &AccountView) -> bool { v.operator != [0; 32] && sg(pid, x) && key(x) == v.operator }
+/// accs: admin(s), vault(w), sub(r), slab(w, zeroed)
+fn vault_slab_init(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
+    if a.len() < 4 { return Err(err(E::BadData)); }
+    let v: &mut Vault = load(&a[1], pid, DISC_VAULT, VAULT_SIZE)?;
+    if !auth(pid, &v.admin, a) { return Err(err(E::BadAccount)); }
+    let si = vault_sub(v, &key(&a[2]))?;
+    let _u: &User = load(&a[2], pid, DISC_USER, USER_SIZE)?;
+    if !a[3].owned_by(pid) || a[3].data_len() < SLAB_SIZE || disc_of(&a[3]) != 0 { return Err(err(E::BadAccount)); }
+    let s = unsafe { &mut *(a[3].borrow_unchecked().as_ptr() as *mut Slab) };
+    s.disc = DISC_SLAB; s.authority = key(&a[1]); s.user = key(&a[2]);
+    v.active |= 1 << si; // a quoting account is part of the vault's value from now on
+    Ok(())
+}
+/// accs: admin(s), market(r), fast(w), slab(w), vault(r), [more signers / the multisig accounts]
+fn vault_join(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
+    if a.len() < 5 { return Err(err(E::BadData)); }
+    let m: &Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+    let f: &mut FastBook = load(&a[2], pid, DISC_FAST, FAST_SIZE)?;
+    let s: &mut Slab = load(&a[3], pid, DISC_SLAB, SLAB_SIZE)?;
+    let v: &Vault = load(&a[4], pid, DISC_VAULT, VAULT_SIZE)?;
+    if !auth(pid, &m.admin, a) || !auth(pid, &v.admin, a) || f.market != key(&a[1]) { return Err(err(E::BadAccount)); }
+    if s.authority != key(&a[4]) || m.vault != v.token_vault { return Err(err(E::BadAccount)); }
+    vault_sub(v, &s.user)?;
+    join_core(f, s, key(&a[3]), key(&a[1]))
+}
+/// One ladder of a vault slab is inside the vault's rules. A ladder offering nothing passes.
+fn vault_ladder_ok(v: &Vault, s: &Slab, lad: usize) -> bool {
+    let (l, ask) = (&s.lad[lad], lad & 1 == 1);
+    let q = &s.quotes[lad * SLAB_LEVELS..(lad + 1) * SLAB_LEVELS];
+    if q.iter().all(|x| x.qty == 0) { return true; }
+    if l.flags & spec::LADDER_PEG == 0 { return false; }
+    if v.q_fresh != 0 && l.flags >> spec::LADDER_FRESH_SHIFT == 0 { return false; }
+    let mut edge = 0i64;
+    if v.q_min_edge_bps != 0 {
+        if l.ref_px == 0 || l.tol_bps == 0 || (v.q_max_tol_bps != 0 && l.tol_bps as u64 > v.q_max_tol_bps) { return false; }
+        edge = ((l.ref_px as u64 * v.q_min_edge_bps + 9999) / 10000) as i64;
+    }
+    q.iter().all(|x| { let off = x.px as i64 - spec::QUOTE_PEG_BIAS as i64; x.qty == 0 || if ask { off >= edge } else { off <= -edge } })
+}
+/// accs: operator(s), vault(r), slab(w). data: tag, items (as slab_quote)
+fn vault_quote(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 3 { return Err(err(E::BadAccount)); }
+    let v: &Vault = load(&a[1], pid, DISC_VAULT, VAULT_SIZE)?;
+    let s: &mut Slab = load(&a[2], pid, DISC_SLAB, SLAB_SIZE)?;
+    if !vault_op(pid, v, &a[0]) || s.authority != key(&a[1]) { return Err(err(E::BadAccount)); }
+    if v.halted != 0 { return Err(err(E::Halted)); }
+    quote_core(s, d)?;
+    // every ladder an item named (its settings or one of its levels) is judged as it stands after the write
+    let mut prev = usize::MAX;
+    for it in d[1..].chunks_exact(spec::QUOTE_ITEM_SIZE) {
+        let i = u16::from_le_bytes([it[0], it[1]]) as usize;
+        let lad = if i & 0x8000 != 0 { i & 0x3fff } else { i / SLAB_LEVELS };
+        if lad == prev { continue; }
+        if lad >= SLAB_LADDERS || !vault_ladder_ok(v, s, lad) { return Err(err(E::BadData)); }
+        prev = lad;
+    }
+    Ok(())
+}
+/// accs: signer(s), sub(w), market(r), fast(w), vault(w), [other markets]. data: tag, amount i64, [target i64]
+fn vault_fund(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 5 { return Err(err(E::BadData)); }
+    let v: &mut Vault = load(&a[4], pid, DISC_VAULT, VAULT_SIZE)?;
+    let u: &User = load(&a[1], pid, DISC_USER, USER_SIZE)?;
+    let f: &FastBook = load(&a[3], pid, DISC_FAST, FAST_SIZE)?;
+    let (vk, uk) = (key(&a[4]), key(&a[1]));
+    if u.authority != vk { return Err(err(E::BadAccount)); }
+    let si = vault_sub(v, &uk)?;
+    let amt = rd64(d, 1)? as i64;
+    let tgt = if d.len() > 9 { Some(rd64(d, 9)? as i64) } else { None };
+    let cur = f.makers[..(f.n as usize).min(FAST_MAKERS)].iter().find(|x| x.user == uk).ok_or(err(E::BadAccount))?.target;
+    let more = amt > 0 || tgt.is_some_and(|t| t > cur);
+    // more quoting margin is the admin's call, and never while the vault is halted; less is also the operator's
+    if !auth(pid, &v.admin, a) && (more || !vault_op(pid, v, &a[0])) { return Err(err(E::BadAccount)); }
+    if more && v.halted != 0 { return Err(err(E::Halted)); }
+    v.active |= 1 << si;
+    fund_core(pid, a, d)
+}
+/// accs: signer, vault(r), slab(w). data: tag, on u8
+fn vault_kill(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 3 || d.len() < 2 { return Err(err(E::BadData)); }
+    let v: &Vault = load(&a[1], pid, DISC_VAULT, VAULT_SIZE)?;
+    let s: &mut Slab = load(&a[2], pid, DISC_SLAB, SLAB_SIZE)?;
+    if s.authority != key(&a[1]) { return Err(err(E::BadAccount)); }
+    let trusted = auth(pid, &v.admin, a) || vault_op(pid, v, &a[0]);
+    if !trusted && !(v.halted != 0 && d[1] != 0) { return Err(err(E::BadAccount)); }
+    s.kill = (d[1] != 0) as u64;
+    Ok(())
+}
+/// accs: admin(s), vault(w). data: tag, operator [32], min_edge_bps, max_tol_bps, fresh
+fn vault_operator(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 2 || d.len() != 57 { return Err(err(E::BadData)); }
+    let v: &mut Vault = load(&a[1], pid, DISC_VAULT, VAULT_SIZE)?;
+    if !auth(pid, &v.admin, a) { return Err(err(E::BadAccount)); }
+    let (edge, tol) = (rd64(d, 33)?, rd64(d, 41)?);
+    // An edge is measured on the ladder's reference price, so it is only worth what the tolerance lets the reference stray:
+    // with an edge the tolerance cap is required and bounded.
+    if edge > spec::VAULT_MAX_EDGE_BPS || tol > spec::VAULT_MAX_TOL_BPS || (edge != 0 && tol == 0) { return Err(err(E::BadData)); }
+    v.operator.copy_from_slice(&d[1..33]); v.q_min_edge_bps = edge; v.q_max_tol_bps = tol; v.q_fresh = (rd64(d, 49)? != 0) as u64;
+    Ok(())
+}
+/// accs: signer(s), vault(w), from sub(w), to sub(w), [from's markets]. data: tag, amount u64
+fn vault_move(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 4 { return Err(err(E::BadData)); }
+    let amt = i64c(rd64(d, 1)? as i128)?;
+    let v: &mut Vault = load(&a[1], pid, DISC_VAULT, VAULT_SIZE)?;
+    if !auth(pid, &v.admin, a) && !vault_op(pid, v, &a[0]) { return Err(err(E::BadAccount)); }
+    let (fk, tk) = (key(&a[2]), key(&a[3]));
+    let (fi, ti) = (vault_sub(v, &fk)?, vault_sub(v, &tk)?);
+    if fi == ti || amt <= 0 { return Err(err(E::BadData)); }
+    let from: &mut User = load(&a[2], pid, DISC_USER, USER_SIZE)?;
+    let to: &mut User = load(&a[3], pid, DISC_USER, USER_SIZE)?;
+    if from.home_vault != to.home_vault { return Err(err(E::Vault)); }
+    let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
+    settle_funding_all(pid, from, &a[4..])?;
+    // judged on everything the giving account owes: fills not settled or claimed yet could hide a loss its cash still has to carry
+    complete_view(pid, from, &fk, &a[4..], None)?;
+    from.cash = i64c(from.cash as i128 - amt as i128)?; to.cash = i64c(to.cash as i128 + amt as i128)?;
+    // the giving account keeps what its own positions need; the receiving one is counted in the vault's value from now on
+    let (eq, im, _) = health_im(pid, from, &a[4..], nw, true)?;
+    if from.cash < 0 || eq < im { return Err(err(E::Margin)); }
+    v.active |= (1 << fi) | (1 << ti);
     Ok(())
 }
 

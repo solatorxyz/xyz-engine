@@ -229,7 +229,14 @@ pub const VAULT_SUBS: usize = 32;
 #[repr(C)]
 pub struct Vault { pub disc: u64, pub admin: Key, pub token_vault: Key, pub shares: u64, pub nav: i64, pub peak_nav: i64, pub nav_slot: u64,
     pub lockup_slots: u64, pub day_cap_bps: u64, pub perf_bps: u64, pub dd_bps: u64, pub halted: u64, pub day_start: u64, pub day_out: i64,
-    pub active: u64, pub n_subs: u64, pub subs: [Key; VAULT_SUBS] }
+    pub active: u64, pub n_subs: u64, pub subs: [Key; VAULT_SUBS],
+    /// The vault as a maker. `operator` (zero = none) is the hot key that writes the quotes of the vault's slabs and nothing
+    /// else: it can never move value out. Every quote it writes must be pegged to the book's price and on its own side of it
+    /// (an ask at or above, a bid at or below), and, when the admin asks for it:
+    /// q_min_edge_bps: at least this far from the price, measured on the ladder's reference price (the ladder then needs a
+    /// tolerance, at most q_max_tol_bps when that is set, so the reference stays near the price);
+    /// q_fresh != 0: the ladder fills only against a recent signed price.
+    pub operator: Key, pub q_min_edge_bps: u64, pub q_max_tol_bps: u64, pub q_fresh: u64 }
 #[repr(C)]
 pub struct VaultDeposit { pub disc: u64, pub vault: Key, pub owner: Key, pub shares: u64, pub unlock_slot: u64, pub basis: i64 }
 /// Markets the vault may take positions in, with an inventory cap as bps of NAV.

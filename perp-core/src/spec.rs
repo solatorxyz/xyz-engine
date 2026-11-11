@@ -402,6 +402,30 @@ pub const IX_VAULT_WITHDRAW: u64 = 54;
 pub const IX_VAULT_TAKEOVER: u64 = 55;
 pub const IX_VAULT_CRANK: u64 = 56;
 pub const IX_VAULT_SET: u64 = 57;
+/// The vault quotes for itself (its depositors are the house). A vault slab's quoting authority is the vault account, which
+/// can sign nothing, so only these instructions write it.
+/// Vault admin makes a slab for one of the vault's sub-accounts. accs: admin(s), vault(w), sub(r), slab(w, zeroed)
+pub const IX_VAULT_SLAB_INIT: u64 = 58;
+/// Market admin and vault admin approve the vault's slab on a book. accs: admin(s), market(r), fast(w), slab(w), vault(r), [signers / multisigs]
+pub const IX_VAULT_JOIN: u64 = 59;
+/// The vault's operator writes quotes: same items as IX_SLAB_QUOTE, checked against the vault's quote rules.
+/// accs: operator(s), vault(r), slab(w)
+pub const IX_VAULT_QUOTE: u64 = 79;
+/// Lock or release a sub-account's quoting margin (IX_SLAB_FUND for a vault). The vault admin may do either; the operator may
+/// only release or lower the target. accs: signer(s), sub(w), market(r), fast(w), vault(w), [other markets]. data: tag, amount i64, [target i64]
+pub const IX_VAULT_FUND: u64 = 80;
+/// Stop (1) or resume (0) all quotes of a vault slab: admin or operator. Anyone may stop them while the vault is halted.
+/// accs: signer, vault(r), slab(w). data: tag, on u8
+pub const IX_VAULT_KILL: u64 = 81;
+/// Vault admin names the operator and the quote rules. accs: admin(s), vault(w). data: tag, operator [32], min_edge_bps, max_tol_bps, fresh
+pub const IX_VAULT_OPERATOR: u64 = 82;
+/// Move idle cash between two sub-accounts of one vault (admin or operator): no value leaves the vault and both stay counted
+/// in its value. accs: signer(s), vault(w), from sub(w), to sub(w), [from's markets, and the books it quotes on]. data: tag, amount u64
+pub const IX_VAULT_MOVE: u64 = 83;
+/// Highest edge the admin can demand of the vault's quotes.
+pub const VAULT_MAX_EDGE_BPS: u64 = 1000;
+/// Widest tolerance (reference price vs the book's price) a vault's quote rules can allow.
+pub const VAULT_MAX_TOL_BPS: u64 = 2000;
 pub const ERR_LOCKED: u64 = 26;
 pub const ERR_HALTED: u64 = 27;
 pub const VAULT_VIRTUAL: u64 = 1000000;

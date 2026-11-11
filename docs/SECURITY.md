@@ -75,6 +75,33 @@ refused). Comments in `lib.rs` may lag behind; this file and the tests are autho
 - The mid EMA credits a deviation only for slots it was present at two consecutive samples (the smaller of the two), at most
   5 slots per sample. The premium sample is clamped to ±5%. Pushers sample every ~2 s.
 
+## The vault as a maker (2026-11-11)
+
+Depositors' money can quote the markets: a sub-account of the vault is the maker (tests: `vault_maker.rs`).
+
+- A vault slab's quoting authority is the vault account, which is program-owned and signs nothing, so `slab_quote`,
+  `slab_kill`, `slab_fund` and `fast_join` never apply to it. Only IX 58, 59, 79-83 write it.
+- Roles. Vault admin (may be a Multisig): makes the slab, approves it on a book together with the market admin, locks
+  margin or raises its target, names the operator and the quote rules. Operator (a hot key): writes quotes inside the
+  rules, stops and resumes them, releases margin or lowers its target, moves idle cash between the vault's own
+  sub-accounts. Anyone: settles fills, stops the quotes of a halted vault. None of these moves value out of the vault.
+- Quote rules, checked on every ladder a write names, as the ladder stands after the write: pegged to the book's price;
+  an ask at or above it and a bid at or below it; with `q_min_edge_bps`, at least that far from it, measured on the
+  ladder's reference price, which then needs a tolerance no wider than `q_max_tol_bps` (required, at most 2,000 bps);
+  with `q_fresh`, the ladder's fresh-price setting. A ladder offering nothing passes.
+  What the rules do not cover: an operator can still quote too tight, too large or not at all. The loss from a bad quote
+  is bounded by the margin the admin locked (budget = margin / IMR between settles), not by the rules.
+- The vault's value counts the margin its accounts have locked in the books (the program takes it out of their cash) and
+  is refused while any of their fills is unsettled or unclaimed: `vault_nav` needs each active sub-account's complete
+  view (the registered books of every market it quotes). Deposits, withdrawals, takeovers and the crank all go through
+  it, so a deposit can't buy the vault below its worth and a withdrawal can't leave before a loss is booked.
+- Withdrawals are paid from the idle cash of `subs[0]`. Cash locked for quoting has to be released first (admin or
+  operator), and other sub-accounts' cash moved back with IX 83.
+- A halted vault takes no new quotes and no more margin; what is posted can be stopped by anyone.
+- Limits to know: a sub-account quotes at most 16 markets (its position slots); valuing the vault takes every active
+  sub-account, its markets and their books in one transaction, which caps how many markets one vault can quote before
+  the value has to be computed in steps. Quotes expire after 30 slots like any maker's: the operator re-posts them.
+
 ## Invariants (fuzz target `program/fuzz`)
 
 Σ base = 0 per market; `oi_long` = Σ long base; insurance ≥ 0;
