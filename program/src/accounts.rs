@@ -3,7 +3,7 @@
 //! `load` is the one place the program turns account bytes into a typed reference. It checks owner, size and
 //! discriminator, then hands out `&'static mut T` straight into the account's data: zero-copy, and outside the borrow
 //! checker. The rule that keeps this sound is in the callers: no path keeps a `&mut` to an account while it loads the
-//! same account again (docs/SECURITY.md, "Aliasing"); `program-tests/diff-build.sh` reruns the suites at other
+//! same account again (docs/ARCHITECTURE.md, "Zero-copy"); `program-tests/diff-build.sh` reruns the suites at other
 //! optimisation levels to catch any behaviour that would lean on the optimiser's view of those references.
 
 use super::*;

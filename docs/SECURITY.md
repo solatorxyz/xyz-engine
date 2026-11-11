@@ -2,7 +2,7 @@
 
 This is the set of rules the program enforces after the November 2026 audit rounds. Anything here is a test in
 `program-tests/tests/` (suites `poc_a`, `poc_b`, `poc_c`, `review`..`review5` are the attacks that were found and are now
-refused). Comments in `lib.rs` may lag behind; this file and the tests are authoritative.
+refused). Comments in the source may lag behind; this file and the tests are authoritative. `ARCHITECTURE.md` is the map of the modules.
 
 ## Signers and authority
 
@@ -177,3 +177,41 @@ arguments (`slab_first(.., nx, signed)`); only a next-price ladder, and only in 
 by that price. A liquidation waives nothing.
 
 Lesson kept as a rule: a change to a fill path is not done until `lanes` has run on it.
+
+## The signing lease (2026-11-12)
+
+Rule: of the hosts that share a signing key, at most one is ever given a slot. `lease_claim` lets the holder only
+extend its term, and lets another member start a term only in a slot after the holder's last one, from that slot on.
+A host signs the price for slot s only while the lease it read (finalized) says `holder == me && since <= s <= expiry`.
+
+- Proved for all 64-bit inputs: `lease_step_keeps_terms_apart`, `lease_step_refuses_a_second_holder` (Kani).
+- Against the built program: `tests/lease.rs` (4,000 random claims by three hosts; the set of slots each was ever told
+  it holds never meets another's; only the key itself can put its signing under a lease; a stranger cannot claim).
+- Host side: `deploy/vault/test_lease.py` (hosts that read late, lose claims and freeze for hundreds of slots never sign
+  the same slot; a dead holder is replaced within a term; two healthy hosts do not trade the lease back and forth).
+  Two mutants are caught: a chain that lets a standby in early, and a host that assumes its renewal landed.
+- Not a check in the fill path. A key that ignores its lease can sign anything, as it could before the lease existed.
+
+## The vault under the fuzzer (2026-11-12)
+
+`fuzz_targets/vault.rs` carries its own valuation (cash + lots x mark + margin locked in the book) and checks after
+every instruction: money, lots, shares, that an account holding anything is counted, that a remembered part equals the
+model's figure for that slot, that the value a deposit / withdrawal / crank used is exactly live accounts plus
+remembered parts inside their window, and that shares are minted and paid against the one who acts.
+
+596,885 runs (25 minutes) without a violation. Planted bugs, each caught from the hand-made seeds:
+
+| Planted bug | Caught by |
+|---|---|
+| `vault_move` forgets to move the remembered parts | moves |
+| a deposit mints one share too many | price |
+| a remembered part never ages | whole |
+| an emptied account is dropped from the value while it still holds cash | counted |
+| a withdrawal leaves the fee in the vault's recorded value | price |
+
+## Proofs that had stopped compiling (2026-11-12)
+
+The three `ladder_room` Kani harnesses stopped compiling when next-price fills gave `ladder_room` a seventh argument,
+and nothing ran them. They are restated for it (a next-price fill is the one case the fresh-price rule does not gate)
+and verify again. `deploy/ops/kani_all.sh` now collects harnesses from every source file.
+

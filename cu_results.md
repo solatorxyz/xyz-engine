@@ -1,7 +1,7 @@
 | instruction (LiteSVM, Agave SBF runtime, perp_program.so) | CU |
 |---|---|
 | init_market | 2006 |
-| init_rank (admin) | 196 |
+| init_rank (admin) | 193 |
 | update_oracle (Pyth parse+conf+staleness, funding accrue) | 1170 |
 | deposit (SPL transfer CPI) | 1383 |
 | deposit (SPL transfer CPI) | 1383 |
@@ -18,9 +18,9 @@
 | update_oracle + premium/mark from full shard set (5 shards) | 3319 |
 | liquidate (takeover at mark: health x2, transfer, fees) | 4629 |
 | deposit (SPL transfer CPI) | 1383 |
-| adl_rank (permissionless re-score) | 2054 |
+| adl_rank (permissionless re-score) | 2057 |
 | ADL (bankrupt -> on-chain ranked counterparty -> insurance) | 7500 |
 | settle_funding (permissionless, 1 position) | 199 |
 | aggregate OI/fees from 9 shards (crank) | 733 |
-| liquidate_book (permissionless, 1 chunk into the book, no liquidator capital) | 5942 |
+| liquidate_book (permissionless, 1 chunk into the book, no liquidator capital) | 5939 |
 | exec SL trigger on mark (keeper crank, IOC reduce-only) | 3788 |
