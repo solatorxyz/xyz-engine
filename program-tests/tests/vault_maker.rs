@@ -461,3 +461,26 @@ const NX: &[u8; 8] = b"etnextpx";
     assert_eq!(e.user_state(&ku).cash - k0, 1_000, "the keeper is paid for the fill");
     assert_eq!(fb(&e, &h.f).makers[0].quote, 100_010 * 40 - 98_490 * 40, "sold 10 under the price of the stop's own slot");
 }
+
+#[test] fn next_price_quotes_outlive_ordinary_ones_and_the_fee_can_be_dropped() {
+    let mut e = Env::new(); let (h, signer) = house_next(&mut e); let m = e.market;
+    let (tp, tu) = e.user(10_000_000_000); let (kk, ku) = e.user(1_000_000);
+    // 100 slots after the quotes were written (an ordinary quote is dead after 30) a committed order still fills
+    let s = e.slot + 100; to_slot(&mut e, s, 1000_00000000);
+    set_trig(&mut e, &tp, &tu, 0, 4, 0, [0, PX + 2_000, 40, 0, 0, 0], true);
+    to_slot(&mut e, s + 2, 1000_00000000);
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&signer, &msg(NX, &m, 100_000, s + 2))), true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 40);
+    // past 150 they are gone: a maker that stopped does not keep trading for long
+    let s = e.slot + 60; to_slot(&mut e, s, 1000_00000000);
+    set_trig(&mut e, &tp, &tu, 0, 4, 1, [0, 0, 40, 0, 0, 0], true);
+    to_slot(&mut e, s + 2, 1000_00000000);
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&signer, &msg(NX, &m, 100_000, s + 2))), false);
+    assert_eq!(e.user_state(&tu).pos[0].base, 40);
+    // the admin can take the performance fee to zero (and nobody else can touch the terms)
+    let a = e.admin.pubkey(); let terms = |perf: u64| { let mut d = vec![57u8]; for x in [100u64, 2000, 2500, 0, perf] { d.extend_from_slice(&x.to_le_bytes()); } d };
+    e.send("", vec![sig(&kk), w(&h.v)], terms(0), &[&kk], false);
+    e.send("", vec![AccountMeta::new(a, true), w(&h.v)], terms(5001), &[], false);
+    e.send("", vec![AccountMeta::new(a, true), w(&h.v)], terms(700), &[], true); assert_eq!(vst(&e, &h.v).perf_bps, 700);
+    e.send("", vec![AccountMeta::new(a, true), w(&h.v)], terms(0), &[], true); assert_eq!(vst(&e, &h.v).perf_bps, 0);
+}

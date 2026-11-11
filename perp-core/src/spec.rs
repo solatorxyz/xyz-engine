@@ -402,6 +402,10 @@ pub const NEXT_DELAY_SLOTS: u64 = 2;
 /// dropped, a stop or TWAP slice can be committed again).
 pub const NEXT_EXPIRY_SLOTS: u64 = 40;
 pub const NEXT_PX_MAGIC: [u8; 8] = *b"etnextpx";
+/// How long a quote on a next-price ladder stays usable without being re-sent. Such a quote is an offset from a price that is
+/// signed afresh for every fill, so its age says nothing about its price; the limit only bounds how long a maker that has
+/// stopped (and can no longer pull its quotes) keeps trading. An ordinary quote keeps QUOTE_MAX_AGE_SLOTS.
+pub const NEXT_QUOTE_MAX_AGE_SLOTS: u32 = 150;
 /// slab_quote items with idx = QUOTE_ITEM_REF | ladder set (oracle price quoted against = px, tolerance bps = qty);
 /// idx = QUOTE_ITEM_INV | ladder set the inventory cap in lots (px; 0 = none) and the ladder flags (qty: LADDER_PEG).
 /// ladder = market idx << 1 | side. Settings items go before the quote items.

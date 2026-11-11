@@ -1908,7 +1908,7 @@ fn fast_bbo(sh: &[AccountView], pid: &Address, m: &Market, mk: &Key, slot: u64, 
                 for l in 0..SLAB_LEVELS {
                     if room == 0 || budget == 0 { break; }
                     let q = &s.quotes[base + l]; let p = qpx(q.px, px, lad.flags & spec::LADDER_PEG != 0);
-                    if q.qty == 0 || p < lo || p > hi || q.slot as u64 >= slot & 0xffff_ffff || slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
+                    if q.qty == 0 || p < lo || p > hi || q.slot as u64 >= slot & 0xffff_ffff || slot as u32 - q.slot.min(slot as u32) > quote_life(lad.flags) { continue; }
                     if guard && (if sd == 1 { p < px.saturating_sub(g) } else { p > px.saturating_add(g) }) { continue; }
                     let u_ = &f.used[mi][sd << 3 | l];
                     let left = if u_.gen == q.gen { (q.qty as u64).saturating_sub(u_.qty as u64) } else { q.qty as u64 };
@@ -2554,6 +2554,9 @@ fn qpx(px: u32, oracle: u64, peg: bool) -> u64 {
 /// position at the last settle + fast fills since. `bid`: the taker buys (hits the ask ladder, the maker sells). A ladder that
 /// asks for a fresh price (flags bits 8-15) gives 0 while the book's signed price is older than that many slots.
 #[inline(always)]
+/// Slots a quote of this ladder stays usable after it was written.
+#[inline(always)]
+fn quote_life(flags: u16) -> u32 { if flags & spec::LADDER_NEXT != 0 { spec::NEXT_QUOTE_MAX_AGE_SLOTS } else { spec::QUOTE_MAX_AGE_SLOTS } }
 fn ladder_room(f: &FastBook, l: &Ladder, mi: usize, bid: bool, oracle: u64, slot: u64, nx: bool) -> u64 {
     let fr = (l.flags >> spec::LADDER_FRESH_SHIFT) as u64;
     // (a next-price fill is judged against the price signed for its own slot, not the book's newest)
@@ -3082,7 +3085,7 @@ fn slab_first(f: &FastBook, sp: *const Slab, mi: usize, base_ix: usize, opp: usi
         if best.0 != 0 && (p != best.0 || q.slot >= best.2) { if p != best.0 { break; } continue; }
         // beyond the band on the far side every later level is too
         if bid { if p > hi { break; } if p < lo { continue; } } else { if p < lo { break; } if p > hi { continue; } }
-        if slot as u32 - q.slot.min(slot as u32) > spec::QUOTE_MAX_AGE_SLOTS { continue; }
+        if slot as u32 - q.slot.min(slot as u32) > quote_life(lad.flags) { continue; }
         if guard && (if bid { p < glo } else { p > ghi }) { continue; } // taker buys an ask under the price / sells into a bid over it
         let u_ = unsafe { f.used.get_unchecked(mi).get_unchecked(opp << 3 | l) };
         let av = (if u_.gen == q.gen { q.qty.saturating_sub(u_.qty) } else { q.qty }) as u64;
@@ -3489,11 +3492,13 @@ fn vault_crank(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
 }
 /// accs: admin(s), vault(w). data: tag, lockup_slots, day_cap_bps, dd_bps, halted
 fn vault_set(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
-    if a.len() < 2 || d.len() != 33 { return Err(err(E::BadData)); }
+    // data: tag, lockup, daily cap, drawdown, halted, [performance fee bps]
+    if a.len() < 2 || (d.len() != 33 && d.len() != 41) { return Err(err(E::BadData)); }
     let v: &mut Vault = load(&a[1], pid, DISC_VAULT, VAULT_SIZE)?;
     if !auth(pid, &v.admin, a) { return Err(err(E::BadAccount)); }
     v.lockup_slots = rd64(d, 1)?; v.day_cap_bps = rd64(d, 9)?; v.dd_bps = rd64(d, 17)?; v.halted = rd64(d, 25)?;
-    if v.day_cap_bps > 10000 || v.dd_bps > 10000 { return Err(err(E::BadData)); }
+    if d.len() == 41 { v.perf_bps = rd64(d, 33)?; }
+    if v.day_cap_bps > 10000 || v.dd_bps > 10000 || v.perf_bps > 5000 { return Err(err(E::BadData)); }
     Ok(())
 }
 
