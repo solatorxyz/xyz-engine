@@ -19,7 +19,7 @@ solana-address = { version = "2", features = ["curve25519"] }
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
-check-cfg = ['cfg(target_os, values("solana"))']
+check-cfg = ['cfg(target_os, values("solana"))', 'cfg(kani)']
 
 [profile.release]
 lto = "fat"
