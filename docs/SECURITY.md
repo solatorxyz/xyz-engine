@@ -114,7 +114,7 @@ price the book's signer signed for the slot `NEXT_DELAY_SLOTS` (2) after the com
 - The fill needs the Ed25519-verified message `etnextpx | market | px | slot | ts` from the book's signer with exactly that
   slot, a price within `FAST_PX_MAX_DEV_BPS` of the oracle, inside the same transaction. Quotes are priced off that price,
   not the book's newest; the ladder's fresh-price setting does not apply. Whoever executes cannot choose the price.
-- A commitment lapses `NEXT_EXPIRY_SLOTS` (10) after its pricing slot: a next-price order is dropped, a stop or TWAP slice
+- A commitment lapses `NEXT_EXPIRY_SLOTS` (40) after its pricing slot: a next-price order is dropped, a stop or TWAP slice
   goes back to being armable. Anyone may clear a lapsed one.
 - Where a maker of the book quotes next-price only, a stop or TWAP slice can't be filled without being armed first (it
   would be routed around those quotes).

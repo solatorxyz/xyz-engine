@@ -400,7 +400,7 @@ pub const TRIGGER_KIND_FLAG_ARMED: u64 = 1024;
 pub const NEXT_DELAY_SLOTS: u64 = 2;
 /// Slots after the pricing slot during which the commitment can still be filled; after that it lapses (a market order is
 /// dropped, a stop or TWAP slice can be committed again).
-pub const NEXT_EXPIRY_SLOTS: u64 = 10;
+pub const NEXT_EXPIRY_SLOTS: u64 = 40;
 pub const NEXT_PX_MAGIC: [u8; 8] = *b"etnextpx";
 /// slab_quote items with idx = QUOTE_ITEM_REF | ladder set (oracle price quoted against = px, tolerance bps = qty);
 /// idx = QUOTE_ITEM_INV | ladder set the inventory cap in lots (px; 0 = none) and the ladder flags (qty: LADDER_PEG).

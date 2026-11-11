@@ -427,8 +427,8 @@ const NX: &[u8; 8] = b"etnextpx";
     wd(&mut e, false);
     // another slot of the same account is free
     set_trig(&mut e, &tp, &tu, 1, 4, 0, [0, PX + 2_000, 10, 0, 0, 0], true);
-    // twelve slots after its pricing slot the price is too old: anyone clears it, nothing fills
-    to_slot(&mut e, s + 2 + 11, 1000_00000000);
+    // forty-one slots after its pricing slot the price is too old: anyone clears it, nothing fills
+    to_slot(&mut e, s + 2 + 41, 1000_00000000);
     exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&signer, &msg(NX, &m, 100_000, s + 2))), true);
     assert_eq!((e.user_state(&tu).triggers[0].kind, e.user_state(&tu).pos[0].base), (0, 0));
     exec(&mut e, &h, &kk, &ku, &tu, 1, false, None, true);
