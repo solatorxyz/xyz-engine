@@ -484,3 +484,151 @@ const NX: &[u8; 8] = b"etnextpx";
     e.send("", vec![AccountMeta::new(a, true), w(&h.v)], terms(700), &[], true); assert_eq!(vst(&e, &h.v).perf_bps, 700);
     e.send("", vec![AccountMeta::new(a, true), w(&h.v)], terms(0), &[], true); assert_eq!(vst(&e, &h.v).perf_bps, 0);
 }
+
+// ---------- the vault's value in parts ----------
+/// A second slab, for subs[1], approved on the same book.
+fn slab1(e: &mut Env, h: &H) -> Address {
+    let (a, m) = (e.admin.pubkey(), e.market); let s = Address::new_unique(); e.prog_acct(s, SLAB_SIZE);
+    e.send("", vec![AccountMeta::new(a, true), w(&h.v), r(&h.sub1), w(&s)], vec![58], &[], true);
+    e.send("", vec![AccountMeta::new(a, true), r(&m), w(&h.f), w(&s), r(&h.v)], vec![59], &[], true);
+    s
+}
+fn vval(e: &mut Env, h: &H, sub: &Address, rest: &[Address], ok: bool) {
+    let m = e.market; let mut a = vec![w(&h.v), w(sub), r(&m)]; a.extend(rest.iter().map(w));
+    e.send(if ok { "vault_value" } else { "" }, a, vec![84], &[], ok);
+}
+/// subs[1] locks margin, quotes 10 off the price on both sides, and a taker buys `qty` lots from it.
+fn sub1_sells(e: &mut Env, h: &H, s1: &Address, qty: u64) {
+    let (m, a) = (e.market, e.admin.pubkey());
+    let mut d = vec![80u8]; d.extend_from_slice(&2_000_000_000i64.to_le_bytes());
+    e.send("", vec![AccountMeta::new(a, true), w(&h.sub1), r(&m), w(&h.f), w(&h.v)], d, &[], true);
+    e.send("", vec![sig(&h.op), r(&h.v), w(s1)], items(79, &[PEGGED[0], PEGGED[1], (ASK, peg(10), 100_000), (0, peg(-10), 100_000)]), &[&h.op], true);
+    let (tp, tu) = e.user(100_000_000_000);
+    let mut d = vec![66u8, 0, 0, 1]; d.extend_from_slice(&(PX + 100).to_le_bytes()); d.extend_from_slice(&qty.to_le_bytes());
+    e.send("", vec![AccountMeta::new(tp.pubkey(), true), w(&tu), r(&m), w(&h.f), r(s1)], d, &[&tp], true);
+    assert_eq!(e.user_state(&tu).pos[0].base, qty as i64);
+    e.send("", vec![w(&h.sub1), r(&m), w(&h.f)], vec![65], &[], true);
+    assert_eq!(e.user_state(&h.sub1).pos[0].base, -(qty as i64));
+}
+
+#[test] fn a_vault_with_many_accounts_is_valued_a_part_at_a_time() {
+    let mut e = Env::new(); let h = house(&mut e);
+    let (a, av, asrc) = holder(&mut e, 10_000_000_000);
+    vdep(&mut e, &h, &a, &av, &asrc, 10_000_000_000, &[], true);
+    let s1 = slab1(&mut e, &h);
+    vmove(&mut e, &h, &h.op, &h.sub, &h.sub1, 4_000_000_000, true);
+    // the second account has never been valued: nothing that prices the vault may leave it out
+    let (b, bv, bsrc) = holder(&mut e, 10_000_000_000);
+    vdep(&mut e, &h, &b, &bv, &bsrc, 5_000_000_000, &[], false);
+    crank(&mut e, &h, &[], false);
+    // valuing is open to anyone, but only for the vault's own accounts
+    let (_, outsider) = e.user(1_000_000);
+    vval(&mut e, &h, &outsider, &[], false);
+    vval(&mut e, &h, &h.sub1, &[], true);
+    let v = vst(&e, &h.v);
+    assert_eq!((v.sub_eq[1], v.sub_slot[1], v.active), (4_000_000_000, e.slot, 0b11));
+    // now a deposit carries only the cash account and its markets, and pays the full value
+    vdep(&mut e, &h, &b, &bv, &bsrc, 5_000_000_000, &[], true);
+    assert_eq!(vds(&e, &bv).shares, 5_000_000_000, "the 4,000 held in the other account is counted");
+    let v = vst(&e, &h.v);
+    assert_eq!((v.nav, v.sub_eq[0], v.sub_eq[1]), (15_000_000_000, 11_000_000_000, 4_000_000_000));
+    // the second account quotes and is left short 50,000 lots at 100,010
+    sub1_sells(&mut e, &h, &s1, 50_000);
+    // fills waiting to be settled: no value is taken (settled above, so it is now)
+    vval(&mut e, &h, &h.sub1, &[], false); // not without the book it has margin in
+    vval(&mut e, &h, &h.sub1, &[h.f], true);
+    assert_eq!(vst(&e, &h.v).sub_eq[1] as i128, worth(&e, &h, &h.sub1));
+    assert_eq!(vst(&e, &h.v).sub_eq[1], 4_000_000_000 + 10 * 50_000, "sold 10 above the mark");
+    // a remembered value is good for 75 slots and not one more
+    let s = e.slot; e.set_time(s + 75); e.oracle_update("", 1000_00000000, None);
+    crank(&mut e, &h, &[], true);
+    assert_eq!(vst(&e, &h.v).nav, 15_000_000_000 + 10 * 50_000);
+    e.set_time(s + 76); e.oracle_update("", 1000_00000000, None);
+    crank(&mut e, &h, &[], false);
+    vdep(&mut e, &h, &b, &bv, &bsrc, 1_000_000_000, &[], false);
+    vwd(&mut e, &h, &a, &av, &asrc, 1_000_000, &[], false);
+    // either refresh the part, or pass the account itself with its book: both give the same value
+    crank(&mut e, &h, &[h.sub1, h.f], true);
+    let live = vst(&e, &h.v).nav;
+    vval(&mut e, &h, &h.sub1, &[h.f], true);
+    crank(&mut e, &h, &[], true);
+    assert_eq!(vst(&e, &h.v).nav, live);
+}
+
+#[test] fn cash_moved_between_accounts_is_neither_lost_nor_counted_twice() {
+    let mut e = Env::new(); let h = house(&mut e);
+    let (a, av, asrc) = holder(&mut e, 10_000_000_000);
+    vdep(&mut e, &h, &a, &av, &asrc, 10_000_000_000, &[], true);
+    vmove(&mut e, &h, &h.op, &h.sub, &h.sub1, 1_000_000_000, true);
+    vval(&mut e, &h, &h.sub1, &[], true);
+    // after the part was taken, 6,000 more moves across. A deposit values the cash account live (4,000 less) and the
+    // other one from memory: if the memory did not move with the cash, 10,000 would buy the vault as if it were worth 4,000.
+    vmove(&mut e, &h, &h.op, &h.sub, &h.sub1, 6_000_000_000, true);
+    let v = vst(&e, &h.v);
+    assert_eq!((v.sub_eq[0], v.sub_eq[1]), (3_000_000_000, 7_000_000_000));
+    let (b, bv, bsrc) = holder(&mut e, 10_000_000_000);
+    vdep(&mut e, &h, &b, &bv, &bsrc, 10_000_000_000, &[], true);
+    assert_eq!(vds(&e, &bv).shares, 10_000_000_000);
+    // and back the other way, before a withdrawal: moved-back cash is not counted on both sides
+    vmove(&mut e, &h, &h.op, &h.sub1, &h.sub, 7_000_000_000, true);
+    let s = e.slot; e.set_time(s + 101); e.oracle_update("", 1000_00000000, None); // past the lockup
+    vval(&mut e, &h, &h.sub1, &[], true);
+    assert_eq!(vst(&e, &h.v).active, 0b01, "an emptied account drops out of the value");
+    let before = token_bal(&e, &asrc);
+    vwd(&mut e, &h, &a, &av, &asrc, 10_000_000_000, &[], false); // over the day's 20%
+    vwd(&mut e, &h, &a, &av, &asrc, 2_000_000_000, &[], true);
+    assert_eq!(token_bal(&e, &asrc) - before, 2_000_000_000);
+    assert_eq!(vst(&e, &h.v).sub_eq[0], 18_000_000_000);
+    // an account that dropped out comes back with the first cash it receives, at the right value straight away
+    vmove(&mut e, &h, &h.op, &h.sub, &h.sub1, 500_000_000, true);
+    let v = vst(&e, &h.v);
+    assert_eq!((v.active, v.sub_eq[1]), (0b11, 500_000_000));
+    crank(&mut e, &h, &[], true);
+    assert_eq!(vst(&e, &h.v).nav, 18_000_000_000);
+}
+
+#[test] fn a_remembered_value_can_be_off_only_by_the_markets_move_inside_its_window() {
+    let mut e = Env::new(); let h = house(&mut e);
+    let (a, av, asrc) = holder(&mut e, 10_000_000_000);
+    vdep(&mut e, &h, &a, &av, &asrc, 10_000_000_000, &[], true);
+    let s1 = slab1(&mut e, &h);
+    vmove(&mut e, &h, &h.op, &h.sub, &h.sub1, 4_000_000_000, true);
+    sub1_sells(&mut e, &h, &s1, 50_000);
+    let s = e.slot; e.set_time(s + 101); e.oracle_update("", 1000_00000000, None); // past the lockup
+    vval(&mut e, &h, &h.sub1, &[h.f], true);
+    let kept = vst(&e, &h.v).sub_eq[1] as i128;
+    // the price jumps 2% against the short inside the window. The holder leaves at the remembered value ...
+    let s = e.slot; e.set_time(s + 30); e.oracle_update("", 1020_00000000, None);
+    let live = worth(&e, &h, &h.sub1);
+    let gap = kept - live;
+    assert!(gap > 0 && (gap - 2_000 * 50_000).abs() <= 2_000_000, "what the short lost on the move (funding aside): {gap}");
+    let before = token_bal(&e, &asrc);
+    vwd(&mut e, &h, &a, &av, &asrc, 1_000_000_000, &[], true);
+    let got = (token_bal(&e, &asrc) - before) as i128;
+    // ... and is overpaid by exactly their share (a tenth here) of that gap, no more: the window is the whole of the edge
+    let fair = (10_000_000_000 + (live - 4_000_000_000)) / 10;
+    assert!(got > fair && (got - fair - gap / 10).abs() <= 10, "got {got} fair {fair} gap {gap}");
+    // once anyone refreshes the part, the next one out is paid at the lower value
+    vval(&mut e, &h, &h.sub1, &[h.f], true);
+    let before = token_bal(&e, &asrc);
+    vwd(&mut e, &h, &a, &av, &asrc, 500_000_000, &[], true);
+    let got2 = (token_bal(&e, &asrc) - before) as i128;
+    assert!(got2 * 2 < fair, "half as many shares, paid below even the fair value of before: the first one out took the difference with them");
+}
+
+#[test] fn a_full_transaction_of_vault_quotes_fits_the_compute_limit() {
+    // the bot packs about 90 quote items (9 markets x 2 sides x 5 levels) into one transaction: what does that cost?
+    let mut e = Env::new(); let h = house(&mut e);
+    let (a, av, asrc) = holder(&mut e, 10_000_000_000);
+    vdep(&mut e, &h, &a, &av, &asrc, 10_000_000_000, &[], true);
+    vfund(&mut e, &h, None, 1_000_000_000, None, true);
+    rules(&mut e, &h, 1, 200, 0, true);
+    let refs = [(0x8000u16, PX as u32, 200u32), (0x8000 | ASK_LAD, PX as u32, 200), PEGGED[0], PEGGED[1]];
+    let lv: Vec<(u16, u32, u32)> = (0..5u16).flat_map(|i| [(ASK + i, peg(10 * (i as i64 + 1)), 100), (i, peg(-10 * (i as i64 + 1)), 100)]).collect();
+    let one: Vec<_> = refs.iter().cloned().chain(lv.iter().cloned()).collect();
+    let c14 = vquote(&mut e, &h, &h.op, &one, true).unwrap();
+    let many: Vec<_> = (0..9).flat_map(|_| lv.iter().cloned()).collect();
+    let c90 = vquote(&mut e, &h, &h.op, &many, true).unwrap();
+    println!("vault_quote CU: 14 items {c14}, 90 items {c90}");
+    assert!(c90 < 400_000, "{c90}");
+}

@@ -236,7 +236,13 @@ pub struct Vault { pub disc: u64, pub admin: Key, pub token_vault: Key, pub shar
     /// q_min_edge_bps: at least this far from the price, measured on the ladder's reference price (the ladder then needs a
     /// tolerance, at most q_max_tol_bps when that is set, so the reference stays near the price);
     /// q_fresh != 0: the ladder fills only against a recent signed price.
-    pub operator: Key, pub q_min_edge_bps: u64, pub q_max_tol_bps: u64, pub q_fresh: u64 }
+    pub operator: Key, pub q_min_edge_bps: u64, pub q_max_tol_bps: u64, pub q_fresh: u64,
+    /// The vault's value, kept in parts. A vault that quotes many markets has more accounts than one transaction can carry,
+    /// so each sub-account is valued on its own (vault_value, or whenever it is passed to an instruction that values the
+    /// vault): `sub_eq` is what it was worth at slot `sub_slot`. A deposit or withdrawal may use a part instead of the
+    /// account itself only while it is at most VAULT_VALUE_MAX_AGE_SLOTS old. Cash moved between sub-accounts, deposited
+    /// or withdrawn is applied to the parts on the spot, so a part is only ever out of date by what the market did since.
+    pub sub_eq: [i64; VAULT_SUBS], pub sub_slot: [u64; VAULT_SUBS] }
 #[repr(C)]
 pub struct VaultDeposit { pub disc: u64, pub vault: Key, pub owner: Key, pub shares: u64, pub unlock_slot: u64, pub basis: i64 }
 /// Markets the vault may take positions in, with an inventory cap as bps of NAV.

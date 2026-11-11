@@ -102,6 +102,33 @@ Depositors' money can quote the markets: a sub-account of the vault is the maker
   sub-account, its markets and their books in one transaction, which caps how many markets one vault can quote before
   the value has to be computed in steps. Quotes expire after 30 slots like any maker's: the operator re-posts them.
 
+## The vault's value in parts (2026-11-11)
+
+A vault that quotes every market has more accounts than one transaction can carry (a sub-account holds 16 positions; each
+needs its market and its book). So the value is kept a part at a time:
+
+- `Vault.sub_eq[i]` / `sub_slot[i]`: what sub-account i was worth, and when. Written by `vault_value` (IX 84, anyone) and
+  whenever the account itself is passed to an instruction that values the vault. A part is the account's equity with
+  funding settled plus its locked quoting margin, and is refused while fills wait to be settled into it (as before).
+- A valuation (deposit, withdrawal, takeover, crank) takes each active account live if it is passed, otherwise its part,
+  which must be at most `VAULT_VALUE_MAX_AGE_SLOTS` (75, 30 s) old. Never valued or too old: `Stale`, nothing happens.
+- Cash that moves is applied to the parts on the spot: `vault_move` takes it from one part and adds it to the other,
+  deposit and withdrawal adjust the cash account's. Without that, a valuation mixing a live account with a remembered one
+  would lose the moved cash or count it twice (test: 10,000 would have bought the vault as if worth 4,000).
+- An account with no cash and no positions drops out of the value at its next `vault_value` and returns with the first
+  cash, margin or position that reaches it.
+
+What this gives up. Whoever deposits or withdraws chooses, per account, between the live value and a part up to 30 s
+old. They can therefore gain their own share of what the market did to that account's inventory inside the window, and
+no more (test `a_remembered_value_can_be_off_only_by_the_markets_move_inside_its_window`: a 2% jump against a short,
+a holder of a tenth leaves overpaid by a tenth of the loss, the next one out is paid at the lower value). It cannot be
+repeated quickly (lockup, daily cap) and nobody can make a part older than the last time anyone valued it, so the
+operator's bot valuing every account each 12 s bounds it in practice to seconds. Shrinking the constant shrinks the edge
+and makes deposits depend more on that upkeep. A withdrawal priced only after it is requested would remove it; not built.
+
+Availability: a takeover by a vault of several accounts now needs the other parts fresh (it could not pass them all
+anyway). Anyone can refresh them.
+
 ## Next-price execution (2026-11-11)
 
 A maker ladder flagged `LADDER_NEXT` never fills an immediate take. It fills only an order that was committed first, at the

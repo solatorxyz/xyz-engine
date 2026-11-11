@@ -242,6 +242,7 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
         spec::IX_VAULT_KILL => vault_kill(pid, accs, data),
         spec::IX_VAULT_OPERATOR => vault_operator(pid, accs, data),
         spec::IX_VAULT_MOVE => vault_move(pid, accs, data),
+        spec::IX_VAULT_VALUE => vault_value(pid, accs),
         spec::IX_ADMIN_EXECUTE => admin_execute(pid, accs),
         IX_AGG_INIT => agg_init(pid, accs, data),
         IX_AGG_POST => agg_post(pid, accs, data),
@@ -3362,21 +3363,49 @@ fn vault_link(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     l.disc = DISC_VLINK; l.vault = key(&a[1]); l.market = key(&a[2]); l.cap_bps = rd64(d, 1)?;
     Ok(())
 }
-/// Vault value: equity of every active sub-account. Flat, unused subs need no account.
-fn vault_nav(pid: &Address, v: &Vault, a: &[AccountView], nw: Now) -> Result<i128, ProgramError> {
+/// What one sub-account is worth: its equity with funding settled, plus the margin it has locked in the books. Its fills
+/// must be settled into it (and its resting orders' fills claimed) first: the program takes locked margin out of the
+/// account's cash, so equity alone would leave it out and a deposit would buy the vault below its worth.
+fn sub_worth(pid: &Address, u: &mut User, uk: &Key, a: &[AccountView], nw: Now) -> Result<i128, ProgramError> {
+    settle_funding_all(pid, u, a)?;
+    complete_view(pid, u, uk, a, None)?;
+    Ok(health(pid, u, a, nw, true)?.0 + maker_mirror(u))
+}
+/// Vault value: the worth of every active sub-account. One that is passed is valued now (and remembered); one that is not
+/// counts at its remembered value, which must be recent. Flat, unused subs need neither.
+fn vault_nav(pid: &Address, v: &mut Vault, a: &[AccountView], nw: Now) -> Result<i128, ProgramError> {
     let mut nav = 0i128;
-    for i in 0..v.n_subs as usize {
+    for i in 0..(v.n_subs as usize).min(VAULT_SUBS) {
         if v.active >> i & 1 == 0 { continue; }
-        let x = a.iter().find(|x| key(x) == v.subs[i]).ok_or(err(E::MissingShards))?;
-        let u: &mut User = load(x, pid, DISC_USER, USER_SIZE)?;
-        settle_funding_all(pid, u, a)?;
-        // A sub-account that quotes: its fills must be settled into it (and its resting orders' fills claimed) before it is
-        // valued, and the margin it has locked in the books is the vault's too. The program takes that margin out of the
-        // account's cash, so equity alone would leave it out and a deposit would buy the vault below its worth.
-        complete_view(pid, u, &v.subs[i], a, None)?;
-        nav += health(pid, u, a, nw, true)?.0 + maker_mirror(u);
+        match a.iter().find(|x| key(x) == v.subs[i]) {
+            Some(x) => {
+                let u: &mut User = load(x, pid, DISC_USER, USER_SIZE)?;
+                let w = sub_worth(pid, u, &v.subs[i], a, nw)?;
+                v.sub_eq[i] = i64c(w)?; v.sub_slot[i] = nw.0;
+                nav += w;
+            }
+            None => {
+                if v.sub_slot[i] == 0 || nw.0 > v.sub_slot[i].saturating_add(spec::VAULT_VALUE_MAX_AGE_SLOTS) { return Err(err(E::Stale)); }
+                nav += v.sub_eq[i] as i128;
+            }
+        }
     }
     Ok(nav)
+}
+/// Permissionless: value one sub-account and remember it, so a vault with more accounts than a transaction can carry can
+/// still be valued, a part at a time. accs: vault(w), sub(w), [its markets, the books it quotes on, shards where it rests orders]
+fn vault_value(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
+    if a.len() < 2 { return Err(err(E::BadData)); }
+    let v: &mut Vault = load(&a[0], pid, DISC_VAULT, VAULT_SIZE)?;
+    let sk = key(&a[1]);
+    let si = vault_sub(v, &sk)?;
+    let u: &mut User = load(&a[1], pid, DISC_USER, USER_SIZE)?;
+    let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
+    let w = sub_worth(pid, u, &sk, &a[2..], nw)?;
+    v.sub_eq[si] = i64c(w)?; v.sub_slot[si] = clk.slot;
+    // an account with nothing in it is no part of the value (and needs no upkeep) until cash, margin or a position reaches it again
+    if si != 0 && u.cash == 0 && u.pos.iter().all(|p| p.market == [0; 32]) { v.active &= !(1 << si); } else { v.active |= 1 << si; }
+    Ok(())
 }
 /// Margin an account has locked for quoting, as the program mirrors it on its pinned cross positions.
 fn maker_mirror(u: &User) -> i128 {
@@ -3415,6 +3444,7 @@ fn vault_deposit(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResul
     pinocchio_token::instructions::Transfer::new(&a[6], &a[5], &a[0], amt).invoke_with_program(a[7].address())?;
     let s0: &mut User = load(&a[3], pid, DISC_USER, USER_SIZE)?;
     s0.cash = i64c(s0.cash as i128 + amt as i128)?;
+    v.sub_eq[0] = i64c(v.sub_eq[0] as i128 + amt as i128)?;
     v.shares += u64::try_from(minted).map_err(|_| err(E::Math))?;
     vd.shares += minted as u64; vd.basis = i64c(vd.basis as i128 + amt as i128)?; vd.unlock_slot = clk.slot + v.lockup_slots;
     vault_mark(v, nav + amt as i128, clk.slot)
@@ -3448,6 +3478,7 @@ fn vault_withdraw(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let s0: &mut User = load(&a[3], pid, DISC_USER, USER_SIZE)?;
     if out + fee > s0.cash as i128 { return Err(err(E::Margin)); }
     s0.cash = i64c(s0.cash as i128 - out - fee)?;
+    v.sub_eq[0] = i64c(v.sub_eq[0] as i128 - out - fee)?;
     if fee > 0 { m.fees = i64c(m.fees as i128 + fee)?; }
     let (eq, im, _) = health_im(pid, s0, &a[3..], nw, true)?;
     if eq < im { return Err(err(E::Margin)); }
@@ -3482,7 +3513,8 @@ fn vault_takeover(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     }
     Ok(())
 }
-/// Permissionless: refresh value, peak and the drawdown stop. accs: vault(w), [active subs, markets]
+/// Permissionless: refresh value, peak and the drawdown stop. accs: vault(w), [active subs with their markets and books; a
+/// sub left out counts at its remembered value while that is recent]
 fn vault_crank(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if a.len() < 2 { return Err(err(E::BadData)); }
     let v: &mut Vault = load(&a[0], pid, DISC_VAULT, VAULT_SIZE)?;
@@ -3634,6 +3666,9 @@ fn vault_move(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let (eq, im, _) = health_im(pid, from, &a[4..], nw, true)?;
     if from.cash < 0 || eq < im { return Err(err(E::Margin)); }
     v.active |= (1 << fi) | (1 << ti);
+    // the remembered values move with the cash: a valuation that takes one account live and the other from memory must
+    // neither lose the money nor count it twice
+    v.sub_eq[fi] = i64c(v.sub_eq[fi] as i128 - amt as i128)?; v.sub_eq[ti] = i64c(v.sub_eq[ti] as i128 + amt as i128)?;
     Ok(())
 }
 

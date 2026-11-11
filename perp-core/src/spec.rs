@@ -441,6 +441,15 @@ pub const IX_VAULT_OPERATOR: u64 = 82;
 /// Move idle cash between two sub-accounts of one vault (admin or operator): no value leaves the vault and both stay counted
 /// in its value. accs: signer(s), vault(w), from sub(w), to sub(w), [from's markets, and the books it quotes on]. data: tag, amount u64
 pub const IX_VAULT_MOVE: u64 = 83;
+/// Permissionless: value one sub-account of a vault and remember it (its equity, the margin it has locked in the books,
+/// funding settled; refused while fills are waiting to be settled into it). An account with nothing in it drops out of the
+/// vault's value until it is used again. accs: vault(w), sub(w), [the sub's markets, the books it quotes on, the shards of
+/// markets where it rests orders]. data: tag
+pub const IX_VAULT_VALUE: u64 = 84;
+/// How old a remembered sub-account value may be when a deposit, withdrawal, takeover or crank uses it in place of the
+/// account (30 s). It bounds what a depositor or withdrawer can gain by picking a remembered value over the live one:
+/// the market's move on that sub-account's inventory over this window, on their own share.
+pub const VAULT_VALUE_MAX_AGE_SLOTS: u64 = 75;
 /// Highest edge the admin can demand of the vault's quotes.
 pub const VAULT_MAX_EDGE_BPS: u64 = 1000;
 /// Widest tolerance (reference price vs the book's price) a vault's quote rules can allow.
