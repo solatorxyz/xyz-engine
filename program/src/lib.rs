@@ -3342,14 +3342,14 @@ fn vault_deposit(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResul
     vd.shares += minted as u64; vd.basis = i64c(vd.basis as i128 + amt as i128)?; vd.unlock_slot = clk.slot + v.lockup_slots;
     vault_mark(v, nav + amt as i128, clk.slot)
 }
-/// accs: owner(s), vault(w), depositor(w), subs[0](w), market(r), token vault(w), dst(w), token program, vault pda, [active subs, markets]
+/// accs: owner(s), vault(w), depositor(w), subs[0](w), market(w when a performance fee is due, else r), token vault(w), dst(w), token program, vault pda, [active subs, markets, books]
 /// data: tag, shares
 fn vault_withdraw(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if a.len() < 9 || !sg(pid, &a[0]) { return Err(err(E::BadData)); }
     let sh = rd64(d, 1)?;
     let v: &mut Vault = load(&a[1], pid, DISC_VAULT, VAULT_SIZE)?;
     let vd: &mut VaultDeposit = load(&a[2], pid, DISC_VDEP, VDEP_SIZE)?;
-    let m: &Market = load(&a[4], pid, DISC_MARKET, MARKET_SIZE)?;
+    let m: &mut Market = load(&a[4], pid, DISC_MARKET, MARKET_SIZE)?;
     if vd.vault != key(&a[1]) || vd.owner != key(&a[0]) || key(&a[3]) != v.subs[0] || key(&a[5]) != v.token_vault || m.vault != v.token_vault { return Err(err(E::BadAccount)); }
     if a[7].address() != &pinocchio_token::ID { return Err(err(E::TokenProgram)); }
     if sh == 0 || sh > vd.shares { return Err(err(E::BadData)); }
@@ -3358,7 +3358,9 @@ fn vault_withdraw(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let nav = vault_nav(pid, v, &a[3..], nw)?;
     let gross = sh as i128 * (nav + VV) / (v.shares as i128 + VV);
     let cost = vd.basis as i128 * sh as i128 / vd.shares as i128;
-    let fee = if gross > cost { (gross - cost) * v.perf_bps as i128 / 10000 } else { 0 }; // kept in the vault for remaining holders
+    // The performance fee is the protocol's: it leaves the vault for the market's fee ledger (so the market must be passed
+    // writable whenever there is a gain to charge). It used to stay in the vault, a gift to the holders who remained.
+    let fee = if gross > cost { (gross - cost) * v.perf_bps as i128 / 10000 } else { 0 };
     let out = gross - fee;
     if out <= 0 { return Err(err(E::BadData)); }
     if v.day_cap_bps != 0 {
@@ -3367,12 +3369,13 @@ fn vault_withdraw(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
         v.day_out = i64c(v.day_out as i128 + out)?;
     }
     let s0: &mut User = load(&a[3], pid, DISC_USER, USER_SIZE)?;
-    if out > s0.cash as i128 { return Err(err(E::Margin)); }
-    s0.cash = i64c(s0.cash as i128 - out)?;
+    if out + fee > s0.cash as i128 { return Err(err(E::Margin)); }
+    s0.cash = i64c(s0.cash as i128 - out - fee)?;
+    if fee > 0 { m.fees = i64c(m.fees as i128 + fee)?; }
     let (eq, im, _) = health_im(pid, s0, &a[3..], nw, true)?;
     if eq < im { return Err(err(E::Margin)); }
     v.shares -= sh; vd.shares -= sh; vd.basis = i64c(vd.basis as i128 - cost)?;
-    vault_mark(v, nav - out, clk.slot)?;
+    vault_mark(v, nav - out - fee, clk.slot)?;
     let bump = [m.vault_bump as u8];
     let seeds = [Seed::from(b"vault".as_slice()), Seed::from(&m.vault_seed), Seed::from(&bump)];
     pinocchio_token::instructions::Transfer::new(&a[5], &a[6], &a[8], out as u64)

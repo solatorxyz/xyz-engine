@@ -18,7 +18,8 @@ fn vds(e: &Env, k: &Address) -> VaultDeposit { unsafe { std::ptr::read_unaligned
 fn sig(k: &Keypair) -> AccountMeta { AccountMeta::new_readonly(k.pubkey(), true) }
 struct H { v: Address, sub: Address, sub1: Address, slab: Address, f: Address, op: Keypair }
 /// A vault with two sub-accounts, an operator, and a slab for subs[0] approved on the market's book.
-fn house(e: &mut Env) -> H {
+fn house(e: &mut Env) -> H { house_p(e, 0) }
+fn house_p(e: &mut Env, perf: u64) -> H {
     e.oracle_update("", 1000_00000000, None);
     let (a, m) = (e.admin.pubkey(), e.market);
     let f = Address::new_unique(); e.prog_acct(f, FAST_SIZE);
@@ -26,7 +27,7 @@ fn house(e: &mut Env) -> H {
     e.send("", vec![AccountMeta::new(a, true), w(&m), w(&f)], d, &[], true);
     let (v, sub, sub1, slab) = (Address::new_unique(), Address::new_unique(), Address::new_unique(), Address::new_unique());
     e.prog_acct(v, VAULT_SIZE); e.prog_acct(sub, USER_SIZE); e.prog_acct(sub1, USER_SIZE); e.prog_acct(slab, SLAB_SIZE);
-    let mut d = vec![50u8]; for x in [100u64, 2000, 0, 2500] { d.extend_from_slice(&x.to_le_bytes()); }
+    let mut d = vec![50u8]; for x in [100u64, 2000, perf, 2500] { d.extend_from_slice(&x.to_le_bytes()); }
     e.send("", vec![AccountMeta::new(a, true), w(&v), r(&m)], d, &[], true);
     e.send("", vec![AccountMeta::new(a, true), w(&v), w(&sub)], vec![51], &[], true);
     e.send("", vec![AccountMeta::new(a, true), w(&v), w(&sub1)], vec![51], &[], true);
@@ -299,4 +300,34 @@ fn worth(e: &Env, h: &H, sub: &Address) -> i128 {
     e.send("", vec![AccountMeta::new(adm2.pubkey(), true), w(&h.sub), r(&m), w(&h.f), w(&h.v)], d, &[&adm2], false);
     let mut d = vec![83u8]; d.extend_from_slice(&1u64.to_le_bytes());
     e.send("", vec![sig(&adm2), w(&v2), w(&h.sub), w(&x2), r(&m)], d, &[&adm2], false); // can't pull v1's cash into v2
+}
+
+#[test] fn the_performance_fee_goes_to_the_protocol_not_to_the_other_holders() {
+    let mut e = Env::new(); let h = house_p(&mut e, 1000); // 10% of a holder's gain
+    let (a, av, asrc) = holder(&mut e, 10_000_000_000);
+    vdep(&mut e, &h, &a, &av, &asrc, 10_000_000_000, &[], true);
+    vfund(&mut e, &h, None, 2_000_000_000, None, true);
+    vquote(&mut e, &h, &h.op, &[PEGGED[0], PEGGED[1], (ASK, peg(10), 1_000), (0, peg(-10), 1_000)], true);
+    let (tp, tu) = e.user(100_000_000_000);
+    take(&mut e, &h, &tp, &tu, 0, PX + 100, 1_000); // the vault sells 1,000 lots at 100,010
+    let s = e.slot; e.set_time(s + 101); e.oracle_update("", 990_00000000, None); // -1%: the vault's short is in profit
+    settle(&mut e, &h); crank(&mut e, &h, &[h.f], true);
+    let nav = vst(&e, &h.v).nav as i128; assert!(nav > 10_000_000_000);
+    let (fees0, before) = (e.market_state().fees as i128, token_bal(&e, &asrc));
+    let gross = 1_000_000_000i128 * (nav + 1_000_000) / (10_000_000_000 + 1_000_000);
+    let fee = (gross - 1_000_000_000) / 10; assert!(fee > 0);
+    // a fee is due, so the market's fee ledger is written: with the market read-only the withdrawal is refused
+    vwd(&mut e, &h, &a, &av, &asrc, 1_000_000_000, &[h.f], false);
+    let (m, tv, pda) = (e.market, e.vault, e.vault_pda); let mut d = vec![54u8]; d.extend_from_slice(&1_000_000_000u64.to_le_bytes());
+    e.send("", vec![AccountMeta::new(a.pubkey(), true), w(&h.v), w(&av), w(&h.sub), w(&m), w(&tv), w(&asrc), r(&TOKEN), r(&pda), w(&h.f)], d, &[&a], true);
+    assert_eq!((token_bal(&e, &asrc) - before) as i128, gross - fee, "the holder is paid the gain less the fee");
+    assert_eq!(e.market_state().fees as i128 - fees0, fee, "the fee is the protocol's");
+    assert_eq!(vst(&e, &h.v).nav as i128, nav - gross, "and none of it stays behind for the other holders");
+    // no gain, no fee: a holder who bought in at the current value and leaves at it pays nothing and needs no writable market
+    let (b, bv, bsrc) = holder(&mut e, 1_000_000_000);
+    vdep(&mut e, &h, &b, &bv, &bsrc, 1_000_000_000, &[h.f], true);
+    let s = e.slot; e.set_time(s + 101); e.oracle_update("", 990_00000000, None);
+    let (fees1, sh) = (e.market_state().fees, vds(&e, &bv).shares);
+    vwd(&mut e, &h, &b, &bv, &bsrc, sh, &[h.f], true);
+    assert_eq!(e.market_state().fees, fees1);
 }
