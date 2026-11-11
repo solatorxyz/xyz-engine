@@ -13,7 +13,7 @@
 | batch cancel 10 | 3690 |
 | taker IOC: match 5 levels across 3 shards | 6399 |
 | taker IOC: match 1 level | 2719 |
-| withdraw (margin check + PDA-signed SPL CPI) | 2083 |
+| withdraw (margin check + PDA-signed SPL CPI) | 2085 |
 | batch replace + claim maker fills (3 shards w/ ledgers) | 11143 |
 | update_oracle + premium/mark from full shard set (5 shards) | 3312 |
 | liquidate (takeover at mark: health x2, transfer, fees) | 4625 |
