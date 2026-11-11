@@ -2963,7 +2963,7 @@ fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base
     let oracle = if nx != 0 { nx } else { book_px(f, m, slot) };
     // maker quotes are judged against the book's price, so they fill only while that price is recent (spec::FAST_GUARD_MAX_AGE_SLOTS)
     let aged = nx == 0 && !(f.fast_px != 0 && slot <= f.fast_slot + spec::FAST_PX_MAX_SLOTS) && slot > m.oracle_slot + spec::FAST_GUARD_MAX_AGE_SLOTS;
-    for (k, &(sp, mi)) in sl.iter().enumerate() { cand[k].write(if aged { (0, 0, 0, 0, 0) } else { slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0, oracle, nx != 0) }); }
+    for (k, &(sp, mi)) in sl.iter().enumerate() { cand[k].write(if aged { (0, 0, 0, 0, 0) } else { slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0, oracle, nx != 0, nx != 0) }); }
     let (mut acc, mut fees) = (Acc { q: 0, nt: 0, fee: 0 }, 0u64);
     while left > 0 {
         let (mut bk, mut best): (usize, Cand) = (usize::MAX, (0, 0, 0, 0, 0));
@@ -2993,7 +2993,7 @@ fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base
         acc.add(u, pi, bid, fq, nt, fee)?;
         ev.push(bp, fq, idt | (mi as u64) << 32 | q.gen as u64);
         left -= fq;
-        if left > 0 { cand[bk].write(slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, b0, oracle, nx != 0)); }
+        if left > 0 { cand[bk].write(slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, b0, oracle, nx != 0, nx != 0)); }
     }
     acc.book(u, pi, bid)?;
     f.fee_accum = i64c(f.fee_accum as i128 + fees as i128)?;
@@ -3069,13 +3069,16 @@ type Cand = (u64, u64, u32, usize, usize);
 /// (slab_quote), so that is the first usable level, except that a later level at the same price with an older quote goes first.
 /// Lots are capped by the maker's remaining budget.
 #[inline(always)]
-fn slab_first(f: &FastBook, sp: *const Slab, mi: usize, base_ix: usize, opp: usize, bid: bool, slot: u64, lo: u64, hi: u64, from: usize, oracle: u64, nx: bool) -> Cand {
+fn slab_first(f: &FastBook, sp: *const Slab, mi: usize, base_ix: usize, opp: usize, bid: bool, slot: u64, lo: u64, hi: u64, from: usize, oracle: u64, nx: bool, signed: bool) -> Cand {
     let s = unsafe { &*sp };
     let e = &f.makers[mi];
     if e.budget <= 0 { return (0, 0, 0, 0, 0); }
     let lad = unsafe { s.lad.get_unchecked(base_ix >> 3) };
     if lad.flags & spec::LADDER_NEXT != 0 && !nx { return (0, 0, 0, 0, 0); } // next-price only: no immediate take
-    let (room, peg) = (ladder_room(f, lad, mi, bid, oracle, slot, nx), lad.flags & spec::LADDER_PEG != 0);
+    // `nx`: next-price ladders may be used (a committed order's fill, or a liquidation). `signed`: the fill carries the price
+    // signed for its own slot, which is what a next-price ladder's freshness is judged by. Any other ladder that asks for a fresh
+    // price keeps asking for the book's own, in every path: a liquidation does not waive it (found by the `lanes` fuzzer).
+    let (room, peg) = (ladder_room(f, lad, mi, bid, oracle, slot, signed && lad.flags & spec::LADDER_NEXT != 0), lad.flags & spec::LADDER_PEG != 0);
     if room == 0 { return (0, 0, 0, 0, 0); }
     // default maker guard (spec::FAST_GUARD_BPS): fixed-price levels through the book's price are skipped
     let guard = !peg && lad.tol_bps == 0;
@@ -3105,7 +3108,7 @@ fn slab_first(f: &FastBook, sp: *const Slab, mi: usize, base_ix: usize, opp: usi
 fn best_quote(f: &FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: usize, bid: bool, slot: u64, lo: u64, hi: u64, oracle: u64, nx: bool) -> Option<(usize, usize, u64, u64)> {
     let (mut bk, mut best): (usize, Cand) = (usize::MAX, (0, 0, 0, 0, 0));
     for (k, &(sp, mi)) in sl.iter().enumerate() {
-        let c = slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0, oracle, nx);
+        let c = slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0, oracle, nx, false);
         if c.0 != 0 && (bk == usize::MAX || (bid && c.0 < best.0) || (!bid && c.0 > best.0) || (c.0 == best.0 && c.2 < best.2)) { bk = k; best = c; }
     }
     if bk == usize::MAX { None } else { Some((bk, best.3, best.0, best.1)) }

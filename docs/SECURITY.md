@@ -165,3 +165,15 @@ the price and capped at `BAND_MAX_BPS` = 50, to every initial and maintenance re
 Equity is still valued at the mark, so bankruptcy, ADL ordering, deficits and vault NAV are unchanged; only the gates move:
 opening risk needs IM + band, liquidation starts at MM + band, and a liquidation restores MM + band. `update_oracle` already
 refuses a confidence above `max_conf_bps`, so the band is bounded twice. Tests: `band.rs`.
+
+## Found by the fuzzer after next-price execution went in (2026-11-12)
+
+`lanes` had not been run on the next-price change (commit `31ce7e7`, on devnet since 11 Nov). Seven seconds into its first run
+on that code it reported "fresh-only ladder filled without a fresh signed price" (seed `seeds_lanes/liq-fresh-waived-00`).
+Letting a liquidation use next-price ladders had been done by passing the same flag that tells the ladder its fill carries the
+price signed for its own slot, and that flag also switched off the fresh-price rule of every other ladder. So a liquidation
+could fill a maker who had asked never to be filled without a fresh signed price. Fixed: the two meanings are separate
+arguments (`slab_first(.., nx, signed)`); only a next-price ladder, and only in a fill that carries a signed price, is judged
+by that price. A liquidation waives nothing.
+
+Lesson kept as a rule: a change to a fill path is not done until `lanes` has run on it.
