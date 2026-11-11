@@ -102,6 +102,29 @@ Depositors' money can quote the markets: a sub-account of the vault is the maker
   sub-account, its markets and their books in one transaction, which caps how many markets one vault can quote before
   the value has to be computed in steps. Quotes expire after 30 slots like any maker's: the operator re-posts them.
 
+## Next-price execution (2026-11-11)
+
+A maker ladder flagged `LADDER_NEXT` never fills an immediate take. It fills only an order that was committed first, at the
+price the book's signer signed for the slot `NEXT_DELAY_SLOTS` (2) after the commitment (tests: `vault_maker.rs`).
+
+- Commitments: a next-price order (`TRIGGER_KIND_NEXT`, made with `set_trigger`) from its creation; a stop, take-profit or
+  TWAP slice once a keeper arms it (`exec_trigger` with arm = 1, allowed only when it would fire). The slot is recorded in
+  the trigger. While a commitment is live its trigger slot can't be replaced or cleared, and the account can't withdraw or
+  move margin to an isolated position: there is no taking it back once its price is known.
+- The fill needs the Ed25519-verified message `etnextpx | market | px | slot | ts` from the book's signer with exactly that
+  slot, a price within `FAST_PX_MAX_DEV_BPS` of the oracle, inside the same transaction. Quotes are priced off that price,
+  not the book's newest; the ladder's fresh-price setting does not apply. Whoever executes cannot choose the price.
+- A commitment lapses `NEXT_EXPIRY_SLOTS` (10) after its pricing slot: a next-price order is dropped, a stop or TWAP slice
+  goes back to being armable. Anyone may clear a lapsed one.
+- Where a maker of the book quotes next-price only, a stop or TWAP slice can't be filled without being armed first (it
+  would be routed around those quotes).
+- Liquidations fill next-price ladders at the book's current price.
+- Trust: the signer must sign one price a market a slot. It is the key the market admin set through the timelock, the same
+  key whose prices pegged ladders already follow.
+- Residual: an order can still be made to fail at its fill (margin spent elsewhere, the position cap reached); the account
+  gains nothing by it except not trading. A vault whose bot stops executing leaves the choice of which commitments fill to
+  the takers until its quotes expire (30 slots).
+
 ## Invariants (fuzz target `program/fuzz`)
 
 Σ base = 0 per market; `oi_long` = Σ long base; insurance ≥ 0;

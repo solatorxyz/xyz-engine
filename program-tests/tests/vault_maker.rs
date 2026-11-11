@@ -331,3 +331,133 @@ fn worth(e: &Env, h: &H, sub: &Address) -> i128 {
     vwd(&mut e, &h, &b, &bv, &bsrc, sh, &[h.f], true);
     assert_eq!(e.market_state().fees, fees1);
 }
+
+// ---------- next-price execution ----------
+const ED_ID: Address = Address::new_from_array([3, 125, 70, 214, 124, 147, 251, 190, 18, 249, 66, 143, 131, 141, 64, 255, 5, 112, 116, 73, 39, 244, 138, 100, 252, 202, 112, 68, 128, 0, 0, 0]);
+const IXS_ID: Address = Address::new_from_array([6, 167, 213, 23, 24, 123, 209, 102, 53, 218, 212, 4, 85, 253, 194, 192, 193, 36, 198, 143, 33, 86, 117, 165, 219, 186, 203, 95, 8, 0, 0, 0]);
+const NEXT: [(u16, u32, u32); 2] = [(0xC000, 0, 3), (0xC000 | ASK_LAD, 0, 3)]; // pegged, next-price only
+fn msg(magic: &[u8; 8], m: &Address, px: u64, slot: u64) -> Vec<u8> { let mut v = magic.to_vec(); v.extend_from_slice(m.as_ref()); for x in [px, slot, slot * 400] { v.extend_from_slice(&x.to_le_bytes()); } v }
+fn ed_ix(kp: &Keypair, m: &[u8]) -> Instruction {
+    let base = 2 + 14; let (mut d, mut body) = (vec![1u8, 0], vec![]);
+    let pk = base + body.len(); body.extend_from_slice(kp.pubkey().as_ref());
+    let so = base + body.len(); body.extend_from_slice(kp.sign_message(m).as_ref());
+    let mo = base + body.len(); body.extend_from_slice(m);
+    for x in [so as u16, u16::MAX, pk as u16, u16::MAX, mo as u16, m.len() as u16, u16::MAX] { d.extend_from_slice(&x.to_le_bytes()); }
+    d.extend(body); Instruction { program_id: ED_ID, accounts: vec![], data: d }
+}
+fn send_ixs(e: &mut Env, ixs: Vec<Instruction>, signers: &[&Keypair], ok: bool) {
+    let mut s: Vec<&Keypair> = vec![&e.admin]; s.extend_from_slice(signers);
+    let tx = Transaction::new_signed_with_payer(&ixs, Some(&e.admin.pubkey()), &s, e.svm.latest_blockhash());
+    let res = e.svm.send_transaction(tx); e.svm.expire_blockhash();
+    match (res, ok) { (Ok(_), true) | (Err(_), false) => {}, (Ok(_), false) => panic!("expected failure"), (Err(f), true) => panic!("{:?}\n{}", f.err, f.meta.logs.join("\n")) }
+}
+/// A vault whose rules allow next-price ladders only, quoting 100 lots each side 10 off the price; the book has a price signer.
+fn house_next(e: &mut Env) -> (H, Keypair) {
+    let h = house(e); let signer = Keypair::new(); let (a, m) = (e.admin.pubkey(), e.market);
+    // a live market's signer goes through the timelock
+    let mut d = vec![28u8, 12]; d.extend_from_slice(&0u64.to_le_bytes()); d.extend_from_slice(signer.pubkey().as_ref());
+    e.send("", vec![AccountMeta::new(a, true), w(&m)], d, &[], true);
+    let s = e.slot + 216_000; e.set_time(s); e.send("", vec![w(&m), w(&h.f)], vec![29], &[], true); e.oracle_update("", 1000_00000000, None);
+    rules(e, &h, 0, 0, 2, true);
+    let (dk, dv, dsrc) = holder(e, 10_000_000_000); vdep(e, &h, &dk, &dv, &dsrc, 10_000_000_000, &[], true);
+    vfund(e, &h, None, 2_000_000_000, None, true);
+    vquote(e, &h, &h.op, &[PEGGED[0], PEGGED[1], (ASK, peg(10), 100), (0, peg(-10), 100)], false); // the rules ask for next-price ladders
+    vquote(e, &h, &h.op, &[NEXT[0], NEXT[1], (ASK, peg(10), 100), (0, peg(-10), 100)], true);
+    (h, signer)
+}
+fn set_trig(e: &mut Env, kp: &Keypair, u: &Address, slot: u8, kind: u8, side: u8, v: [u64; 6], ok: bool) {
+    let m = e.market; let mut d = vec![20u8, slot, kind, side]; for x in v { d.extend_from_slice(&x.to_le_bytes()); }
+    e.send("", vec![AccountMeta::new(kp.pubkey(), true), w(u), r(&m)], d, &[kp], ok);
+}
+/// exec_trigger by keeper `kp` on `tu`'s trigger `si`; `arm`: commit a stop instead of filling it; `sig`: the signed price before it
+fn exec(e: &mut Env, h: &H, kp: &Keypair, ku: &Address, tu: &Address, si: u8, arm: bool, sig: Option<Instruction>, ok: bool) {
+    let m = e.market; let mut d = vec![21u8, si]; if arm { d.push(1); }
+    let ix = Instruction { program_id: e.pid, accounts: vec![AccountMeta::new(kp.pubkey(), true), w(ku), w(tu), r(&m), w(&h.f), r(&h.slab), r(&IXS_ID)], data: d };
+    send_ixs(e, sig.into_iter().chain([ix]).collect(), &[kp], ok);
+}
+fn to_slot(e: &mut Env, slot: u64, px: i64) { e.set_time(slot); e.oracle_update("", px, None); }
+const NX: &[u8; 8] = b"etnextpx";
+
+#[test] fn a_committed_order_fills_at_the_price_signed_for_its_slot_whatever_the_taker_knew() {
+    let mut e = Env::new(); let (h, signer) = house_next(&mut e); let m = e.market;
+    let (tp, tu) = e.user(10_000_000_000); let (kk, ku) = e.user(1_000_000);
+    // an immediate take finds nothing: the vault's quotes are for committed orders only
+    take(&mut e, &h, &tp, &tu, 0, PX + 500, 40);
+    assert_eq!(e.user_state(&tu).pos[0].base, 0);
+    // the taker has seen something the signed price has not (say the true price is already 0.5% up) and commits a buy at slot s
+    let s = e.slot;
+    set_trig(&mut e, &tp, &tu, 0, 4, 0, [0, PX + 2_000, 40, 0, 0, 0], true);
+    // not before its pricing slot, even with a price in hand
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&signer, &msg(NX, &m, 100_000, s + 2))), false);
+    to_slot(&mut e, s + 2, 1005_00000000); // two slots on the signer has caught up: its price for slot s + 2 is 100,500
+    // only that slot's price, in that message type, from the book's signer
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, None, false);
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&signer, &msg(NX, &m, 100_000, s + 1))), false);
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&signer, &msg(NX, &m, 100_000, s + 3))), false);
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&signer, &msg(b"etfastpx", &m, 100_500, s + 2))), false);
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&kk, &msg(NX, &m, 100_500, s + 2))), false);
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&signer, &msg(NX, &m, 103_000, s + 2))), false); // a price far from the oracle
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&signer, &msg(NX, &m, 100_500, s + 2))), true);
+    // filled 10 above the price of its own slot: what the taker knew at the commitment bought it nothing
+    let b = fb(&e, &h.f); assert_eq!((b.makers[0].base, b.makers[0].quote), (-40, 100_510 * 40));
+    assert_eq!(e.user_state(&tu).pos[0].base, 40);
+    assert_eq!(e.user_state(&tu).triggers[0].kind, 0, "one shot");
+    // late execution still uses the order's own slot price: nobody picks a better moment
+    let s2 = e.slot;
+    set_trig(&mut e, &tp, &tu, 0, 4, 1, [0, 0, 40, 0, 0, 0], true); // sell 40 at the next price
+    to_slot(&mut e, s2 + 6, 1000_00000000);
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&signer, &msg(NX, &m, 100_000, s2 + 6))), false);
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&signer, &msg(NX, &m, 100_450, s2 + 2))), true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 0);
+    assert_eq!(fb(&e, &h.f).makers[0].quote, 100_510 * 40 - 100_440 * 40);
+}
+
+#[test] fn a_commitment_cannot_be_taken_back_and_lapses_on_its_own() {
+    let mut e = Env::new(); let (h, signer) = house_next(&mut e); let m = e.market;
+    let (tp, tu) = e.user(10_000_000_000); let (kk, ku) = e.user(1_000_000);
+    let s = e.slot;
+    set_trig(&mut e, &tp, &tu, 0, 4, 0, [0, PX + 2_000, 40, 0, 0, 0], true);
+    // no replacing it, no clearing it, no pulling the margin out from under it
+    set_trig(&mut e, &tp, &tu, 0, 4, 1, [0, 0, 40, 0, 0, 0], false);
+    set_trig(&mut e, &tp, &tu, 0, 0, 0, [0; 6], false);
+    let dst = Address::new_unique(); let mint = Address::from(e.market_state().mint);
+    e.svm.set_account(dst, Account { lamports: 1_000_000_000, data: token_acct(&mint, &tp.pubkey(), 0), owner: TOKEN, executable: false, rent_epoch: 0 }).unwrap();
+    let wd = |e: &mut Env, ok: bool| { let (tv, pda) = (e.vault, e.vault_pda); let mut d = vec![14u8]; d.extend_from_slice(&1_000_000u64.to_le_bytes());
+        e.send("", vec![AccountMeta::new(tp.pubkey(), true), w(&tu), r(&m), w(&tv), w(&dst), r(&TOKEN), r(&pda)], d, &[&tp], ok); };
+    wd(&mut e, false);
+    // another slot of the same account is free
+    set_trig(&mut e, &tp, &tu, 1, 4, 0, [0, PX + 2_000, 10, 0, 0, 0], true);
+    // twelve slots after its pricing slot the price is too old: anyone clears it, nothing fills
+    to_slot(&mut e, s + 2 + 11, 1000_00000000);
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&signer, &msg(NX, &m, 100_000, s + 2))), true);
+    assert_eq!((e.user_state(&tu).triggers[0].kind, e.user_state(&tu).pos[0].base), (0, 0));
+    exec(&mut e, &h, &kk, &ku, &tu, 1, false, None, true);
+    wd(&mut e, true);
+    set_trig(&mut e, &tp, &tu, 0, 4, 1, [0, 0, 40, 0, 0, 0], true);
+}
+
+#[test] fn a_stop_is_committed_by_a_keeper_and_filled_at_the_next_price() {
+    let mut e = Env::new(); let (h, signer) = house_next(&mut e); let m = e.market;
+    let (tp, tu) = e.user(10_000_000_000); let (kk, ku) = e.user(1_000_000);
+    let s = e.slot;
+    set_trig(&mut e, &tp, &tu, 0, 4, 0, [0, PX + 2_000, 40, 0, 0, 0], true);
+    to_slot(&mut e, s + 2, 1000_00000000);
+    exec(&mut e, &h, &kk, &ku, &tu, 0, false, Some(ed_ix(&signer, &msg(NX, &m, 100_000, s + 2))), true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 40);
+    // a stop-loss at 99,500 (market), tip 1,000
+    set_trig(&mut e, &tp, &tu, 1, 2, 1, [99_500, 0, 40, 1_000, 0, 0], true);
+    exec(&mut e, &h, &kk, &ku, &tu, 1, true, None, false); // not fired: nothing to commit
+    to_slot(&mut e, s + 5, 990_00000000);
+    // fired. Filling it on the spot is refused (the vault quotes for the next price only): the keeper commits it ...
+    exec(&mut e, &h, &kk, &ku, &tu, 1, false, None, false);
+    exec(&mut e, &h, &kk, &ku, &tu, 1, true, None, true);
+    assert_ne!(e.user_state(&tu).triggers[1].kind & 1024, 0);
+    set_trig(&mut e, &tp, &tu, 1, 2, 1, [90_000, 0, 40, 0, 0, 0], false); // ... and the owner can't move it out of the way now
+    exec(&mut e, &h, &kk, &ku, &tu, 1, false, Some(ed_ix(&signer, &msg(NX, &m, 99_000, s + 7))), false); // too early
+    to_slot(&mut e, s + 7, 985_00000000);
+    let k0 = e.user_state(&ku).cash;
+    exec(&mut e, &h, &kk, &ku, &tu, 1, false, Some(ed_ix(&signer, &msg(NX, &m, 98_500, s + 7))), true);
+    let t = e.user_state(&tu); assert_eq!((t.pos[0].base, t.triggers[1].kind), (0, 0));
+    assert_eq!(e.user_state(&ku).cash - k0, 1_000, "the keeper is paid for the fill");
+    assert_eq!(fb(&e, &h.f).makers[0].quote, 100_010 * 40 - 98_490 * 40, "sold 10 under the price of the stop's own slot");
+}

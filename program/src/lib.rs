@@ -429,6 +429,8 @@ fn withdraw(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     home(u, m)?; // AUDIT C-2
     let uk = key(&a[1]);
     let clk = clock()?; let slot = clk.slot; let nw: Now = (slot, clk.unix_timestamp);
+    // a committed next-price order can't be starved of its margin once its price is known
+    if u.triggers.iter().any(|t| committed(t, slot)) { return Err(err(E::Locked)); }
     claim_all(pid, u, &uk, &a[7..])?;
     complete_view(pid, u, &uk, &a[2..], None)?;
     settle_funding_all(pid, u, &a[2..])?;
@@ -537,6 +539,7 @@ fn iso_transfer(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
     let mk = key(&a[2]);
     let pi = u.pos.iter().position(|p| p.market == mk && p.flags & POS_ISO != 0).ok_or(err(E::Isolated))?;
     let clk = clock()?; let nw: Now = (clk.slot, clk.unix_timestamp);
+    if u.triggers.iter().any(|t| committed(t, clk.slot)) { return Err(err(E::Locked)); } // as in withdraw: no moving margin away from a committed order
     let uk = key(&a[1]);
     claim_all(pid, u, &uk, &a[3..])?;
     complete_view(pid, u, &uk, &a[2..], if amt < 0 { Some(&mk) } else { None })?;
@@ -613,7 +616,7 @@ fn pos_idx(u: &mut User, mk: &Key, funding_index: i64) -> Result<usize, ProgramE
 fn trig_sync(u: &mut User) {
     for i in 0..MAX_TRIGGERS {
         let t = &u.triggers[i];
-        if t.kind == 0 || t.kind & 0xff == TRIGGER_KIND_TWAP { continue; }
+        if t.kind == 0 || t.kind & 0xff >= TRIGGER_KIND_TWAP { continue; } // stops only: a TWAP or a next-price order is not tied to a position
         let mk = t.market;
         let open = u.pos.iter().any(|p| p.market == mk && p.base != 0);
         let t = &mut u.triggers[i];
@@ -678,7 +681,7 @@ fn claim(u: &mut User, uk: &Key, s: &mut Shard) -> ProgramResult {
             s.oi_long_delta += long(p.base) - before;
             u.maker_volume += l.base.unsigned_abs();
             s.nled -= 1; s.ledger[i] = s.ledger[s.nled as usize];
-            if closed { let mk = s.market; for t in u.triggers.iter_mut() { if t.kind != 0 && t.kind & 0xff != TRIGGER_KIND_TWAP && t.market == mk { t.kind = 0; } } }
+            if closed { let mk = s.market; for t in u.triggers.iter_mut() { if t.kind != 0 && t.kind & 0xff < TRIGGER_KIND_TWAP && t.market == mk { t.kind = 0; } } }
             return Ok(()); // at most one entry per owner per shard
         }
         i += 1;
@@ -1301,6 +1304,41 @@ fn batch(pid: &Address, a: &mut [AccountView], d: &[u8], single: bool) -> Progra
 }
 
 // ---------- trigger orders: TP / SL / TWAP ----------
+/// Slot at which a trigger was committed for next-price execution: a next-price order at its creation (next_slot), a TWAP slice
+/// (trigger_px) or a stop (slices_left) when a keeper armed it.
+fn commit_slot(t: &Trigger) -> u64 { match t.kind & 0xff { spec::TRIGGER_KIND_NEXT => t.next_slot, TRIGGER_KIND_TWAP => t.trigger_px, _ => t.slices_left } }
+/// A live commitment: it can still be filled at its price, so it can be neither replaced nor starved of margin.
+fn committed(t: &Trigger, slot: u64) -> bool {
+    t.kind != 0 && (t.kind & 0xff == spec::TRIGGER_KIND_NEXT || t.kind & spec::TRIGGER_KIND_FLAG_ARMED != 0) && slot <= commit_slot(t) + spec::NEXT_DELAY_SLOTS + spec::NEXT_EXPIRY_SLOTS
+}
+/// The price the book's signer signed for slot `want` of this market, from the Ed25519 instruction right before this one (key,
+/// signature and message all inside that instruction). One price a market a slot: whoever executes cannot choose it.
+fn next_px(f: &FastBook, mk: &Key, oracle: u64, want: u64, xs: &[AccountView]) -> Result<u64, ProgramError> {
+    let no = err(E::NotTriggered);
+    if f.px_signer == [0; 32] || oracle == 0 { return Err(no); }
+    let Some(x) = xs.iter().find(|x| x.address() == &INSTRUCTIONS_ID) else { return Err(no) };
+    let ins = Instructions::try_from(x)?;
+    let cur = ins.load_current_index() as usize;
+    if cur == 0 { return Err(no); }
+    let e = ins.load_instruction_at(cur - 1)?;
+    if e.get_program_id().to_bytes() != ED25519_ID { return Err(no); }
+    let d = e.get_instruction_data();
+    if d.is_empty() { return Err(no); }
+    for i in 0..d[0] as usize {
+        let o = 2 + 14 * i;
+        if d.len() < o + 14 { break; }
+        let h = |k: usize| u16::from_le_bytes([d[o + 2 * k], d[o + 2 * k + 1]]) as usize;
+        if h(1) != 0xffff || h(3) != 0xffff || h(6) != 0xffff || h(5) != spec::FAST_PX_MSG { continue; }
+        let (pk, mo) = (h(2), h(4));
+        if d.len() < pk + 32 || d.len() < mo + spec::FAST_PX_MSG { continue; }
+        if d[pk..pk + 32] != f.px_signer || d[mo..mo + 8] != spec::NEXT_PX_MAGIC || d[mo + 8..mo + 40] != *mk { continue; }
+        let (px, sl) = (rd64(d, mo + 40)?, rd64(d, mo + 48)?);
+        // a price far from the oracle is not traded on (the same bound as the book's own signed price)
+        if sl != want || px == 0 || px >> 32 != 0 || moved(px, oracle, spec::FAST_PX_MAX_DEV_BPS) { continue; }
+        return Ok(px);
+    }
+    Err(no)
+}
 /// accs: authority(s), user(w), market(r). data: tag, slot u8, kind u8, side u8, trigger_px, limit_px, qty, tip, interval, slices (u64s)
 fn set_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     if a.len() < 3 || d.len() < 4 + 6 * 8 { return Err(err(E::BadData)); }
@@ -1312,12 +1350,19 @@ fn set_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult 
     let v = |i: usize| rd64(d, 4 + 8 * i);
     // kind byte: low 6 bits = TP/SL/TWAP, bit 6 = FLAG_MARK (>>2 of 256), bit 7 = FLAG_CONFIRM_ORACLE (>>2 of 512)
     let k = (k & 0x3f) | ((k >> 6 & 1) << 8) | ((k >> 7 & 1) << 9);
-    if s >= MAX_TRIGGERS || k & 0xff > TRIGGER_KIND_TWAP || side > 1 { return Err(err(E::BadData)); }
-    let twap = k & 0xff == TRIGGER_KIND_TWAP;
+    if s >= MAX_TRIGGERS || k & 0xff > spec::TRIGGER_KIND_NEXT || side > 1 { return Err(err(E::BadData)); }
+    let now = clock()?.slot;
+    // a commitment stands until it is filled or lapses: overwriting the slot would be a way to take it back
+    if committed(&u.triggers[s], now) { return Err(err(E::Locked)); }
+    let next = k & 0xff == spec::TRIGGER_KIND_NEXT;
+    let twap = k & 0xff == TRIGGER_KIND_TWAP || next;
     // TP/SL: next_slot is the "has protected a position" mark (see gc_pos); a TWAP's is its next slice
     let armed = u.pos.iter().any(|p| p.market == key(&a[2]) && p.base != 0) as u64;
-    let t = Trigger { market: key(&a[2]), kind: k, side, trigger_px: v(0)?, limit_px: v(1)?, qty: v(2)?, tip: v(3)?, interval: v(4)?,
-        next_slot: if twap { clock()?.slot } else { armed }, slices_left: v(5)? };
+    let mut t = Trigger { market: key(&a[2]), kind: k, side, trigger_px: v(0)?, limit_px: v(1)?, qty: v(2)?, tip: v(3)?, interval: v(4)?,
+        next_slot: if twap { now } else { armed }, slices_left: v(5)? };
+    // next price: one shot, committed at this slot (next_slot), no trigger level
+    if next { if t.qty == 0 { return Err(err(E::BadData)); } t.trigger_px = 0; t.interval = 1; t.slices_left = 1; }
+    else if twap { t.trigger_px = 0; } else { t.slices_left = 0; } // these fields hold the commitment slot once a keeper arms them
     if twap && (t.slices_left == 0 || t.interval == 0) { return Err(err(E::BadData)); }
     u.triggers[s] = t;
     Ok(())
@@ -1345,15 +1390,34 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
         _ => false,
     };
     // same rule as perp_core::trigger_fires: oracle by default; FLAG_MARK = mark, + FLAG_CONFIRM_ORACLE = both
-    let fire = if k8 == TRIGGER_KIND_TWAP { slot >= tr.next_slot }
+    // Next-price execution. A next-price order is committed from its creation; a stop or a TWAP slice once a keeper arms it
+    // (arm = 1 in the data, allowed when it would fire). A commitment fills only at the price signed for its own slot +
+    // NEXT_DELAY_SLOTS, and lapses NEXT_EXPIRY_SLOTS later.
+    let next = k8 == spec::TRIGGER_KIND_NEXT;
+    let armed = next || tr.kind & spec::TRIGGER_KIND_FLAG_ARMED != 0;
+    let at = commit_slot(&tr) + spec::NEXT_DELAY_SLOTS;
+    if armed {
+        if slot > at + spec::NEXT_EXPIRY_SLOTS {
+            let w = &mut t.triggers[si];
+            if next { w.kind = 0; } else { w.kind &= !spec::TRIGGER_KIND_FLAG_ARMED; if k8 == TRIGGER_KIND_TWAP { w.trigger_px = 0; } else { w.slices_left = 0; } }
+            gc_pos(t); return Ok(());
+        }
+        if slot < at { return Err(err(E::NotTriggered)); }
+    }
+    let fire = if armed { true } else if k8 == TRIGGER_KIND_TWAP { slot >= tr.next_slot }
         else if tr.kind & spec::TRIGGER_KIND_FLAG_MARK != 0 { thr(mark(m)) && (tr.kind & spec::TRIGGER_KIND_FLAG_CONFIRM_ORACLE == 0 || thr(m.oracle_px)) }
         else { thr(m.oracle_px) };
     if !fire { return Err(err(E::NotTriggered)); }
+    if !armed && d.len() > 2 && d[2] == 1 {
+        let w = &mut t.triggers[si]; w.kind |= spec::TRIGGER_KIND_FLAG_ARMED;
+        if k8 == TRIGGER_KIND_TWAP { w.trigger_px = slot; } else { w.slices_left = slot; }
+        return Ok(());
+    }
     let rest = &a[4..];
     claim_all(pid, t, &tk, rest)?;
     settle_funding_all(pid, t, &a[3..])?;
     let pi = pos_idx(t, &mk, m.funding_index)?;
-    let twap = k8 == TRIGGER_KIND_TWAP;
+    let twap = k8 == TRIGGER_KIND_TWAP || next; // a next-price order is one slice
     // a slice is what is left over the slices left, so a short fill is caught up by the later ones (and qty < slices still trades)
     let mut qty = if twap { (tr.qty / tr.slices_left.max(1)).max(1).min(tr.qty) } else { tr.qty };
     if twap && qty == 0 { t.triggers[si].kind = 0; gc_pos(t); return Ok(()); } // nothing left: clear, no tip
@@ -1384,8 +1448,14 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
         let px0 = mark(m); let band = quote_band(px0); let (blo, bhi) = bound_range(m);
         let (lo, hi) = (px0.saturating_sub(band).max(blo), (px0 + band).min(bhi));
         let (sl, cnt, _) = collect_slabs(pid, fb, rest, &tk, None, true, true)?;
-        { let mut ev = FastEv::new(&tk, bid); let r = fast_match(pid, fb, &sl[..cnt], (fb.idx as usize) << 4 | opp << 3, opp, bid, lo, hi, rest, &mk, m, t, &tk, pi, limit, qty, slot, taker_bps, &mut ev, 0)?; ev.flush(); r }
-    } else { take(pid, rest, &mk, m, t, &tk, pi, bid, limit, qty, slot, taker_bps, STP_CANCEL_OLDEST)?.filled };
+        let base_ix = (fb.idx as usize) << 4 | opp << 3;
+        // committed: the price signed for its slot. Not committed: an immediate fill, refused while a maker here quotes for
+        // next-price only (the keeper must arm it first, or it would be routed around those quotes to a worse price).
+        let nx = if armed { next_px(fb, &mk, m.oracle_px, at, rest)? } else {
+            if sl[..cnt].iter().any(|&(sp, _)| unsafe { (*sp).lad.get_unchecked(base_ix >> 3).flags } & spec::LADDER_NEXT != 0) { return Err(err(E::NotTriggered)); }
+            0 };
+        { let mut ev = FastEv::new(&tk, bid); let r = fast_match(pid, fb, &sl[..cnt], base_ix, opp, bid, lo, hi, rest, &mk, m, t, &tk, pi, limit, qty, slot, taker_bps, &mut ev, 0, nx)?; ev.flush(); r }
+    } else { if armed { return Err(err(E::NotTriggered)); } take(pid, rest, &mk, m, t, &tk, pi, bid, limit, qty, slot, taker_bps, STP_CANCEL_OLDEST)?.filled };
     if filled == 0 { return Err(err(E::NotTriggered)); } // AUDIT M-1: no tip / no slice burn without a fill
     // TP/SL: the tip is paid in proportion to the fill, out of what is left of it -- however many partial fills it takes, the
     // keepers together earn the tip once (a keeper feeding it one lot at a time gains nothing)
@@ -1394,6 +1464,7 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
     let w = &mut t.triggers[si];
     if twap {
         w.qty -= filled; w.slices_left -= 1; w.next_slot = slot + tr.interval; // what a slice missed stays in the order
+        w.kind &= !spec::TRIGGER_KIND_FLAG_ARMED; if !next { w.trigger_px = 0; } // the next slice is committed afresh
         if w.slices_left == 0 || w.qty == 0 { w.kind = 0; }
         credit(t, pi, -(tip as i128))?;
         let (eq, im, _) = phealth(pid, t, pi, &a[3..], nw, true)?;
@@ -1404,7 +1475,7 @@ fn exec_trigger(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult
         if m.max_oi != 0 && m.oi_long as i128 + if bid { filled as i128 } else { 0 } > m.max_oi as i128 { return Err(err(E::Cap)); }
     } else {
         // a partial fill leaves the rest of the stop armed (it used to be spent by its first lot, leaving the position bare)
-        if filled == qty { w.kind = 0; } else { w.qty = w.qty.saturating_sub(filled); w.tip = (full_tip - tip) as u64; }
+        if filled == qty { w.kind = 0; } else { w.qty = w.qty.saturating_sub(filled); w.tip = (full_tip - tip) as u64; w.kind &= !spec::TRIGGER_KIND_FLAG_ARMED; w.slices_left = 0; }
         // TP/SL reduce: never leave bad debt (fills may include resting orders from shards the keeper passed)
         credit(t, pi, -(tip as i128))?;
         let (eq, _, _) = phealth(pid, t, pi, &a[3..], nw, false)?;
@@ -1830,7 +1901,7 @@ fn fast_bbo(sh: &[AccountView], pid: &Address, m: &Market, mk: &Key, slot: u64, 
                 if f.side != 0 && f.side != sd as u64 + 1 { continue; }
                 let base = (f.idx as usize) << 4 | sd << 3;
                 let lad = &s.lad[base >> 3];
-                let mut room = ladder_room(f, lad, mi, sd == 1, px, slot);
+                let mut room = ladder_room(f, lad, mi, sd == 1, px, slot, false);
                 // same default maker guard as the matcher (slab_first): a level no taker can fill doesn't count for the mark
                 let guard = lad.flags & spec::LADDER_PEG == 0 && lad.tol_bps == 0;
                 let g = if guard { px.min(1 << 40).wrapping_mul(spec::FAST_GUARD_BPS) / 10000 } else { 0 };
@@ -2483,9 +2554,10 @@ fn qpx(px: u32, oracle: u64, peg: bool) -> u64 {
 /// position at the last settle + fast fills since. `bid`: the taker buys (hits the ask ladder, the maker sells). A ladder that
 /// asks for a fresh price (flags bits 8-15) gives 0 while the book's signed price is older than that many slots.
 #[inline(always)]
-fn ladder_room(f: &FastBook, l: &Ladder, mi: usize, bid: bool, oracle: u64, slot: u64) -> u64 {
+fn ladder_room(f: &FastBook, l: &Ladder, mi: usize, bid: bool, oracle: u64, slot: u64, nx: bool) -> u64 {
     let fr = (l.flags >> spec::LADDER_FRESH_SHIFT) as u64;
-    if fr != 0 && (f.fast_px == 0 || slot > f.fast_slot + fr.min(spec::FAST_PX_MAX_SLOTS)) { return 0; }
+    // (a next-price fill is judged against the price signed for its own slot, not the book's newest)
+    if fr != 0 && !nx && (f.fast_px == 0 || slot > f.fast_slot + fr.min(spec::FAST_PX_MAX_SLOTS)) { return 0; }
     if l.tol_bps != 0 {
         let r = l.ref_px as u64; // < 2^32; the difference is clamped so the product stays native
         if oracle.abs_diff(r).min(1 << 40).wrapping_mul(10000) > r.wrapping_mul(l.tol_bps as u64) { return 0; }
@@ -2754,7 +2826,7 @@ fn take_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
 
     cp!(8);
     let mut ev = FastEv::new(&uk, bid);
-    fast_match(pid, f, &sl[..cnt], base_ix, opp, bid, lo, hi, rest, &mk, m, u, &uk, pi, limit, left, slot, taker_bps, &mut ev, 0)?;
+    fast_match(pid, f, &sl[..cnt], base_ix, opp, bid, lo, hi, rest, &mk, m, u, &uk, pi, limit, left, slot, taker_bps, &mut ev, 0, 0)?;
     ev.flush();
     cp!(9);
     if reduce {
@@ -2845,7 +2917,7 @@ fn batch_take(pid: &Address, f: &mut FastBook, fk: &Key, m: &Market, mk: &Key, m
         let mut cnt = 0;
         let sk = key(sa);
         for &(sp, mi) in all { let (su, sa_) = unsafe { ((*sp).user, (*sp).authority) }; if su != uk && sa_ != sk { sl[cnt] = (sp, mi); cnt += 1; } } // no self-trade
-        fast_match(pid, f, &sl[..cnt], (f.idx as usize) << 4 | opp << 3, opp, bid, lo, hi, &[], mk, m, u, &uk, pi, limit, left, nw.0, taker_bps, ev, idt | (opp as u64 ^ 1) << 39)?;
+        fast_match(pid, f, &sl[..cnt], (f.idx as usize) << 4 | opp << 3, opp, bid, lo, hi, &[], mk, m, u, &uk, pi, limit, left, nw.0, taker_bps, ev, idt | (opp as u64 ^ 1) << 39, 0)?;
     }
     gc_pos(u);
     Ok(())
@@ -2875,15 +2947,16 @@ fn worst_ok(pid: &Address, u: &User, pi: usize, mkts: &[AccountView], nw: Now, m
 /// once (a merge of sorted lists).
 fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: usize, bid: bool, lo: u64, hi: u64,
               rest: &[AccountView], mk: &Key, m: &Market, u: &mut User, uk: &Key, pi: usize, limit: u64, mut left: u64, slot: u64,
-              taker_bps: u64, ev: &mut FastEv, idt: u64) -> Result<u64, ProgramError> {
+              taker_bps: u64, ev: &mut FastEv, idt: u64, nx: u64) -> Result<u64, ProgramError> {
     let (want, base0) = (left, long(u.pos[pi].base));
     let mut in_shards = 0i64;
     // only the first sl.len() entries are ever read, and each is written first
     let mut cand: [core::mem::MaybeUninit<Cand>; FAST_MAKERS] = [core::mem::MaybeUninit::uninit(); FAST_MAKERS];
-    let oracle = book_px(f, m, slot);
+    // nx != 0: a next-price fill. Quotes are priced off the price signed for the order's own slot, and next-price ladders take part.
+    let oracle = if nx != 0 { nx } else { book_px(f, m, slot) };
     // maker quotes are judged against the book's price, so they fill only while that price is recent (spec::FAST_GUARD_MAX_AGE_SLOTS)
-    let aged = !(f.fast_px != 0 && slot <= f.fast_slot + spec::FAST_PX_MAX_SLOTS) && slot > m.oracle_slot + spec::FAST_GUARD_MAX_AGE_SLOTS;
-    for (k, &(sp, mi)) in sl.iter().enumerate() { cand[k].write(if aged { (0, 0, 0, 0, 0) } else { slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0, oracle) }); }
+    let aged = nx == 0 && !(f.fast_px != 0 && slot <= f.fast_slot + spec::FAST_PX_MAX_SLOTS) && slot > m.oracle_slot + spec::FAST_GUARD_MAX_AGE_SLOTS;
+    for (k, &(sp, mi)) in sl.iter().enumerate() { cand[k].write(if aged { (0, 0, 0, 0, 0) } else { slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0, oracle, nx != 0) }); }
     let (mut acc, mut fees) = (Acc { q: 0, nt: 0, fee: 0 }, 0u64);
     while left > 0 {
         let (mut bk, mut best): (usize, Cand) = (usize::MAX, (0, 0, 0, 0, 0));
@@ -2913,7 +2986,7 @@ fn fast_match(pid: &Address, f: &mut FastBook, sl: &[(*const Slab, usize)], base
         acc.add(u, pi, bid, fq, nt, fee)?;
         ev.push(bp, fq, idt | (mi as u64) << 32 | q.gen as u64);
         left -= fq;
-        if left > 0 { cand[bk].write(slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, b0, oracle)); }
+        if left > 0 { cand[bk].write(slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, b0, oracle, nx != 0)); }
     }
     acc.book(u, pi, bid)?;
     f.fee_accum = i64c(f.fee_accum as i128 + fees as i128)?;
@@ -2989,12 +3062,13 @@ type Cand = (u64, u64, u32, usize, usize);
 /// (slab_quote), so that is the first usable level, except that a later level at the same price with an older quote goes first.
 /// Lots are capped by the maker's remaining budget.
 #[inline(always)]
-fn slab_first(f: &FastBook, sp: *const Slab, mi: usize, base_ix: usize, opp: usize, bid: bool, slot: u64, lo: u64, hi: u64, from: usize, oracle: u64) -> Cand {
+fn slab_first(f: &FastBook, sp: *const Slab, mi: usize, base_ix: usize, opp: usize, bid: bool, slot: u64, lo: u64, hi: u64, from: usize, oracle: u64, nx: bool) -> Cand {
     let s = unsafe { &*sp };
     let e = &f.makers[mi];
     if e.budget <= 0 { return (0, 0, 0, 0, 0); }
     let lad = unsafe { s.lad.get_unchecked(base_ix >> 3) };
-    let (room, peg) = (ladder_room(f, lad, mi, bid, oracle, slot), lad.flags & spec::LADDER_PEG != 0);
+    if lad.flags & spec::LADDER_NEXT != 0 && !nx { return (0, 0, 0, 0, 0); } // next-price only: no immediate take
+    let (room, peg) = (ladder_room(f, lad, mi, bid, oracle, slot, nx), lad.flags & spec::LADDER_PEG != 0);
     if room == 0 { return (0, 0, 0, 0, 0); }
     // default maker guard (spec::FAST_GUARD_BPS): fixed-price levels through the book's price are skipped
     let guard = !peg && lad.tol_bps == 0;
@@ -3021,10 +3095,10 @@ fn slab_first(f: &FastBook, sp: *const Slab, mi: usize, base_ix: usize, opp: usi
 /// Best usable maker quote across slabs: (slab slot, level, price, lots available). Better price first, then the older
 /// quote, then the earlier slab.
 #[inline(always)]
-fn best_quote(f: &FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: usize, bid: bool, slot: u64, lo: u64, hi: u64, oracle: u64) -> Option<(usize, usize, u64, u64)> {
+fn best_quote(f: &FastBook, sl: &[(*const Slab, usize)], base_ix: usize, opp: usize, bid: bool, slot: u64, lo: u64, hi: u64, oracle: u64, nx: bool) -> Option<(usize, usize, u64, u64)> {
     let (mut bk, mut best): (usize, Cand) = (usize::MAX, (0, 0, 0, 0, 0));
     for (k, &(sp, mi)) in sl.iter().enumerate() {
-        let c = slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0, oracle);
+        let c = slab_first(f, sp, mi, base_ix, opp, bid, slot, lo, hi, 0, oracle, nx);
         if c.0 != 0 && (bk == usize::MAX || (bid && c.0 < best.0) || (!bid && c.0 > best.0) || (c.0 == best.0 && c.2 < best.2)) { bk = k; best = c; }
     }
     if bk == usize::MAX { None } else { Some((bk, best.3, best.0, best.1)) }
@@ -3116,7 +3190,7 @@ fn liquidate_fast(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     let aged = !(f.fast_px != 0 && slot <= f.fast_slot + spec::FAST_PX_MAX_SLOTS) && slot > m.oracle_slot + spec::FAST_GUARD_MAX_AGE_SLOTS;
     let mut levels = 0u32;
     while left > 0 && levels < spec::LIQ_FAST_MAX_LEVELS {
-        let best = if aged { None } else { best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi, book_px(f, m, slot)) };
+        let best = if aged { None } else { best_quote(f, &sl[..cnt], base_ix, opp, bid, slot, lo, hi, book_px(f, m, slot), true) }; // a liquidation fills next-price ladders too, at the book's price
         if hybrid {
             let lim = match best { Some((_, _, bp, _)) => if bid { hi.min(bp) } else { lo.max(bp) }, None => if bid { hi } else { lo } };
             let (sf, sn) = shard_take(t, lim, left, &mut sbest)?;
@@ -3464,7 +3538,8 @@ fn vault_ladder_ok(v: &Vault, s: &Slab, lad: usize) -> bool {
     let q = &s.quotes[lad * SLAB_LEVELS..(lad + 1) * SLAB_LEVELS];
     if q.iter().all(|x| x.qty == 0) { return true; }
     if l.flags & spec::LADDER_PEG == 0 { return false; }
-    if v.q_fresh != 0 && l.flags >> spec::LADDER_FRESH_SHIFT == 0 { return false; }
+    if v.q_fresh & 1 != 0 && l.flags >> spec::LADDER_FRESH_SHIFT == 0 { return false; }
+    if v.q_fresh & 2 != 0 && l.flags & spec::LADDER_NEXT == 0 { return false; }
     let mut edge = 0i64;
     if v.q_min_edge_bps != 0 {
         if l.ref_px == 0 || l.tol_bps == 0 || (v.q_max_tol_bps != 0 && l.tol_bps as u64 > v.q_max_tol_bps) { return false; }
@@ -3530,7 +3605,7 @@ fn vault_operator(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResu
     // An edge is measured on the ladder's reference price, so it is only worth what the tolerance lets the reference stray:
     // with an edge the tolerance cap is required and bounded.
     if edge > spec::VAULT_MAX_EDGE_BPS || tol > spec::VAULT_MAX_TOL_BPS || (edge != 0 && tol == 0) { return Err(err(E::BadData)); }
-    v.operator.copy_from_slice(&d[1..33]); v.q_min_edge_bps = edge; v.q_max_tol_bps = tol; v.q_fresh = (rd64(d, 49)? != 0) as u64;
+    v.operator.copy_from_slice(&d[1..33]); v.q_min_edge_bps = edge; v.q_max_tol_bps = tol; v.q_fresh = rd64(d, 49)? & 3; // bit 0: fresh signed price, bit 1: next-price ladders only
     Ok(())
 }
 /// accs: signer(s), vault(w), from sub(w), to sub(w), [from's markets]. data: tag, amount u64

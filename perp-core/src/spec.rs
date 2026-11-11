@@ -387,6 +387,21 @@ pub const LADDER_FRESH_SHIFT: u16 = 8;
 /// In a pegged ladder (LADDER_PEG) a level's price is oracle + px - QUOTE_PEG_BIAS (price units).
 pub const QUOTE_PEG_BIAS: u32 = 1 << 31;
 pub const LADDER_PEG: u16 = 1;
+/// Next-price execution. A ladder with LADDER_NEXT never fills an immediate take: only an order that was committed first and is
+/// filled at the price the book's signer signed for the slot NEXT_DELAY_SLOTS after the commitment (one price a market a slot,
+/// message NEXT_PX_MAGIC, market key, px u64, slot u64, ts_ms u64 -- the layout of the fast price message). The taker decides
+/// on what it knows at the commitment and cannot take it back; nobody chooses the price. Liquidations still fill these ladders
+/// at the book's current price.
+pub const LADDER_NEXT: u16 = 2;
+/// A market order committed now and filled at the next price (set_trigger; executed by anyone through exec_trigger).
+pub const TRIGGER_KIND_NEXT: u64 = 4;
+/// Kind flag: a stop, take-profit or TWAP slice a keeper has committed for next-price execution (exec_trigger with arm = 1).
+pub const TRIGGER_KIND_FLAG_ARMED: u64 = 1024;
+pub const NEXT_DELAY_SLOTS: u64 = 2;
+/// Slots after the pricing slot during which the commitment can still be filled; after that it lapses (a market order is
+/// dropped, a stop or TWAP slice can be committed again).
+pub const NEXT_EXPIRY_SLOTS: u64 = 10;
+pub const NEXT_PX_MAGIC: [u8; 8] = *b"etnextpx";
 /// slab_quote items with idx = QUOTE_ITEM_REF | ladder set (oracle price quoted against = px, tolerance bps = qty);
 /// idx = QUOTE_ITEM_INV | ladder set the inventory cap in lots (px; 0 = none) and the ladder flags (qty: LADDER_PEG).
 /// ladder = market idx << 1 | side. Settings items go before the quote items.

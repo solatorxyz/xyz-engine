@@ -13,7 +13,7 @@
 | batch cancel 10 | 3690 |
 | taker IOC: match 5 levels across 3 shards | 6399 |
 | taker IOC: match 1 level | 2719 |
-| withdraw (margin check + PDA-signed SPL CPI) | 2085 |
+| withdraw (margin check + PDA-signed SPL CPI) | 2134 |
 | batch replace + claim maker fills (3 shards w/ ledgers) | 11143 |
 | update_oracle + premium/mark from full shard set (5 shards) | 3312 |
 | liquidate (takeover at mark: health x2, transfer, fees) | 4625 |
@@ -23,4 +23,4 @@
 | settle_funding (permissionless, 1 position) | 199 |
 | aggregate OI/fees from 9 shards (crank) | 733 |
 | liquidate_book (permissionless, 1 chunk into the book, no liquidator capital) | 5935 |
-| exec SL trigger on mark (keeper crank, IOC reduce-only) | 3748 |
+| exec SL trigger on mark (keeper crank, IOC reduce-only) | 3785 |
