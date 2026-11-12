@@ -201,6 +201,38 @@ pub(crate) fn init_shard(pid: &Address, a: &mut [AccountView], d: &[u8]) -> Prog
     Ok(())
 }
 
+/// Move a shard to another price range. Only an empty one: no resting order (n) and no fill waiting to be claimed (nled),
+/// so nothing anyone owns is in it and the move can strand nothing. Its side, its number (the high bits of order ids), its
+/// order sequence and its accumulators stay, so the market's counts (n_shards, n_side) and every complete view of the market
+/// are exactly what they were, and an order id is never issued twice. Why it exists: a shard covers [lo, lo + width), a
+/// price that walks away leaves a market's shards behind it, and the only remedy was new shards: rent each time, 64 a
+/// market at most, and no instruction that closes one. Same authority as init_shard, and like it immediate: it changes
+/// where new orders can rest, never an order that exists.
+/// accs: admin(s), market, shard(w). data: tag, lo u64
+pub(crate) fn shard_move(pid: &Address, a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    if a.len() < 3 || !sg(pid, &a[0]) || d.len() < 9 {
+        return Err(err(E::BadData));
+    }
+    let m: &mut Market = load(&a[1], pid, DISC_MARKET, MARKET_SIZE)?;
+    if !auth(pid, &m.admin, a) {
+        return Err(err(E::BadAccount));
+    }
+    let s: &mut Shard = load(&a[2], pid, DISC_SHARD, SHARD_SIZE)?;
+    if s.market != key(&a[1]) {
+        return Err(err(E::BadAccount));
+    }
+    let lo = rd64(d, 1)?;
+    if lo % m.bucket_width != 0 {
+        return Err(err(E::BadData));
+    }
+    if s.n != 0 || s.nled != 0 {
+        return Err(err(E::Locked));
+    }
+    s.lo = lo;
+    s.width = m.bucket_width;
+    Ok(())
+}
+
 /// accs: authority(s), user(w)
 pub(crate) fn init_user(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
     if a.len() < 2 || !sg(pid, &a[0]) {

@@ -228,6 +228,7 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
         spec::IX_SLAB_SETTLE => slab_settle(pid, accs),
         spec::IX_SLAB_KILL => slab_kill(pid, accs, data),
         spec::IX_SLAB_TOUCH => slab_touch(pid, accs),
+        spec::IX_SHARD_MOVE => shard_move(pid, accs, data),
         spec::IX_LIQ_FAST => liquidate_fast(pid, accs, data),
         spec::IX_ASSERT => assert_state(pid, accs, data),
         spec::IX_SET_SESSION => set_session(pid, accs, data),

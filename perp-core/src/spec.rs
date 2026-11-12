@@ -341,6 +341,9 @@ pub const IX_SLAB_KILL: u64 = 67;
 /// else. A maker whose quotes are offsets from the price (LADDER_PEG) re-sends them only when their shape changes; between
 /// those, this one small transaction is what says it is still there. QUOTE_MAX_AGE_SLOTS is unchanged.
 pub const IX_SLAB_TOUCH: u64 = 87;
+/// Move an empty shard to another price range (admin). A market whose price has walked away from its shards is
+/// re-centred with the accounts it already has, instead of paying rent for new ones that can never be closed.
+pub const IX_SHARD_MOVE: u64 = 88;
 pub const IX_LIQ_FAST: u64 = 70;
 pub const IX_ASSERT: u64 = 71;
 pub const IX_TAKE_FAST_BATCH: u64 = 72;

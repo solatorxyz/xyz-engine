@@ -507,3 +507,63 @@ fn vault_withdraw_keeps_positions_margined() {
     vwd(&mut e, &x, &a, &av, &asrc, sh, false); // all of it: the 9.15B position would be unmargined
     vwd(&mut e, &x, &a, &av, &asrc, sh / 20, true); // a small slice is fine
 }
+
+fn shard_move(e: &mut Env, adm: &Keypair, shard: &Address, lo: u64, ok: bool) {
+    let m = e.market;
+    let mut d = vec![88u8]; // IX_SHARD_MOVE
+    d.extend_from_slice(&lo.to_le_bytes());
+    e.send("", vec![AccountMeta::new(adm.pubkey(), true), r(&m), w(shard)], d, &[adm], ok);
+}
+
+#[test]
+fn an_empty_shard_moves_to_where_the_price_went() {
+    let mut e = Env::new();
+    e.oracle_update("", 1000_00000000, None);
+    let adm = e.admin.insecure_clone();
+    let (a, b) = (e.shard(1, 100_000), e.shard(0, 100_000 - BW));
+    let (mk, mu) = e.user(10_000_000_000);
+    let (tk, tu) = e.user(10_000_000_000);
+    let before = e.shard_state(&a);
+    let (n_shards, n_side) = (e.market_state().n_shards, e.market_state().n_side);
+
+    // an ask rests in the shard: it cannot be moved from under it
+    place(&mut e, &mk, &mu, &[a], 1, 1, 100_010, 10, true);
+    shard_move(&mut e, &adm, &a, 100_000 + BW, false);
+    // a taker lifts it: no order is left, but the maker's fill waits in the shard to be claimed. Still not movable.
+    place(&mut e, &tk, &tu, &[a], 0, 4, 100_010, 10, true);
+    let s = e.shard_state(&a);
+    assert_eq!((s.n, s.nled), (0, 1));
+    shard_move(&mut e, &adm, &a, 100_000 + BW, false);
+    assert_eq!(e.shard_state(&a).lo, 100_000);
+    // the maker's next transaction over the shard claims the fill (it places an order and takes it back)
+    place(&mut e, &mk, &mu, &[a], 1, 1, 100_020, 5, true);
+    let id = e.shard_state(&a).orders[0].id;
+    let m = e.market;
+    e.send("", trade_accts(&mk, &mu, &m, &[a]), batch_data(&[cancel_item(id, 1, 100_020)], &[]), &[&mk], true);
+    let s = e.shard_state(&a);
+    assert_eq!((s.n, s.nled), (0, 0));
+    assert_eq!(e.user_state(&mu).pos[0].base, -10, "the fill was booked before the shard went anywhere");
+
+    // the price range above is outside this shard; after the move it is inside, and the old range is outside
+    let far = 100_000 + BW + 10;
+    place(&mut e, &mk, &mu, &[a], 1, 1, far, 5, false);
+    shard_move(&mut e, &tk, &a, 100_000 + BW, false); // not the admin
+    shard_move(&mut e, &adm, &a, 100_000 + BW + 1, false); // not on the price grid
+    shard_move(&mut e, &adm, &m, 100_000 + BW, false); // not a shard
+    shard_move(&mut e, &adm, &a, 100_000 + BW, true);
+    let after = e.shard_state(&a);
+    assert_eq!((after.lo, after.width), (100_000 + BW, BW));
+    assert_eq!(
+        (after.side, after.shard_no, after.market),
+        (before.side, before.shard_no, before.market),
+        "its side, its number and its market are what they were"
+    );
+    assert!(after.seq >= 2, "the order sequence went on, so no order id is issued twice: {}", after.seq);
+    let ms = e.market_state();
+    assert_eq!((ms.n_shards, ms.n_side), (n_shards, n_side), "the market counts the same shards");
+    place(&mut e, &mk, &mu, &[a], 1, 1, far, 5, true);
+    assert_eq!(e.shard_state(&a).n, 1);
+    place(&mut e, &mk, &mu, &[a], 1, 1, 100_010, 5, false);
+    // the other side's shard was not touched
+    assert_eq!(e.shard_state(&b).lo, 100_000 - BW);
+}
