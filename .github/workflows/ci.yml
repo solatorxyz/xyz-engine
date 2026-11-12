@@ -22,6 +22,16 @@ jobs:
           cd program-tests
           T=$(ls tests/*.rs | xargs -n1 basename | sed 's/\.rs$//' | grep -v '^common$' | sed 's/^/--test /' | tr '\n' ' ')
           cargo test --release --no-fail-fast $T
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Command line (ts/) against the built program
+        run: |
+          cd ts
+          npm ci
+          npm run typecheck
+          npm run format:check
+          npm run spec && git diff --exit-code lib/sdk/spec.ts   # the TypeScript layouts are the program's own
+          npm test
   secrets:
     runs-on: ubuntu-latest
     steps:

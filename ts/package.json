@@ -1,0 +1,30 @@
+{
+  "name": "solator-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Open and run a market on the Solator kernel from a terminal, and liquidate on anyone's.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "solator": "tsx cli/solator.ts",
+    "typecheck": "tsc --noEmit -p .",
+    "test": "tsx scripts/test-cli.ts && tsx scripts/test-liquidate.ts",
+    "spec": "python3 scripts/gen-spec.py .. && prettier --write lib/sdk/spec.ts",
+    "format:check": "prettier --check \"cli/**/*.ts\" \"lib/**/*.ts\" \"scripts/**/*.{ts,mjs}\""
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.99.0",
+    "buffer": "^6.0.3",
+    "tsx": "^4.23.15"
+  },
+  "devDependencies": {
+    "@solana/kit": "^8.6.0",
+    "@types/node": "^26.6.6",
+    "@types/ws": "^8.5.10",
+    "bs58": "^6.0.0",
+    "litesvm": "^1.6.2",
+    "prettier": "3.10.0",
+    "typescript": "^5.9.3",
+    "ws": "^8.22.1"
+  }
+}
