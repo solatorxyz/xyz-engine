@@ -180,7 +180,7 @@ export function shape(d: Draft): { ok: Shape } | { bad: Problems } {
       pxDiv,
       units,
       tickUsd,
-      lot: 1e-6 / tickUsd,
+      lot: 100 / Number(pxDiv), // 1e-6 dollars over the price step (pxDiv / 1e8), as one exact division
       bucket: bucketFor(units),
       maxOi,
       maxAgeSecs: f.secs,

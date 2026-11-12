@@ -33,6 +33,8 @@ npm run solator -- market pause <market>
 ```
 
 Every command takes `--url <rpc>` (default: devnet) and `--keypair <file>` (default: `~/.config/solana/id.json`).
+The public devnet endpoint limits requests per network address: a loop that is refused says so and tries again at
+its next turn, and a market that matters wants an endpoint of its own.
 `SOLATOR_PROGRAM` and `SOLATOR_MINT` in the environment name another deployment of the program or another collateral.
 
 What the numbers mean:

@@ -53,6 +53,7 @@ async function main() {
     );
     assert.match(out, /xyz:GOLD-USDC at \$2650\.5/);
     assert.match(out, /the bond that covers it: \$12,500\.00/, "a twentieth of the cap");
+    assert.match(out, /price step \$0\.1, smallest order 0\.00001 GOLD, a price is good for 1 min/);
     assert.match(out, /1\/3 Price feed/);
     assert.match(out, /3\/3 Order book/);
     assert.match(out, /covers the cap/);
@@ -90,6 +91,7 @@ async function main() {
     assert.match(cli(["price", "post", addr, "2660"], ck), /xyz:GOLD \$2660\.0\n/);
     await new Promise((r) => setTimeout(r, 1100));
     assert.match(cli(["price", "post", addr, "3000"], ck), /\$2660\.0 +\(held: a move over 5%/);
+    assert.match(cli(["market", "list"], ck), /xyz:GOLD +\$2660\.0 holding /, "a held move is not a pause");
     await new Promise((r) => setTimeout(r, 1100));
     assert.match(cli(["price", "post", addr, "3000"], ck), /xyz:GOLD \$3000\.0\n/);
     // the loop, one turn, from a command and from a URL

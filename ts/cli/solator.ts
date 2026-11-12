@@ -557,7 +557,7 @@ async function run(addr: string) {
         lastStamp = stamp;
         last = p;
         lastAt = Date.now() / 1000;
-        console.log(`${clock()}  $${p}  ${sig.slice(0, 12)}…`);
+        console.log(`${clock()}  $${Number(p.toFixed(8))}  ${sig.slice(0, 12)}…`);
       }
     } catch (e: any) {
       // a missed reading or a refused post is said and tried again at the next turn: the loop is what keeps the market open
@@ -621,7 +621,14 @@ async function main() {
         [
           f.name.padEnd(18),
           (f.px ? "$" + priceOf(f).toFixed(dpOf(f)) : "--").padStart(14),
-          (age > f.maxAgeSecs ? "waiting" : f.paused ? "paused" : "live").padEnd(8),
+          (age > f.maxAgeSecs
+            ? "waiting"
+            : f.paused === S.PAUSED_ADMIN
+              ? "paused"
+              : f.paused
+                ? "holding"
+                : "live"
+          ).padEnd(8),
           ("bond " + usd(f.bond, 0)).padEnd(16),
           (f.maxOi
             ? "cap " + usd(capBase(f), 0) + (covered(f) ? " covered" : " not covered")
