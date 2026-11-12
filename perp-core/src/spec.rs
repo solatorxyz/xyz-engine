@@ -337,6 +337,10 @@ pub const IX_SLAB_FUND: u64 = 64;
 pub const IX_SLAB_SETTLE: u64 = 65;
 pub const IX_TAKE_FAST: u64 = 66;
 pub const IX_SLAB_KILL: u64 = 67;
+/// Keep-alive for a maker's quotes: stamps every live quote of the given slabs with the current slot and changes nothing
+/// else. A maker whose quotes are offsets from the price (LADDER_PEG) re-sends them only when their shape changes; between
+/// those, this one small transaction is what says it is still there. QUOTE_MAX_AGE_SLOTS is unchanged.
+pub const IX_SLAB_TOUCH: u64 = 87;
 pub const IX_LIQ_FAST: u64 = 70;
 pub const IX_ASSERT: u64 = 71;
 pub const IX_TAKE_FAST_BATCH: u64 = 72;

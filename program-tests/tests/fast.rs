@@ -2536,3 +2536,83 @@ fn maker_quotes_need_a_recent_price() {
     tk_try(&mut e, &tp, &tu, &f, &[k.slab], 0, 0, 100_100, 10);
     assert_eq!(mbase(&e, &f), -10, "fills once the price is recent");
 }
+
+fn touch(e: &mut Env, kp: &Keypair, slabs: &[Address], ok: bool) -> Option<u64> {
+    let mut acc = vec![AccountMeta::new(kp.pubkey(), true)];
+    acc.extend(slabs.iter().map(w));
+    e.send("", acc, vec![87u8], &[kp], ok) // IX_SLAB_TOUCH
+}
+/// px, qty, gen and slot of quote `i` of a slab (96 bytes of header, 16 bytes a quote).
+fn quote_at(e: &Env, slab: &Address, i: u16) -> [u32; 4] {
+    let d = e.data(slab);
+    let o = 96 + 16 * i as usize;
+    core::array::from_fn(|k| u32::from_le_bytes(d[o + 4 * k..o + 4 * k + 4].try_into().unwrap()))
+}
+
+#[test]
+fn a_touch_keeps_quotes_alive_and_changes_nothing_else() {
+    let mut e = Env::new();
+    let (f, k) = setup(&mut e);
+    let (tp, tu) = e.user(10_000_000_000);
+    quote(&mut e, &k, &[(ASK, 100_010, 100), (ASK + 1, 100_020, 50)], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 30, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 30);
+    let (q0, q1) = (quote_at(&e, &k.slab, ASK), quote_at(&e, &k.slab, ASK + 1));
+    let head = e.data(&k.slab)[..96].to_vec();
+
+    // 25 slots on the maker says it is still there
+    later(&mut e, 25);
+    let cu = touch(&mut e, &k.kp, &[k.slab], true).unwrap();
+    println!("slab_touch, one slab: {cu} CU");
+    assert!(cu < 40_000, "a keep-alive has to be cheap: {cu} CU");
+    let (t0, t1) = (quote_at(&e, &k.slab, ASK), quote_at(&e, &k.slab, ASK + 1));
+    assert_eq!((&t0[..3], &t1[..3]), (&q0[..3], &q1[..3]), "price, size and generation are not written");
+    assert_eq!((t0[3], t1[3]), (e.slot as u32, e.slot as u32), "the stamp is this slot");
+    assert_eq!(quote_at(&e, &k.slab, ASK + 2), [0; 4], "an empty level is left empty and unstamped");
+    assert_eq!(e.data(&k.slab)[..96], head[..], "the slab's own counters are not written");
+
+    // 50 slots after it was written (its life is 30) the quote still fills, and only what was left of it:
+    // 70 at the first price, the other 30 from the level behind. A re-quote would have handed the first 100 back.
+    later(&mut e, 25);
+    e.oracle_update("", 1000_00000000, None);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 100, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 130);
+    assert_eq!(fb(&e, &f).makers[0].base, -130, "70 + 30 after the first 30");
+
+    // the dead-man's limit is as it was: 31 slots after the last touch nothing fills
+    later(&mut e, 31);
+    e.oracle_update("", 1000_00000000, None);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 10, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 130, "an aged quote never fills");
+    // and a touch brings back what is left at the price it still carries (20 of the second level)
+    touch(&mut e, &k.kp, &[k.slab], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 50, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 150, "20 were left");
+
+    // a killed slab stays killed
+    quote(&mut e, &k, &[(ASK, 100_010, 100)], true);
+    e.send("", vec![AccountMeta::new(k.kp.pubkey(), true), w(&k.slab)], vec![67u8, 1], &[&k.kp], true);
+    touch(&mut e, &k.kp, &[k.slab], true);
+    tk(&mut e, &tp, &tu, &f, &[k.slab], &[], 0, PX + 100, 10, true);
+    assert_eq!(e.user_state(&tu).pos[0].base, 150, "killed maker never fills");
+
+    // only the slab's own authority; one stranger's slab in the list refuses the whole transaction
+    let before = quote_at(&e, &k.slab, ASK);
+    later(&mut e, 3);
+    touch(&mut e, &tp, &[k.slab], false);
+    let k2 = maker(&mut e, &f, 10_000_000_000, 0);
+    touch(&mut e, &k.kp, &[k.slab, k2.slab], false);
+    assert_eq!(quote_at(&e, &k.slab, ASK), before);
+    // not a slab, no slab, not signed
+    let m = e.market;
+    touch(&mut e, &k.kp, &[m], false);
+    touch(&mut e, &k.kp, &[], false);
+    // several slabs of one maker in one transaction
+    let k3 = Mk { kp: k.kp.insecure_clone(), u: k.u, slab: Address::new_unique() };
+    e.prog_acct(k3.slab, SLAB_SIZE);
+    e.send("", vec![AccountMeta::new(k3.kp.pubkey(), true), r(&k3.u), w(&k3.slab)], vec![60], &[&k3.kp], true);
+    quote(&mut e, &k3, &[(ASK, 100_030, 5)], true);
+    later(&mut e, 4);
+    touch(&mut e, &k.kp, &[k.slab, k3.slab], true);
+    assert_eq!((quote_at(&e, &k.slab, ASK)[3], quote_at(&e, &k3.slab, ASK)[3]), (e.slot as u32, e.slot as u32));
+}

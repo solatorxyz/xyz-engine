@@ -256,6 +256,36 @@ pub(crate) fn slab_kill(pid: &Address, a: &mut [AccountView], d: &[u8]) -> Progr
     Ok(())
 }
 
+/// Keep-alive: every live quote (qty > 0) of the given slabs is stamped with the current slot. Prices, sizes and
+/// generations are not written, so what takers have used of a level stays used (a re-quote would hand the full size back),
+/// and no ladder check is needed: nothing a ladder is ordered by moves. This is what lets a maker whose quotes are offsets
+/// from the price (LADDER_PEG) pay for one small transaction every few seconds instead of re-sending every level: the price
+/// moves the quotes, the touch only says the maker is still there. The dead-man's limit is as it was: a maker that stops is
+/// no longer filled QUOTE_MAX_AGE_SLOTS later. Like a re-quote, a touch gives up time priority at a shared price (ties go to
+/// the older stamp), and it revives a quote that had aged out at the price and size it still carries: the maker signs for
+/// that. A killed slab stays killed. Only slabs whose authority signed are accepted, so the vault's quotes, which belong
+/// to the vault and are written under its rules, cannot be touched by its operator.
+/// accs: authority(s), slab(w), [more slabs of the same authority (w)]. data: tag
+pub(crate) fn slab_touch(pid: &Address, a: &mut [AccountView]) -> ProgramResult {
+    if a.len() < 2 || !sg(pid, &a[0]) {
+        return Err(err(E::BadAccount));
+    }
+    let who = key(&a[0]);
+    let slot = clock()?.slot as u32;
+    for x in &a[1..] {
+        let s: &mut Slab = load(x, pid, DISC_SLAB, SLAB_SIZE)?;
+        if s.authority != who {
+            return Err(err(E::BadAccount));
+        }
+        for q in s.quotes.iter_mut() {
+            if q.qty != 0 {
+                q.slot = slot;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Lock (amount > 0) or release (amount < 0) quoting margin. A maker can only fill up to margin / IMR of notional between settles.
 /// Optional target turns on auto mode (0 turns it off); see slab_settle.
 /// accs: authority(s), user(w), market(r), fast(w), [other markets]. data: tag, amount i64, [target i64]
