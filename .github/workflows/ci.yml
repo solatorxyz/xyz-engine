@@ -1,0 +1,32 @@
+name: ci
+on: { push: { branches: [main] }, pull_request: {} }
+jobs:
+  program:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Solana toolchain
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: Format
+        run: rustfmt --edition 2021 --check program/src/*.rs perp-core/src/spec.rs program-tests/tests/*.rs program/fuzz/fuzz_targets/*.rs
+      - name: Build SBF programs (warnings are errors)
+        run: |
+          (cd program && RUSTFLAGS="-D warnings" cargo build-sbf)
+          (cd audit/noop && cargo build-sbf)
+          sha256sum program/target/deploy/perp_program.so
+      - name: Program tests (LiteSVM, real SBF)
+        run: |
+          cd program-tests
+          T=$(ls tests/*.rs | xargs -n1 basename | sed 's/\.rs$//' | grep -v '^common$' | sed 's/^/--test /' | tr '\n' ' ')
+          cargo test --release --no-fail-fast $T
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No key material or provider keys in the tree
+        run: |
+          ! git grep -nIE 'api-key=[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{16}|"?secret_?key"?\s*[:=]|BEGIN (RSA|OPENSSH|EC) PRIVATE KEY' -- . ':!.github/workflows/ci.yml'
+          ! git ls-files | grep -E '(^|/)(id|deployer|oracle|mm|crank|push|treasury|pubB|pubC|buffer)[^/]*\.json$'

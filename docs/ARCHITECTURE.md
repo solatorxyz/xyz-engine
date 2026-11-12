@@ -94,7 +94,6 @@ Everything else is proposed, waits 24 hours in the open, and is executed by anyo
 | Arithmetic fast paths equal the wide formula; the lease never gives a slot twice | Kani proofs, full bit-widths where the solver finishes | `deploy/ops/kani_all.sh` |
 | Compute cost per instruction | measured, written to `cu_results.md` by the test run | `cargo test --release --test cu -- --nocapture` |
 | A refactor changed nothing that runs | `tools/same-code.py` compares two builds function by function after removing layout (addresses, call offsets, module names) | `tools/same-code.py old.so new.so` |
-| The Python tools were reformatted, not rewritten | `tools/same-tree.py` refuses a file whose syntax tree would change | `tools/same-tree.py file.py` |
 | No behaviour hides behind the optimiser | all suites again at `opt-level` 1 and z without LTO | `program-tests/diff-build.sh` |
 
 The split of the original single file into these modules was checked with `tools/same-code.py`: 183 functions, 58,349

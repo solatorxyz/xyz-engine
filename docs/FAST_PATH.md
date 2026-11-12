@@ -36,17 +36,6 @@ A maker can fill at most margin / IMR of notional between settles. That bounds w
 - User layout changed (4 to 16 positions, triggers moved to offset 1632). Accounts made by the live devnet program must be migrated or recreated before this version goes live.
 - FastBook is 2000 bytes (auto target added). Nothing on devnet uses it yet.
 
-## Frontend (Codex owns UI)
-Use `sdk/ts/solator.ts` (builders, decoders, `fastDepth`). `sdk/ts/smoke.ts` shows reading a FastBook, slabs, a User and a Market from RPC.
-- Order book: `fastDepth(decodeFastBook(fast), slabs, slot, mark)` gives live maker levels (used qty, age, ±5% band and budget applied). Merge with shard orders.
-- Sending: `sendFast(relayUrl, connection, rawTx)` posts through the txsend relay (`/tx` on the web host: straight to the
-  leaders' TPU) and resolves at *processed* (~1 slot) — show the fill then, confirm in the background.
-- Trading: `take_fast` with all approved slabs for the market. Show fills from the program's fill events. Markets re-price
-  in the publishers' own transactions (post-and-push), so a taker bundle needs no `update_oracle`; if one is included to be
-  safe, use `UPDATE_ORACLE_SOFT` (IX 78, same accounts) so a momentarily unusable oracle cannot fail the take itself.
-- Positions: decode_user plus, for makers, the FastBook entry (unsettled base and quote) so equity matches what liquidation sees.
-- Maker panel: margin, budget, auto target, kill switch.
-
 ## Liquidation (2026-11-04)
 - Partial: one liquidation closes only what brings equity back to 1.25x maintenance (worst-band fee assumed), capped at the
   25% chunk. Example from the tests: a 9x long just under maintenance closed 10,674 of 90,000 lots, not 22,500.
