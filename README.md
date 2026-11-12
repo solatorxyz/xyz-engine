@@ -16,7 +16,7 @@ tooling. Those are built on the kernel; none of them can make it break a rule in
 |---|---|
 | `program/src` | The program: Rust on [pinocchio](https://github.com/anza-xyz/pinocchio), zero-copy, no allocator, 8,100 lines, one file per subsystem. |
 | `perp-core/src/spec.rs` | Account layouts and constants. The program checks its own structs against this file at compile time; every client reads the same file. |
-| `program-tests/` | 230 tests that run the built SBF program in LiteSVM: each rule, each regression, and the compute cost of each instruction. |
+| `program-tests/` | 233 tests that run the built SBF program in LiteSVM: each rule, each regression, and the compute cost of each instruction. |
 | `program/fuzz/` | Native fuzz targets with their own reference models: `native` (order book), `lanes` (withdrawals, fast path, liquidation, triggers, multisig, funding), `vault`. |
 | `program/src/proofs.rs` | Kani proofs: the arithmetic fast paths equal the wide formula; a lease never gives one slot to two holders. |
 | `docs/` | `ARCHITECTURE.md` (the design in one page, and how to check each claim), `SECURITY.md` (every rule and the test that pins it), `FAST_PATH.md`, `ORDER_RULES.md`. |
@@ -48,3 +48,7 @@ deploy/ops/kani_all.sh                                                          
   then executed by anyone.
 
 Start with `docs/ARCHITECTURE.md`.
+
+## Licence
+
+Apache-2.0 (`LICENSE`). Copyright 2026 Solator.
