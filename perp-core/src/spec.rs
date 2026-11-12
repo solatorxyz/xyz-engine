@@ -344,6 +344,12 @@ pub const IX_SLAB_TOUCH: u64 = 87;
 /// Move an empty shard to another price range (admin). A market whose price has walked away from its shards is
 /// re-centred with the accounts it already has, instead of paying rent for new ones that can never be closed.
 pub const IX_SHARD_MOVE: u64 = 88;
+/// A publisher's price brought by anyone, with the publisher's Ed25519 signature in the instruction before it.
+pub const IX_AGG_POST_SIGNED: u64 = 89;
+/// What a publisher signs for agg_post_signed: this, the feed's address, then agg_post's values (32 or 48 bytes).
+pub const AGG_SIG_MAGIC: [u8; 8] = *b"etaggpx1";
+/// A signed value older than this is refused: the bringer chooses the moment, so the window to choose in is short.
+pub const AGG_SIGNED_MAX_AGE_SECS: i64 = 2;
 pub const IX_LIQ_FAST: u64 = 70;
 pub const IX_ASSERT: u64 = 71;
 pub const IX_TAKE_FAST_BATCH: u64 = 72;
