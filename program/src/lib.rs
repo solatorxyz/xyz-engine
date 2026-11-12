@@ -230,6 +230,8 @@ pub fn process_instruction(pid: &Address, accs: &mut [AccountView], data: &[u8])
         spec::IX_SLAB_TOUCH => slab_touch(pid, accs),
         spec::IX_SHARD_MOVE => shard_move(pid, accs, data),
         spec::IX_AGG_POST_SIGNED => agg_post_signed(pid, accs),
+        spec::IX_INS_FUND => ins_fund(pid, accs, data),
+        spec::IX_FEE_CLAIM => fee_claim(pid, accs),
         spec::IX_LIQ_FAST => liquidate_fast(pid, accs, data),
         spec::IX_ASSERT => assert_state(pid, accs, data),
         spec::IX_SET_SESSION => set_session(pid, accs, data),

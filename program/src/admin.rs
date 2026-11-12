@@ -56,14 +56,15 @@ pub(crate) fn admin_propose(pid: &Address, a: &mut [AccountView], d: &[u8]) -> P
         }
     }
     let pv = rd64(d, 2)?;
-    if m.pool != [0; 32]
-        && match op {
-            spec::ADMIN_IMR => pv < IMR_BPS,
-            spec::ADMIN_MMR => pv < MMR_BPS,
-            spec::ADMIN_SET_ADMIN => true,
-            _ => false,
-        }
-    {
+    // Margin has a floor in every market, pooled or on its own: MMR_BPS is the largest move one post of a single
+    // feed can make without being held (ORACLE_SINGLE_SOURCE_MAX_MOVE_BPS), so a position at maintenance still has
+    // equity after it, and IMR_BPS is twice that. A pooled market also cannot hand itself to another admin.
+    if match op {
+        spec::ADMIN_IMR => pv < IMR_BPS,
+        spec::ADMIN_MMR => pv < MMR_BPS,
+        spec::ADMIN_SET_ADMIN => m.pool != [0; 32],
+        _ => false,
+    } {
         return Err(err(E::Cap)); // AUDIT V5-4 (also re-checked at execute)
     }
     m.pending_op = op;
@@ -94,16 +95,13 @@ pub(crate) fn admin_execute(pid: &Address, a: &mut [AccountView]) -> ProgramResu
     }
     let v = m.pending_val;
     // AUDIT V5-4: pooled markets: margin can only be tightened (never below the spec defaults) and the admin is not transferable
-    if m.pool != [0; 32] {
-        let bad = match m.pending_op {
-            spec::ADMIN_IMR => v < IMR_BPS,
-            spec::ADMIN_MMR => v < MMR_BPS,
-            spec::ADMIN_SET_ADMIN => true,
-            _ => false,
-        };
-        if bad {
-            return Err(err(E::Cap));
-        }
+    if match m.pending_op {
+        spec::ADMIN_IMR => v < IMR_BPS,
+        spec::ADMIN_MMR => v < MMR_BPS,
+        spec::ADMIN_SET_ADMIN => m.pool != [0; 32],
+        _ => false,
+    } {
+        return Err(err(E::Cap));
     }
     match m.pending_op {
         spec::ADMIN_IMR => {

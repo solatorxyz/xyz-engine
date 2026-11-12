@@ -350,6 +350,16 @@ pub const IX_AGG_POST_SIGNED: u64 = 89;
 pub const AGG_SIG_MAGIC: [u8; 8] = *b"etaggpx1";
 /// A signed value older than this is refused: the bringer chooses the moment, so the window to choose in is short.
 pub const AGG_SIGNED_MAX_AGE_SECS: i64 = 2;
+/// Pay collateral into a market's insurance. It is the market's bond: the first money a loss larger than a position's
+/// margin is taken from (liquidation.rs, adl.rs), before any trader of the market. One way: no instruction takes it out.
+/// Anyone may pay; a market's creator does, to stand behind it.
+pub const IX_INS_FUND: u64 = 90;
+/// A market without a pool pays out the trading fees it has collected: FEE_CREATOR_BPS of them to a token account its
+/// admin names, the rest into its own insurance.
+pub const IX_FEE_CLAIM: u64 = 91;
+/// The creator's share of a market's net trading fees (taker fees less maker rebates). The other half stays in the
+/// market as insurance, so the bond grows with the volume that puts it at risk.
+pub const FEE_CREATOR_BPS: u64 = 5000;
 pub const IX_LIQ_FAST: u64 = 70;
 pub const IX_ASSERT: u64 = 71;
 pub const IX_TAKE_FAST_BATCH: u64 = 72;
