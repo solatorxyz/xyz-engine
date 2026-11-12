@@ -7,7 +7,8 @@ export const PROGRAM_ID =
   "7AY437YN1dupEhyahmKAQ6KTRm4nVx52BdyVzTcJbuRZ";
 export const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 export const ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-/** The collateral of every listed market: the test dollar the faucet hands out (6 decimals). Another deployment (a
- *  local chain, another cluster) names its own with NEXT_PUBLIC_MINT. */
+/** The collateral of the devnet deployment's listed markets: the test dollar the site's faucet hands out (6 decimals).
+ *  A market opened with any other token works on chain, but the site lists only markets on this one. Another
+ *  deployment (a local chain, another cluster) names its own. */
 export const MINT =
-  process.env.SOLATOR_MINT ?? process.env.NEXT_PUBLIC_MINT ?? "6hNBNCXegZxr2drnSydntdt5JYyv4m2Qtp23iM6teW6a";
+  process.env.SOLATOR_MINT ?? process.env.NEXT_PUBLIC_MINT ?? "65Y9os6EE8hWreCtd38QvFA4A8thtmVp9NsBwRG9Hsrd";

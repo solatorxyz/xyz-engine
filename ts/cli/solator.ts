@@ -257,6 +257,7 @@ function show(f: Found, now: number) {
   );
   console.log(`  fees waiting   ${usd(Math.max(0, f.fees))}`);
   console.log(`  feed           ${f.feed}`);
+  console.log(`  collateral     ${f.mint}`);
   console.log(`  vault          ${f.vault}`);
   console.log(
     `  book           ${f.book}   shards ${f.shards.map((s) => (s.side ? "ask " : "bid ") + s.key).join("  ")}`,

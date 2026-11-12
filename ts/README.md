@@ -40,13 +40,14 @@ What the numbers mean:
 - **The price.** The market takes what its creator's key posts. A post that moves the price more than 5% is held until
   the next post confirms it. When no price has arrived for as long as the market says a price is good (`--fresh`:
   1 minute, 10 minutes or 1 hour), it takes no orders and judges nobody until one does.
+- **Collateral.** By default the test dollar of the devnet deployment (`lib/ids.ts`); `--mint` names another token.
 - **Margin.** 10% to open, 5% to keep (10x), and the program refuses a change below that.
 - **The cap and the bond.** `--cap` limits open interest. The bond is money the creator pays into the market's
   insurance; it is the first money taken when a position loses more than its margin. A bond of a twentieth of the cap
   covers every position on one side losing one more full step of the price (5%) after its margin is gone. The program
   does not require a bond: `market show` says whether the market has one and whether it covers the cap.
-- **Fees.** Takers pay 5 bps, makers are paid 2. Of what is left, half is the creator's (`fees claim`) and half goes
-  into the market's insurance.
+- **Fees.** Takers pay 5 bps; a resting order pays nothing. Half of what the market has collected is the creator's
+  (`fees claim`) and half goes into the market's insurance.
 
 ## Liquidating, for anyone
 
